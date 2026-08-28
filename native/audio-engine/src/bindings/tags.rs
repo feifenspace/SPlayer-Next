@@ -2,7 +2,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use tracing::{info, warn};
 
-use audio_engine_core::{metadata, scanner};
+use crate::{metadata, scanner};
 
 use super::scanner::JsScannedTrack;
 use super::IntoNapiResult;

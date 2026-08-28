@@ -39,6 +39,8 @@ pub struct PlayerSnapshot {
     pub position: f64,
     pub duration: f64,
     pub volume: f32,
+    /// 当前播放速度（1.0 = 原速）
+    pub speed: f32,
     #[serde(serialize_with = "serialize_player_state")]
     pub state: PlayerState,
     pub is_finished: bool,
@@ -148,7 +150,9 @@ impl AppState {
                         *snapshot.write() = Some(ws_state);
                         let _ = ws_tx.send(serde_json::json!({ "type": "sourceError" }));
                     }
-                    PlayerEvent::FftData { .. } | PlayerEvent::OutputStalled => {}
+                    PlayerEvent::FftData { .. } | PlayerEvent::OutputStalled
+                    // 输出失败：InnerPlayer 已通过 failure 回调异步重建输出流，WS 侧无需动作
+                    | PlayerEvent::OutputFailed => {}
                 }
             })
         };
@@ -180,9 +184,10 @@ impl AppState {
             position: state.position,
             duration: state.duration,
             volume: state.volume,
+            speed: player.speed(),
             state: state.state,
             is_finished: player.is_finished(),
-            current_source: player.current_source(),
+            current_source: player.current_source().map(String::from),
         }
     }
 }

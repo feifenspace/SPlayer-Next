@@ -1,6 +1,26 @@
-//! FFmpeg 音频解码 + rodio 播放 + FFT 频谱分析。
-//! 通过 NAPI-RS 暴露给 Node.js，作为 Electron 主进程的原生模块。
+//! 垫片（shim）：仅保留 NAPI 绑定入口，实现整体委托给 audio-engine-core。
+//!
+//! 通过把 core 的模块 re-export 到 crate 根，bindings 代码中的 `crate::`
+//! 路径无需修改即可解析到 core 实现，从而与上游 audio-engine 的绑定层
+//! 保持逐字一致，便于后续同步。
 
 mod bindings;
+
+pub use audio_engine_core::audio_output;
+pub use audio_engine_core::decoder;
+pub use audio_engine_core::device_watcher;
+pub use audio_engine_core::equalizer;
+pub use audio_engine_core::error;
+pub use audio_engine_core::fft;
+pub use audio_engine_core::logger;
+pub use audio_engine_core::loudness;
+pub use audio_engine_core::metadata;
+pub use audio_engine_core::playback;
+pub use audio_engine_core::player;
+pub use audio_engine_core::priority;
+pub use audio_engine_core::scanner;
+pub use audio_engine_core::shared;
+pub use audio_engine_core::source;
+pub use audio_engine_core::tempo;
 
 pub use bindings::*;

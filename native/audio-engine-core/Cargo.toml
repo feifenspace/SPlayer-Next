@@ -9,14 +9,16 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 # 音频解码 & 播放
-ffmpeg_audio = { version = "0.3.1", default-features = false, features = ["http", "tracing"] }
+ffmpeg_audio = { version = "0.3.1", default-features = false, features = [
+  "http",
+  "tracing",
+] }
 libc = "0.2"
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "tracing"] }
 parking_lot = "0.12"
 diretta-sys = { path = "../diretta-sys" }
 
 # 错误处理
-anyhow = "1"
+anyhow = { workspace = true }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 once_cell = "1"
@@ -27,27 +29,50 @@ rustfft = "6"
 
 # 元数据 & 缩略图
 lofty = "0.24"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "webp"] }
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "bmp",
+  "webp",
+] }
 
 # 文件遍历 & 文本编码识别
 walkdir = "2"
 encoding_rs = "0.8"
 chardetng = "0.1"
 rustysynth = "1.3"
-httpmock = { version = "0.8.3", optional = true }
 
 # 日志（纯 Rust，无 NAPI）
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
-tracing-appender = "0.2"
-time = { version = "0.3", features = ["macros", "formatting"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+time = { workspace = true }
 
-# Windows 音频设备（可选）
+# 音频输出（cpal 统一后端：Linux PipeWire/PulseAudio、macOS CoreAudio、Windows WASAPI）
+cpal = { version = "0.18.2", default-features = false, features = [
+  "pipewire",
+  "pulseaudio",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { version = "0.10.0", features = ["v0_3_53"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-audio = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "AudioHardware",
+] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-core = "0.62.2"
+windows-core = { workspace = true }
 [target.'cfg(target_os = "windows")'.dependencies.windows]
-version = "0.62"
-features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_System_Com", "Win32_System_Threading"]
+workspace = true
+features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+]
 
 [features]
 default = []

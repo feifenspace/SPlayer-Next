@@ -23,7 +23,7 @@ trait IntoNapiResult<T> {
 impl<T> IntoNapiResult<T> for anyhow::Result<T> {
     fn into_napi(self) -> napi::Result<T> {
         self.map_err(|err| {
-            let classified = audio_engine_core::error::AudioEngineError::classify(&err);
+            let classified = crate::error::AudioEngineError::classify(&err);
             Error::from_reason(format!("[{}] {classified}", classified.code()))
         })
     }
@@ -34,7 +34,7 @@ impl<T> IntoNapiResult<T> for anyhow::Result<T> {
 pub fn init_logger(log_dir: String, is_dev: bool) {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        audio_engine_core::logger::init_logger(&log_dir, is_dev);
+        crate::logger::init_logger(&log_dir, is_dev);
         ffmpeg_audio::log::set_log_level(ffmpeg_audio::sys::LogLevel::Fatal);
         info!(log_dir, is_dev, "audio-engine 日志系统已初始化");
     });

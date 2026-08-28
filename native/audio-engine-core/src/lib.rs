@@ -1,4 +1,4 @@
-//! FFmpeg 音频解码 + rodio 播放 + FFT 频谱分析。
+//! FFmpeg 音频解码 + CPAL 播放 + FFT 频谱分析。
 //!
 //! 在 Headless 环境下直接使用，或通过 NAPI 包装供 Node.js 绑定。
 
@@ -20,6 +20,7 @@ pub mod loudness;
 pub mod metadata;
 pub mod midi;
 pub mod mqa;
+pub mod playback;
 pub mod player;
 pub mod priority;
 pub mod sacd;

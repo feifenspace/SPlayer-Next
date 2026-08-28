@@ -46,7 +46,7 @@ impl StretchProcessor {
     }
 
     /// 更新输出格式；采样率或声道数改变后必须重建 stretch 内核
-    pub(crate) fn set_output_format(&mut self, sample_rate: u32, channels: u16) {
+    pub fn set_output_format(&mut self, sample_rate: u32, channels: u16) {
         if sample_rate == self.sample_rate && channels == self.channels {
             return;
         }

@@ -350,6 +350,7 @@ async fn status_handler(State(state): State<AppState>) -> Result<Json<Value>, Ap
         "position": snapshot.position,
         "duration": snapshot.duration,
         "volume": snapshot.volume,
+        "speed": snapshot.speed,
         "is_finished": snapshot.is_finished,
         "current_source": snapshot.current_source,
     })))
@@ -419,25 +420,29 @@ async fn load_handler(
 
     let (
         old_threads,
-        old_output,
         token,
         load_token,
         cover_dir,
         normalization_enabled,
         device_name,
+        output_generation,
+        failure_callback,
         equalizer,
         tempo,
     ) = {
         let mut player = state.player.lock();
-        let (old_threads, old_output, token) = player.take_for_async_load(handle.clone());
+        let (old_threads, token) = player.take_for_async_load(handle.clone());
+        let output_generation = player.reserve_output_generation();
+        let failure_callback = player.make_failure_callback(output_generation);
         (
             old_threads,
-            old_output,
             token,
             player.load_token_handle(),
             player.cover_cache_dir().map(String::from),
             player.is_normalization_enabled(),
-            player.selected_device_name().map(String::from),
+            player.selected_device().map(String::from),
+            output_generation,
+            failure_callback,
             player.equalizer_handle(),
             player.tempo_handle(),
         )
@@ -448,7 +453,6 @@ async fn load_handler(
         if let Some(h) = old_threads.join_aux() {
             let _ = h.join();
         }
-        drop(old_output);
         let prepared = audio_engine_core::decoder::prepare_decode(
             &source_for_decoder,
             cover_dir.as_deref(),
@@ -457,16 +461,23 @@ async fn load_handler(
         if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
             anyhow::bail!(LOAD_SUPERSEDED_REASON);
         }
-        let output =
-            audio_engine_core::audio_output::AudioOutput::new(device_name.as_deref(), None, None)?;
-        let shared = audio_engine_core::shared::Shared::new(
-            output.sample_rate(),
-            audio_engine_core::decoder::TARGET_CHANNELS,
-        );
+        // 输出采样率协商：音源原始采样率被设备支持时按精确采样率打开
+        let output = audio_engine_core::audio_output::AudioOutput::new(
+            device_name.as_deref(),
+            Some(prepared.original_sample_rate()),
+            output_generation,
+            failure_callback,
+        )?;
+        let shared =
+            audio_engine_core::shared::Shared::new(output.sample_rate(), output.channels());
         shared.set_normalization_enabled(normalization_enabled);
-        equalizer.lock().set_sample_rate(output.sample_rate());
+        equalizer
+            .lock()
+            .set_output_format(output.sample_rate(), output.channels());
         equalizer.lock().reset_state();
-        tempo.lock().set_sample_rate(output.sample_rate());
+        tempo
+            .lock()
+            .set_output_format(output.sample_rate(), output.channels());
         tempo.lock().reset();
         let (metadata, decode_handle, cancel) = audio_engine_core::decoder::start_prepared_decode(
             prepared,
@@ -559,7 +570,7 @@ async fn seek_handler(
     let (take, was_playing, current_source) = {
         let mut player = state.player.lock();
         let was_playing = player.state() == audio_engine_core::PlayerState::Playing;
-        let current_source = player.current_source();
+        let current_source = player.current_source().map(String::from);
         let take = player.take_for_async_seek();
         (take, was_playing, current_source)
     };
@@ -578,6 +589,7 @@ async fn seek_handler(
         current_source: _,
         was_playing: _,
         output_sample_rate,
+        output_channels,
         token,
         equalizer,
         tempo,
@@ -592,15 +604,17 @@ async fn seek_handler(
         if !decoder_data.seek(position) {
             return SeekOutcome::Fallback;
         }
-        let shared = audio_engine_core::shared::Shared::new(
-            output_sample_rate,
-            audio_engine_core::decoder::TARGET_CHANNELS,
-        );
+        // 沿用实际输出流采样率，与复用的 DecoderData 重采样器目标一致
+        let shared = audio_engine_core::shared::Shared::new(output_sample_rate, output_channels);
         shared.set_normalization_enabled(normalization_enabled);
         shared.set_normalization_gain(normalization_gain);
-        equalizer.lock().set_sample_rate(output_sample_rate);
+        equalizer
+            .lock()
+            .set_output_format(output_sample_rate, output_channels);
         equalizer.lock().reset_state();
-        tempo.lock().set_sample_rate(output_sample_rate);
+        tempo
+            .lock()
+            .set_output_format(output_sample_rate, output_channels);
         tempo.lock().reset();
         let handle = match audio_engine_core::decoder::resume_decode(
             decoder_data,
@@ -620,7 +634,7 @@ async fn seek_handler(
         SeekOutcome::Resumed { shared, handle } => {
             let mut player = state.player.lock();
             let committed = player
-                .commit_seeked(token, position, shared, handle)
+                .commit_seeked(token, position, shared, handle, None)
                 .map_err(|e| ApiError::internal(e.to_string()))?;
             Ok(Json(PlayerResponse::ok(json!({
                 "status": if committed { "seeked" } else { "superseded" },
@@ -1421,7 +1435,7 @@ async fn diretta_status_handler(
     let (selected_device, runtime) = {
         let player = state.player.lock();
         (
-            player.selected_device_name().map(String::from),
+            player.selected_device().map(String::from),
             audio_engine_core::diretta::runtime_state(),
         )
     };
@@ -1461,7 +1475,7 @@ async fn diretta_select_handler(
 
     Ok(Json(PlayerResponse::ok(json!({
         "status": "output_device_updated",
-        "selected_device": player.selected_device_name(),
+        "selected_device": player.selected_device(),
     }))))
 }
 
