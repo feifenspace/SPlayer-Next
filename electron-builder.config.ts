@@ -5,6 +5,7 @@ const packageVersion = JSON.parse(readFileSync("package.json", "utf8")).version 
 const prereleaseChannel = /-(alpha|beta)(?:\.|$)/.exec(packageVersion)?.[1];
 const inferredUpdateChannel = prereleaseChannel ?? "latest";
 const updateChannel = process.env.UPDATE_CHANNEL ?? inferredUpdateChannel;
+const headlessBuild = process.env.HEADLESS_BUILD === "1";
 
 if (updateChannel !== "latest" && updateChannel !== "beta" && updateChannel !== "alpha") {
   throw new Error(`不支持的更新通道: ${updateChannel}`);
@@ -135,7 +136,11 @@ const config: Configuration = {
     category: "Audio;Music;AudioVideo;",
     target: ["AppImage", "deb", "rpm", "tar.gz", "pacman"],
     syncDesktopName: true,
-    desktop: { entry: { MimeType: "x-scheme-handler/orpheus;" } },
+    desktop: {
+      entry: headlessBuild
+        ? { Type: "Application", Terminal: true, Exec: "${executable} --headless", Categories: "Audio;Music;AudioVideo;" }
+        : { MimeType: "x-scheme-handler/orpheus;" },
+    },
   },
   appImage: {
     artifactName: "${name}-${version}-${arch}.${ext}",

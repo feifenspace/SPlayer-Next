@@ -80,7 +80,20 @@ export default defineConfig({
       __COMMIT_DATE__: JSON.stringify(getGitDate()),
     },
     server: {
-      port: 14558,
+      // 开发时让 Vite 与 Electron 外部 API 分离：Vite 负责前端，14558 负责 API/WS。
+      port: Number(process.env.VITE_DEV_PORT ?? 5173),
+      strictPort: true,
+      proxy: {
+        "/api": {
+          target: process.env.VITE_API_PROXY ?? "http://127.0.0.1:14558",
+          changeOrigin: true,
+        },
+        "/ws": {
+          target: process.env.VITE_WS_PROXY ?? "ws://127.0.0.1:14558",
+          ws: true,
+          changeOrigin: true,
+        },
+      },
       watch: {
         ignored: ["**/native/**/target/**"],
       },

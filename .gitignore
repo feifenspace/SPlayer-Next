@@ -23,3 +23,8 @@ package-lock.json
 # Code signing certificates
 *.pfx
 *.p12
+
+# Headless 运行数据（数据库等，禁止入库）
+splayer-headless/data/
+native/headless-server/splayer-headless/
+.dbg/

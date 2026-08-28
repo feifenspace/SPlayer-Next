@@ -1,4 +1,13 @@
-* text=auto eol=lf
-*.{png,jpg,jpeg,gif,webp,ico,svg} binary
-*.{woff,woff2,ttf,eot} binary
-*.node binary
+# Headless fork 合并策略
+# ------------------------------------------------------------------
+# native/audio-engine 已由本地 fork 接管：实现整体迁移至
+# native/audio-engine-core，本目录仅保留向上委托的 bindings 垫片。
+# 上游对该目录的任何改动在合并时一律保留本地版本（merge=ours）。
+#
+# 前提：仓库需配置驱动（sync-upstream.sh 会自动配置）：
+#   git config merge.ours.driver "cat %A"
+#   git config merge.ours.name   "Keep our version (headless fork)"
+#
+# 注意：modify/delete 冲突（上游改了本地已删的文件）不会触发驱动，
+# 由 scripts/sync-upstream.sh 统一按“保留删除”处理。
+/native/audio-engine/** merge=ours
