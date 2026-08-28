@@ -400,7 +400,9 @@ export class LyricRenderer {
    * @param timeMs - 当前播放时间
    */
   setCurrentTime = (timeMs: number) => {
-    this.pendingPlayTime = timeMs;
+    if (typeof timeMs === "number" && !isNaN(timeMs)) {
+      this.pendingPlayTime = timeMs;
+    }
   };
 
   /**
@@ -562,7 +564,12 @@ export class LyricRenderer {
       this.activateLineAnimations(lineIdx, currentTime);
     }
 
-    if (this.activeLineSet.size > 0) this.activeLineIndex = setMin(this.activeLineSet);
+    if (this.activeLineSet.size > 0) {
+      this.activeLineIndex = setMin(this.activeLineSet);
+    } else {
+      const futureIdx = lines.findIndex((line) => line.startTime >= currentTime);
+      this.activeLineIndex = futureIdx === -1 ? lines.length : futureIdx;
+    }
     this.calculateLayout(false);
     return true;
   };
@@ -1091,16 +1098,12 @@ export class LyricRenderer {
     const newWidth = this.container.clientWidth;
     const newHeight = this.container.clientHeight;
     if (newWidth === this.containerWidth && newHeight === this.containerHeight) return;
+    const wasZero = this.containerHeight === 0 || this.containerWidth === 0;
     this.containerWidth = newWidth;
     this.containerHeight = newHeight;
     this.measureLineHeights();
     measureAndApplyWordMasks(this.wordMeasurements, this.wordFadeWidth, this.lines);
-    // 入场动画期间跳过 calculateLayout，避免 setPosition 瞬移破坏弹簧入场
-    if (!this.entranceComplete) {
-      this.needsFullSync = true;
-      return;
-    }
-    this.calculateLayout(true);
+    this.calculateLayout(this.entranceComplete || wasZero);
     this.needsFullSync = true;
   };
 
@@ -1111,12 +1114,7 @@ export class LyricRenderer {
     this.dotsContainerHeight = this.dotsContainer.offsetHeight || 20;
     this.measureLineHeights();
     measureAndApplyWordMasks(this.wordMeasurements, this.wordFadeWidth, this.lines);
-    // 入场动画期间跳过 calculateLayout，避免 setPosition 瞬移破坏弹簧入场
-    if (!this.entranceComplete) {
-      this.needsFullSync = true;
-      return;
-    }
-    this.calculateLayout(true);
+    this.calculateLayout(this.entranceComplete);
     this.needsFullSync = true;
   };
 

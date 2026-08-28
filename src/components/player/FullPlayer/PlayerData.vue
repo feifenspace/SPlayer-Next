@@ -165,6 +165,14 @@ const alignItems = computed(() => {
       >
         {{ sourceLabel }}
       </span>
+      <span
+        v-if="settings.player.outputDevice?.startsWith('diretta:') || settings.player.outputDevice?.startsWith('diretta@')"
+        class="inline-flex items-center gap-1 leading-none px-1.5 py-1.2 rounded-md border border-solid border-emerald-400/40 text-emerald-300 font-medium"
+        title="Diretta 发烧级纯净网络传输 (Bit-Perfect)"
+      >
+        <span class="size-1.5 rounded-full bg-emerald-400 animate-pulse" />
+        Diretta Target
+      </span>
       <SPopover side="top" :side-offset="8" cover trigger="hover">
         <template #trigger>
           <span
@@ -183,7 +191,13 @@ const alignItems = computed(() => {
             </div>
             <div class="flex justify-between">
               <span class="text-cover/40">{{ t("quality.sampleRate") }}</span>
-              <span>{{ (quality.sampleRate / 1000).toFixed(1) }} kHz</span>
+              <span>
+                {{
+                  quality.sampleRate >= 1000000
+                    ? `${(quality.sampleRate / 1000000).toFixed(2)} MHz`
+                    : `${(quality.sampleRate / 1000).toFixed(1)} kHz`
+                }}
+              </span>
             </div>
             <div v-if="quality.bitsPerSample > 0" class="flex justify-between">
               <span class="text-cover/40">{{ t("quality.bitDepth") }}</span>

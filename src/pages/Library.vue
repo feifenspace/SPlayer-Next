@@ -7,6 +7,7 @@ import { formatFileSize } from "@/utils/format";
 import IconFolderOpen from "~icons/lucide/folder-open";
 import IconRefreshCw from "~icons/lucide/refresh-cw";
 import IconLucideListChecks from "~icons/lucide/list-checks";
+import IconLucideX from "~icons/lucide/x";
 import * as player from "@/core/player";
 
 const { t } = useI18n();
@@ -31,14 +32,13 @@ const totalSize = computed(() => {
   return bytes > 0 ? formatFileSize(bytes) : "";
 });
 
-/** 新增目录后立即扫描 */
+/** 新增目录（手动触发扫描，避免抢占播放资源） */
 const handleFolderAdded = (): void => {
-  libraryStore.startScan(false);
+  // 添加后不自动扫描，由用户按需点击扫描
 };
 
-const handleQuickAddFolder = async (): Promise<void> => {
-  const res = await libraryStore.addScanDir();
-  if (res.success) libraryStore.startScan(false);
+const handleQuickAddFolder = (): void => {
+  folderDialogOpen.value = true;
 };
 
 // 播放全部
@@ -49,23 +49,42 @@ const handlePlayAll = (): void => {
 
 // 扫描进度百分比
 const scanPercent = computed(() => {
-  if (!scanProgress.value || scanProgress.value.total === 0) return 0;
-  return Math.round((scanProgress.value.scanned / scanProgress.value.total) * 100);
+  if (!scanProgress.value || !scanProgress.value.total) return 0;
+  return Math.min(100, Math.round((scanProgress.value.scanned / scanProgress.value.total) * 100));
 });
 
 // 目录管理弹窗
 const folderDialogOpen = ref(false);
 
-const moreMenuItems = computed<DropdownMenuItem[]>(() => [
-  { key: "batchManage", label: t("songList.batch.manage"), icon: IconLucideListChecks },
-  { key: "folders", label: t("library.folders"), icon: IconFolderOpen, separator: true },
-  {
-    key: "scan",
-    label: scanning.value ? t("library.scanning") : t("library.scanAll"),
-    icon: IconRefreshCw,
-    disabled: scanning.value || scanDirs.value.length === 0,
-  },
-]);
+const moreMenuItems = computed<DropdownMenuItem[]>(() => {
+  const items: DropdownMenuItem[] = [
+    { key: "batchManage", label: t("songList.batch.manage"), icon: IconLucideListChecks },
+    { key: "folders", label: t("library.folders"), icon: IconFolderOpen, separator: true },
+  ];
+  if (scanning.value) {
+    items.push({
+      key: "cancelScan",
+      label: "取消正在进行的扫描",
+      icon: IconLucideX,
+    });
+  } else {
+    items.push(
+      {
+        key: "scanIncremental",
+        label: "增量扫描 (推荐)",
+        icon: IconRefreshCw,
+        disabled: scanDirs.value.length === 0,
+      },
+      {
+        key: "scanFull",
+        label: t("library.scanAll") || "全量重新扫描",
+        icon: IconRefreshCw,
+        disabled: scanDirs.value.length === 0,
+      },
+    );
+  }
+  return items;
+});
 
 // 更多菜单
 const handleMoreMenu = (key: string): void => {
@@ -78,22 +97,26 @@ const handleMoreMenu = (key: string): void => {
     case "folders":
       folderDialogOpen.value = true;
       break;
+    // 增量扫描
+    case "scanIncremental":
+      libraryStore.startScan(true);
+      break;
     // 全量扫描
-    case "scan":
+    case "scanFull":
       libraryStore.startScan(false);
+      break;
+    // 取消扫描
+    case "cancelScan":
+      libraryStore.cancelScan();
       break;
   }
 };
 
-// 进入页面时初始化
+// 进入页面时初始化（仅加载数据，绝不自动触发扫描）
 onMounted(async () => {
   libraryStore.subscribeScanProgress();
   if (!initialized.value) {
     await libraryStore.load();
-  }
-  // 有目录即扫描：尚无曲目时全量，已有曲目时增量
-  if (scanDirs.value.length > 0) {
-    libraryStore.startScan(tracks.value.length > 0);
   }
 });
 
@@ -125,7 +148,14 @@ onUnmounted(() => {
                   })
                 }}
               </span>
-              <span class="text-on-surface-variant/40">{{ scanPercent }}%</span>
+              <span class="text-on-surface-variant/40 font-mono">{{ scanPercent }}%</span>
+              <button
+                type="button"
+                class="ml-1 text-xs text-error hover:underline cursor-pointer border-none bg-transparent"
+                @click="libraryStore.cancelScan()"
+              >
+                取消
+              </button>
             </div>
             <div
               v-else-if="tracks.length > 0"
@@ -144,8 +174,9 @@ onUnmounted(() => {
           </Transition>
         </div>
       </div>
+      <!-- 操作栏 -->
       <div class="flex items-center justify-between gap-4">
-        <div class="flex items-center gap-3">
+        <div class="flex items-center gap-2">
           <SButton
             type="primary"
             variant="secondary"
@@ -158,14 +189,29 @@ onUnmounted(() => {
             </template>
             {{ t("common.playAll") }}
           </SButton>
+          <!-- 手动扫描按钮 (扫描中显示取消按钮) -->
           <SButton
+            v-if="!scanning"
             variant="secondary"
             circle
-            :disabled="scanning || scanDirs.length === 0"
+            :disabled="scanDirs.length === 0"
+            title="手动增量扫描曲库"
             @click="libraryStore.startScan(true)"
           >
             <template #icon>
-              <IconLucideRefreshCw :class="{ 'animate-spin': scanning }" />
+              <IconLucideRefreshCw />
+            </template>
+          </SButton>
+          <SButton
+            v-else
+            type="error"
+            variant="secondary"
+            circle
+            title="取消扫描"
+            @click="libraryStore.cancelScan()"
+          >
+            <template #icon>
+              <IconLucideX class="size-4" />
             </template>
           </SButton>
           <SDropdownMenu :items="moreMenuItems" align="start" @select="handleMoreMenu">

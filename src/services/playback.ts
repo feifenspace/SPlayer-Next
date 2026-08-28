@@ -8,6 +8,8 @@
  * 高频组件在自己的 RAF 循环中调用 getCurrentTime 读取
  */
 
+import { useStatusStore } from "@/stores/status";
+
 /** 当前播放位置（毫秒） */
 let currentTimeMs = 0;
 
@@ -46,18 +48,42 @@ const SYNC_TOLERANCE_MS = 1000;
  */
 const SYNC_CONVERGE_RATE = 0.2;
 
+/** 是否正在播放 */
+export const isPlaying = (): boolean => {
+  try {
+    const status = useStatusStore();
+    return status.isPlaying || playing;
+  } catch {
+    return playing;
+  }
+};
+
 /** 获取当前播放位置（毫秒），播放中按 speed 插值，seek 中冻结 */
 export const getCurrentTime = (): number => {
-  if (!playing || seeking) return currentTimeMs;
-  const elapsed = performance.now() - lastSyncAt;
-  return Math.min(currentTimeMs + elapsed * speed, totalDurationMs);
+  const isCurrentlyPlaying = isPlaying();
+  let baseMs = currentTimeMs;
+  try {
+    const status = useStatusStore();
+    if (status.position > 0 && Math.abs(status.position - currentTimeMs) > 2000) {
+      baseMs = status.position;
+      currentTimeMs = baseMs;
+    }
+  } catch {}
+  if (!isCurrentlyPlaying || seeking) return baseMs;
+  const elapsed = lastSyncAt > 0 ? performance.now() - lastSyncAt : 0;
+  const maxDur = totalDurationMs > 0 ? totalDurationMs : Number.MAX_SAFE_INTEGER;
+  return Math.min(baseMs + elapsed * speed, maxDur);
 };
 
 /** 获取总时长（毫秒） */
-export const getDuration = (): number => totalDurationMs;
-
-/** 是否正在播放 */
-export const isPlaying = (): boolean => playing;
+export const getDuration = (): number => {
+  if (totalDurationMs > 0) return totalDurationMs;
+  try {
+    return useStatusStore().duration;
+  } catch {
+    return 0;
+  }
+};
 
 /**
  * 同步主进程推送的位置

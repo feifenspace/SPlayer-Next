@@ -20,8 +20,8 @@ interface LoginStatusBody {
  * @returns 二维码 key
  */
 export const qrKey = async (): Promise<string> => {
-  const body = await neteaseApi.login_qr_key({ timestamp: Date.now() });
-  const unikey = body?.data?.unikey;
+  const body = (await neteaseApi.login_qr_key({ timestamp: Date.now() })) as any;
+  const unikey = body?.data?.unikey || body?.unikey;
   if (!unikey) throw new Error("qr key missing");
   return unikey;
 };

@@ -55,9 +55,7 @@ const hasTrack = computed(() => !!displayTrack.value);
 
 /** 精确播放时间（毫秒） */
 const { start: startTick, stop: stopTick } = usePlaybackTime((currentMs) => {
-  if (!status.trackLoading && !media.lyricLoading) {
-    lyricRef.value?.setCurrentTime(currentMs + status.lyricOffsetMs, player.isSeeking());
-  }
+  lyricRef.value?.setCurrentTime(currentMs + status.lyricOffsetMs, player.isSeeking());
 });
 
 /** 展开后 */
@@ -84,23 +82,23 @@ const onAfterLeave = () => {
 // 重新挂载时，刷新初始时间
 watch(hasLyric, (value) => {
   if (value && lyricMounted.value) {
-    initialLyricTimeMs.value = getCurrentTime() + status.lyricOffsetMs;
+    initialLyricTimeMs.value = getCurrentTime() + (status.lyricOffsetMs || 0);
   }
 });
 
 // 歌词变化时先推送精确时间
 watch(
   () => media.parsedLyric,
-  () => lyricRef.value?.setCurrentTime(getCurrentTime() + status.lyricOffsetMs),
+  () => lyricRef.value?.setCurrentTime(getCurrentTime() + (status.lyricOffsetMs || 0)),
 );
 
 // 切换歌词引擎时，重新计算初始并推送时间
 watch(
   () => settings.lyric.engine,
   () => {
-    initialLyricTimeMs.value = getCurrentTime() + status.lyricOffsetMs;
+    initialLyricTimeMs.value = getCurrentTime() + (status.lyricOffsetMs || 0);
     nextTick(() => {
-      lyricRef.value?.setCurrentTime(getCurrentTime() + status.lyricOffsetMs);
+      lyricRef.value?.setCurrentTime(getCurrentTime() + (status.lyricOffsetMs || 0));
       if (isPlaying.value) lyricRef.value?.resume();
     });
   },
@@ -197,7 +195,7 @@ const showComments = (): void => {
       @after-leave="onAfterLeave"
     >
       <div
-        v-show="isPlayerExpanded"
+        v-if="isPlayerExpanded"
         class="fixed inset-0 z-200 overflow-hidden text-cover"
         :class="immersive ? 'cursor-none [&_*]:!cursor-none' : ''"
         style="--lp-color: rgb(var(--s-cover))"

@@ -126,6 +126,21 @@ export const useLibraryStore = defineStore("library", () => {
     }
     if (dirsRes.success && dirsRes.data) scanDirs.value = dirsRes.data;
     initialized.value = true;
+    // 同步服务端真实扫描状态，防止残留
+    try {
+      const scanStatus = await window.api.library.isScanning();
+      if (scanStatus.success && scanStatus.data) {
+        const isCurrentlyScanning = Boolean((scanStatus.data as any).is_scanning ?? scanStatus.data);
+        scanning.value = isCurrentlyScanning;
+        if (!isCurrentlyScanning) scanProgress.value = null;
+      } else {
+        scanning.value = false;
+        scanProgress.value = null;
+      }
+    } catch {
+      scanning.value = false;
+      scanProgress.value = null;
+    }
     // 预取歌手头像
     loadArtistAvatars();
   };
@@ -155,22 +170,26 @@ export const useLibraryStore = defineStore("library", () => {
   };
 
   /** 添加扫描目录 */
-  const addScanDir = async (): Promise<{ success: boolean; error?: string }> => {
-    const res = await window.api.library.addScanDir();
+  const addScanDir = async (path?: string): Promise<{ success: boolean; error?: string }> => {
+    const res = await window.api.library.addScanDir(path);
     if (res.success) {
-      const newDir = res.data as string;
-      const nested = scanDirs.value.some(
-        (d) =>
-          newDir.startsWith(d + "\\") ||
-          newDir.startsWith(d + "/") ||
-          d.startsWith(newDir + "\\") ||
-          d.startsWith(newDir + "/"),
-      );
-      if (nested) {
-        await window.api.library.removeScanDir(newDir);
-        return { success: false, error: "nested" };
+      const newDir = (res.data as string) || path;
+      if (newDir) {
+        const nested = scanDirs.value.some(
+          (d) =>
+            newDir.startsWith(d + "\\") ||
+            newDir.startsWith(d + "/") ||
+            d.startsWith(newDir + "\\") ||
+            d.startsWith(newDir + "/"),
+        );
+        if (nested) {
+          await window.api.library.removeScanDir(newDir);
+          return { success: false, error: "nested" };
+        }
+        if (!scanDirs.value.includes(newDir)) {
+          scanDirs.value = [...scanDirs.value, newDir];
+        }
       }
-      scanDirs.value = [...scanDirs.value, newDir];
     }
     return res;
   };
@@ -197,10 +216,20 @@ export const useLibraryStore = defineStore("library", () => {
   /** 监听扫描进度 */
   const subscribeScanProgress = (): void => {
     unsubscribe?.();
-    unsubscribe = window.api.library.onScanProgress((data) => {
-      scanProgress.value = data;
-      if (data.phase === "done") {
+    unsubscribe = window.api.library.onScanProgress((raw: any) => {
+      if (!raw) return;
+      const phase = raw.phase || (raw.type === "done" ? "done" : raw.type === "error" ? "error" : "scanning");
+      const normalized: ScanProgress = {
+        phase,
+        scanned: raw.scanned ?? 0,
+        total: raw.total ?? 0,
+        current: raw.current,
+        error: raw.error,
+      };
+      scanProgress.value = normalized;
+      if (phase === "done") {
         scanning.value = false;
+        scanProgress.value = null;
         window.api.library.getTracks().then((res) => {
           if (res.success && res.data) {
             tracks.value = res.data;
@@ -208,8 +237,9 @@ export const useLibraryStore = defineStore("library", () => {
             loadArtistAvatars();
           }
         });
-      } else if (data.phase === "error") {
+      } else if (phase === "error") {
         scanning.value = false;
+        scanProgress.value = null;
       }
     });
   };
