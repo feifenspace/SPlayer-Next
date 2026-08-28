@@ -197,7 +197,10 @@ impl CaptureSink {
         } else {
             let mono_8k = downsample_mono(&self.mono, self.sample_rate, TARGET_SAMPLE_RATE);
             info!(samples = mono_8k.len(), "采集结束，输出 8kHz PCM");
-            let bytes: Vec<u8> = mono_8k.into_iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut bytes = Vec::with_capacity(mono_8k.len() * 4);
+            for v in mono_8k {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
             Some(Buffer::from(bytes))
         };
         (self.emitter)(JsCaptureEvent {

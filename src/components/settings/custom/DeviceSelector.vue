@@ -34,14 +34,14 @@ const scanDiretta = async () => {
 };
 
 const options = computed(() => {
-  const defaultName = status.outputDevices.find((d) => d.isDefault)?.name;
+  const defaultName = status.outputDevices.find((device) => device.isDefault)?.name;
   const defaultLabel = defaultName
     ? `${t("settings.outputDevice.default")}（${defaultName}）`
     : t("settings.outputDevice.default");
 
   const opts = [
     { value: SYSTEM_DEFAULT, label: defaultLabel },
-    ...status.outputDevices.map((d) => ({ value: d.name, label: d.name })),
+    ...status.outputDevices.map((device) => ({ value: device.id, label: device.name })),
   ];
 
   // 加入扫描到的 Diretta 网络 DAC 设备

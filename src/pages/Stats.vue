@@ -1,4 +1,6 @@
 <script setup lang="ts">
+defineOptions({ name: "Stats" });
+
 import type {
   DailyPlayStats,
   HourlyPlayStats,

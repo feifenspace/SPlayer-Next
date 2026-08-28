@@ -1,7 +1,7 @@
-import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import { app, ipcMain, powerMonitor } from "electron";
 import { sendToMain } from "@main/utils/broadcast";
+import { readFileAutoEncoding } from "@main/utils/encoding";
 import { wsBroadcast } from "@main/server/broadcast";
 import { toCacheUrl } from "@main/utils/protocol";
 import { toMs } from "@main/utils/time";
@@ -11,7 +11,13 @@ import * as lastfm from "@main/services/lastfm";
 import * as neteaseScrobble from "@main/services/neteaseScrobble";
 import { fetchBytes } from "@main/utils/fetchBytes";
 import { getPlayer, resetPlayer, onPlayerCreated } from "@main/services/engine";
-import { startDeviceMonitoring, stopDeviceMonitoring } from "@main/services/device";
+import {
+  cancelPendingReinit,
+  setPauseOnDeviceSwitch,
+  startDeviceMonitoring,
+  stopDeviceMonitoring,
+  requestReinit,
+} from "@main/services/device";
 import { getThumbar } from "@main/services/thumbar";
 import {
   setTraySongName,
@@ -69,14 +75,37 @@ const fail = (code: ErrorCode, error?: unknown) => {
   return { success: false as const, error: code };
 };
 
+/** 判断原生错误是否为设备错误 */
+const isNativeDeviceError = (error: unknown): boolean => String(error).includes("[Device]");
+const isNativeSourceNotFoundError = (error: unknown): boolean =>
+  String(error).includes("[SourceNotFound]");
+const isNativeNetworkError = (error: unknown): boolean =>
+  String(error).includes("[NetworkUnreachable]");
+const isNativeCancelledError = (error: unknown): boolean => String(error).includes("[Cancelled]");
+
+/** 根据原生错误特征和音源类型，将异常分类为标准 ErrorCode */
+const classifyLoadError = (error: unknown, source: string): ErrorCode => {
+  const msg = error instanceof Error ? error.message : String(error);
+  if (isNativeCancelledError(error)) {
+    return ErrorCode.LOAD_SUPERSEDED;
+  }
+  if (isNativeDeviceError(error) || /output device|NoDevice|DeviceNotAvailable/i.test(msg)) {
+    return ErrorCode.DEVICE_NOT_FOUND;
+  }
+  if (isNativeSourceNotFoundError(error)) {
+    return ErrorCode.FILE_NOT_FOUND;
+  }
+  if (isNativeNetworkError(error) || /^https?:\/\//i.test(source)) {
+    return ErrorCode.NETWORK_ERROR;
+  }
+  return ErrorCode.FILE_DECODE_ERROR;
+};
+
 /**
  * 播放器原生事件回调
  * @param inst 播放器实例
  */
 const registerNativeEvents = (inst: InstanceType<AudioEngineModule["AudioPlayer"]>): void => {
-  // 自动重建输出的冷却时间戳
-  let lastReinitAt = 0;
-  const REINIT_COOLDOWN_MS = 5000;
   inst.onEvent((event: JsPlayerEvent) => {
     switch (event.type) {
       case "stateChanged": {
@@ -107,6 +136,7 @@ const registerNativeEvents = (inst: InstanceType<AudioEngineModule["AudioPlayer"
             position: toDisplayPositionMs(toMs(inst.getPosition())),
             duration: toDisplayDurationMs(toMs(inst.getDuration())),
             volume: inst.getVolume(),
+            speed: inst.getSpeed(),
             isFinished: false,
           },
         };
@@ -154,14 +184,16 @@ const registerNativeEvents = (inst: InstanceType<AudioEngineModule["AudioPlayer"
         wsBroadcast(fftEvent);
         break;
       }
+      case "outputFailed": {
+        // 运行期流错误（CPAL/Rodio），重建输出流恢复播放
+        playerLog.warn("检测到音频输出流错误，触发恢复");
+        requestReinit(inst);
+        break;
+      }
       case "outputStalled": {
-        const now = Date.now();
-        if (now - lastReinitAt < REINIT_COOLDOWN_MS) break;
-        lastReinitAt = now;
-        playerLog.warn("检测到音频输出停滞，自动重建");
-        inst.reinitOutput().catch((error) => {
-          playerLog.error("自动重建音频输出失败:", error);
-        });
+        // 看门狗：无流错误但长期未消费样本
+        playerLog.warn("检测到音频输出停滞，触发恢复");
+        requestReinit(inst);
         break;
       }
     }
@@ -178,6 +210,7 @@ export const registerPlayerIpc = (): void => {
   onPlayerCreated(startDeviceMonitoring);
   // 加载音频文件
   ipcMain.handle("player:load", async (_event, source: string, options: LoadOptions = {}) => {
+    cancelPendingReinit();
     const autoPlay = options.autoPlay ?? true;
     const authoritative = options.meta ?? null;
     const cueRange = cueRangeFromTrack(authoritative);
@@ -194,6 +227,7 @@ export const registerPlayerIpc = (): void => {
           position: 0,
           duration: 0,
           volume: inst.getVolume(),
+          speed: inst.getSpeed(),
           isFinished: false,
         },
       };
@@ -306,19 +340,7 @@ export const registerPlayerIpc = (): void => {
       return { success: true, data };
     } catch (error) {
       if (seq === loadSeq) activeCueRange = null;
-      const msg = error instanceof Error ? error.message : String(error);
-      // 被更新的 load/stop 取代是正常竞态结果，不能按源类型误判为网络/解码错误
-      //（那两类是可跳曲错误，会让用户的停止操作变成自动跳下一曲）
-      if (msg.includes("已被更新的 load 取代")) {
-        return fail(ErrorCode.LOAD_SUPERSEDED);
-      }
-      const isDeviceError = /output device|NoDevice|DeviceNotAvailable/i.test(msg);
-      const isNetwork = source.startsWith("http://") || source.startsWith("https://");
-      const code = isDeviceError
-        ? ErrorCode.DEVICE_NOT_FOUND
-        : isNetwork
-          ? ErrorCode.NETWORK_ERROR
-          : ErrorCode.FILE_DECODE_ERROR;
+      const code = classifyLoadError(error, source);
       // 解码失败的源指向歌曲缓存目录 → 文件已损坏，把这条缓存项作废
       if (code === ErrorCode.FILE_DECODE_ERROR && source.startsWith(getSongCacheDir())) {
         void songCache.invalidate(source);
@@ -350,6 +372,7 @@ export const registerPlayerIpc = (): void => {
   // 停止播放并释放资源
   ipcMain.handle("player:stop", () => {
     try {
+      cancelPendingReinit();
       activeCueRange = null;
       getPlayer().stop();
       return { success: true };
@@ -386,6 +409,11 @@ export const registerPlayerIpc = (): void => {
     }
   });
 
+  ipcMain.handle("player:setPauseOnDeviceSwitch", (_event, enabled: boolean) => {
+    setPauseOnDeviceSwitch(enabled);
+    return { success: true };
+  });
+
   // 获取当前音量
   ipcMain.handle("player:getVolume", () => {
     return { success: true, data: getPlayer().getVolume() };
@@ -416,6 +444,7 @@ export const registerPlayerIpc = (): void => {
         position: toDisplayPositionMs(toMs(raw.position)),
         duration: toDisplayDurationMs(toMs(raw.duration)),
         volume: raw.volume,
+        speed: getPlayer().getSpeed(),
         isFinished: raw.isFinished,
       },
     };
@@ -427,7 +456,10 @@ export const registerPlayerIpc = (): void => {
       await getPlayer().reinitOutput();
       return { success: true };
     } catch (error) {
-      return fail(ErrorCode.UNKNOWN, error);
+      return fail(
+        isNativeDeviceError(error) ? ErrorCode.DEVICE_INIT_FAILED : ErrorCode.UNKNOWN,
+        error,
+      );
     }
   });
 
@@ -475,6 +507,7 @@ export const registerPlayerIpc = (): void => {
   ipcMain.handle("player:setSpeed", (_event, speed: number) => {
     try {
       getPlayer().setSpeed(speed);
+      mediaService.setRate(speed);
       nowPlaying.onSpeedChange(speed);
       return { success: true };
     } catch (error) {
@@ -536,7 +569,7 @@ export const registerPlayerIpc = (): void => {
       if (!LYRIC_FILE_EXTS.has(ext)) {
         return fail(ErrorCode.UNKNOWN, new Error(`不支持的歌词文件类型: ${ext}`));
       }
-      const content = await readFile(filePath, "utf-8");
+      const content = await readFileAutoEncoding(filePath);
       return { success: true, data: content };
     } catch (error) {
       return fail(ErrorCode.UNKNOWN, error);
@@ -576,15 +609,23 @@ export const registerPlayerIpc = (): void => {
     }
   });
 
-  // 切换输出设备（传 null 使用系统默认）
-  ipcMain.handle("player:setOutputDevice", async (_event, deviceName: string | null) => {
-    try {
-      await getPlayer().setOutputDevice(deviceName ?? undefined);
-      return { success: true };
-    } catch (error) {
-      return fail(ErrorCode.UNKNOWN, error);
-    }
-  });
+  // 切换输出设备（传设备 ID，null 使用系统默认）
+  ipcMain.handle(
+    "player:setOutputDevice",
+    async (_event, deviceId: string | null, pauseBeforeSwitch = false) => {
+      try {
+        cancelPendingReinit();
+        if (pauseBeforeSwitch) getPlayer().pauseImmediately();
+        await getPlayer().setOutputDevice(deviceId ?? undefined);
+        return { success: true };
+      } catch (error) {
+        return fail(
+          isNativeDeviceError(error) ? ErrorCode.DEVICE_INIT_FAILED : ErrorCode.UNKNOWN,
+          error,
+        );
+      }
+    },
+  );
 
   // 获取当前选择的输出设备名称
   ipcMain.handle("player:getSelectedDeviceName", () => {
@@ -640,7 +681,45 @@ export const registerPlayerIpc = (): void => {
           break;
         case "SetVolume":
           if (event.volume != null) {
-            inst.setVolume(event.volume);
+            if (0 <= event.volume && event.volume <= 1) {
+              inst.setVolume(event.volume);
+              mediaService.setVolume(event.volume);
+              sendToMain("player:event", {
+                type: "status",
+                data: {
+                  state: inst.getStatus().state as PlayerState,
+                  position: toDisplayPositionMs(toMs(inst.getPosition())),
+                  duration: toDisplayDurationMs(toMs(inst.getDuration())),
+                  volume: event.volume,
+                  speed: inst.getSpeed(),
+                  isFinished: false,
+                },
+              });
+            } else {
+              playerLog.warn(`无效的音量值: ${event.volume}`);
+            }
+          }
+          break;
+        case "SetRate":
+          if (event.rate != null) {
+            if (0.5 <= event.rate && event.rate <= 2.0) {
+              inst.setSpeed(event.rate);
+              mediaService.setRate(event.rate);
+              nowPlaying.onSpeedChange(event.rate);
+              sendToMain("player:event", {
+                type: "status",
+                data: {
+                  state: inst.getStatus().state as PlayerState,
+                  position: toDisplayPositionMs(toMs(inst.getPosition())),
+                  duration: toDisplayDurationMs(toMs(inst.getDuration())),
+                  volume: inst.getVolume(),
+                  speed: event.rate,
+                  isFinished: false,
+                },
+              });
+            } else {
+              playerLog.warn(`无效的播放速率值: ${event.rate}`);
+            }
           }
           break;
         case "NextTrack":
@@ -675,7 +754,7 @@ export const registerPlayerIpc = (): void => {
     stopDeviceMonitoring();
     const stoppedEvent = {
       type: "status",
-      data: { state: "stopped", position: 0, duration: 0, volume: 1, isFinished: false },
+      data: { state: "stopped", position: 0, duration: 0, volume: 1, speed: 1, isFinished: false },
     };
     sendToMain("player:event", stoppedEvent);
     wsBroadcast(stoppedEvent);

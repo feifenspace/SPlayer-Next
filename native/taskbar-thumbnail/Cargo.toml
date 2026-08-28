@@ -7,14 +7,11 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "3.12.1", features = ["napi9"] }
-napi-derive = "3.6.3"
+napi = { workspace = true, features = ["napi9"] }
+napi-derive = { workspace = true }
 
-[build-dependencies]
-napi-build = "2.4.1"
-
-[target.'cfg(target_os = "windows")'.dependencies.windows]
-version = "0.62"
+[dependencies.windows]
+workspace = true
 features = [
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
@@ -22,3 +19,9 @@ features = [
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ]
+
+[build-dependencies]
+napi-build = { workspace = true }
+
+[lints]
+workspace = true

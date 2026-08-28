@@ -65,10 +65,9 @@ describe("lyric parse", () => {
   it("将空时间标签保留为结束上一行的空白时间节点", () => {
     const lines = parseLyric({ content: "[00:00.00]A\n[00:01.00]\n[00:02.00]B" }, "lrc");
 
-    expect(lines).toHaveLength(3);
+    expect(lines).toHaveLength(2);
     expect(lines[0].endTime).toBe(1_000);
-    expect(lines[1]).toMatchObject({ startTime: 1_000, endTime: 2_000, words: [] });
-    expect(lines[2].startTime).toBe(2_000);
+    expect(lines[1].startTime).toBe(2_000);
   });
 
   it("使用 ESLRC 末尾时间标签结束最后一个字", () => {

@@ -17,8 +17,6 @@ import IconLucideListMusic from "~icons/lucide/list-music";
 import IconLucideHourglass from "~icons/lucide/hourglass";
 import IconLucideCalendar from "~icons/lucide/calendar";
 import IconLucideUser from "~icons/lucide/user";
-import IconMaterialSymbolsFavoriteRounded from "~icons/material-symbols/favorite-rounded";
-import IconMaterialSymbolsFavoriteOutlineRounded from "~icons/material-symbols/favorite-outline-rounded";
 import IconMoreHorizontal from "~icons/lucide/more-horizontal";
 import IconCopy from "~icons/lucide/copy";
 
@@ -34,6 +32,8 @@ const id = route.params.id as string;
 const collection = shallowRef<Collection | null>(null);
 /** 正在加载 */
 const loading = ref(false);
+/** 错误信息 */
+const error = ref("");
 /** 取消当次加载 */
 let loadAbort: AbortController | null = null;
 
@@ -59,6 +59,7 @@ const loadCollection = async (): Promise<void> => {
   const myAbort = new AbortController();
   loadAbort = myAbort;
   loading.value = true;
+  error.value = "";
 
   try {
     await loadCollectionService(source, type, id, {
@@ -69,6 +70,9 @@ const loadCollection = async (): Promise<void> => {
         collection.value = next;
       },
     });
+  } catch (err) {
+    if (myAbort.signal.aborted) return;
+    error.value = err instanceof Error ? err.message : String(err);
   } finally {
     if (!myAbort.signal.aborted) loading.value = false;
   }
@@ -428,6 +432,18 @@ onBeforeUnmount(() => {
         <div class="text-center text-on-surface-variant/60">
           <SLoading class="text-4xl text-primary/70 mb-4 mx-auto block" />
           <div class="text-sm">{{ t("common.loading") }}</div>
+        </div>
+      </div>
+      <!-- 错误态 -->
+      <div v-else-if="error" key="error" class="flex-1 flex items-center justify-center px-6">
+        <div class="text-center text-red-500/85">
+          <IconLucideTriangleAlert class="size-14 mx-auto mb-4 opacity-50" />
+          <div class="text-sm font-medium mb-1">{{ t("search.errorTitle") }}</div>
+          <div class="text-xs opacity-80 break-all max-w-xs mb-4">{{ error }}</div>
+          <SButton type="primary" variant="secondary" @click="loadCollection">
+            <template #icon><IconLucideRefreshCw /></template>
+            {{ t("common.retry") }}
+          </SButton>
         </div>
       </div>
       <!-- 空状态 -->

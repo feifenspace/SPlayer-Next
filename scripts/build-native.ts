@@ -25,6 +25,9 @@ const modules: NativeModule[] = [
     name: "taskbar-thumbnail",
     enabled: process.platform === "win32",
   },
+  {
+    name: "opencc",
+  },
 ];
 
 const isRustAvailable = () => {

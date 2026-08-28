@@ -184,6 +184,8 @@ Never hand-write native module types — import from `@splayer/*`. Use `shallowR
 ### Auto-imports
 
 In Vue components, `vue / pinia / vue-router / @vueuse/core / vue-i18n` are auto-imported, and UI components in `src/components/` are auto-registered.
+Icon components used only in Vue templates are auto-imported. Do not manually import them in
+`<script setup>`; import an icon explicitly only when it is referenced by script code.
 
 ### Logging (Main Process)
 
@@ -196,6 +198,10 @@ In preload's `onEvent`, always `ipcRenderer.removeAllListeners()` before adding 
 ### Prettier
 
 Double quotes, semicolons, 100-char width, trailing commas.
+
+Before committing, run Prettier on every file included in the commit and verify the formatted
+working tree before creating the commit. Do not leave formatting-only changes from the current task
+outside the commit.
 
 ### Shared Types
 

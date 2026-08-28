@@ -64,6 +64,8 @@ import comment_hot from "./comment_hot";
 import song_detail from "./song_detail";
 import song_url from "./song_url";
 import song_download_url from "./song_download_url";
+import song_simi_get from "./song_simi_get";
+import song_wiki_info from "./song_wiki_info";
 import playmode_intelligence from "./playmode_intelligence";
 import personal_fm from "./personal_fm";
 import fm_trash from "./fm_trash";
@@ -88,6 +90,7 @@ import playlist_desc_update from "./playlist_desc_update";
 import playlist_order_update from "./playlist_order_update";
 import likelist from "./likelist";
 import like from "./like";
+import like_v1 from "./like_v1";
 
 // 专辑
 import album from "./album";
@@ -154,9 +157,13 @@ export const modules: Record<string, NeteaseModule> = {
 
   song_detail,
   song_url,
+  song_url_v1: song_url,
   song_download_url,
+  song_simi_get,
+  song_wiki_info,
   playmode_intelligence,
   personal_fm,
+  personal_fm_mode: personal_fm,
   fm_trash,
   scrobble,
   scrobble_v1,
@@ -177,6 +184,7 @@ export const modules: Record<string, NeteaseModule> = {
   playlist_order_update,
   likelist,
   like,
+  like_v1,
 
   album,
   album_sub,

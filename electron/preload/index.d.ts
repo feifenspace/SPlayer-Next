@@ -31,6 +31,7 @@ import { CloudUploadApi } from "@shared/types/cloudUpload";
 import { CommentsApi } from "@shared/types/comment";
 import { AiModelApi } from "@shared/types/ai";
 import { PlaylistApi } from "@shared/types/playlist";
+import { OpenccApi } from "@shared/types/opencc";
 
 declare global {
   interface Window {
@@ -77,6 +78,7 @@ declare global {
       apis: ApisApi;
       cloud: CloudUploadApi;
       lyrics: LyricsApi;
+      opencc: OpenccApi;
       comments: CommentsApi;
       download: DownloadApi;
       theme: {

@@ -365,10 +365,26 @@ pub fn open_backend(
         .map_err(|e| BackendError::CaptureFailed(format!("获取采集接口失败: {e}")))?;
     let audio_event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
         .map_err(|e| BackendError::CaptureFailed(format!("创建事件句柄失败: {e}")))?;
-    let cancel_event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
-        .map_err(|e| BackendError::CaptureFailed(format!("创建事件句柄失败: {e}")))?;
-    unsafe { client.SetEventHandle(audio_event) }
-        .map_err(|e| BackendError::CaptureFailed(format!("设置事件句柄失败: {e}")))?;
+    let cancel_event = match unsafe { CreateEventW(None, false, false, PCWSTR::null()) } {
+        Ok(evt) => evt,
+        Err(e) => {
+            unsafe {
+                let _ = CloseHandle(audio_event);
+            }
+            return Err(BackendError::CaptureFailed(format!(
+                "创建事件句柄失败: {e}"
+            )));
+        }
+    };
+    if let Err(e) = unsafe { client.SetEventHandle(audio_event) } {
+        unsafe {
+            let _ = CloseHandle(audio_event);
+            let _ = CloseHandle(cancel_event);
+        }
+        return Err(BackendError::CaptureFailed(format!(
+            "设置事件句柄失败: {e}"
+        )));
+    }
 
     Ok(Arc::new(WindowsBackend {
         audio_client: client,

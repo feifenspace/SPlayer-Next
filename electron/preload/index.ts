@@ -25,6 +25,7 @@ import type {
   PlaylistCreateInput,
   PlaylistUpdateInput,
 } from "@shared/types/playlist";
+import type { CjkTransformMode } from "@shared/types/opencc";
 
 /** 订阅主进程推送的事件 */
 const subscribe = <T>(channel: string, callback: (data: T) => void): (() => void) => {
@@ -75,6 +76,9 @@ const api = {
     seek: (position: number) => ipcRenderer.invoke("player:seek", position),
     // 设置音量（0.0 ~ 1.0）
     setVolume: (volume: number) => ipcRenderer.invoke("player:setVolume", volume),
+    // 设置输出设备切换时暂停播放
+    setPauseOnDeviceSwitch: (enabled: boolean) =>
+      ipcRenderer.invoke("player:setPauseOnDeviceSwitch", enabled),
     // 获取当前音量
     getVolume: () => ipcRenderer.invoke("player:getVolume"),
     // 设置暂停/恢复时的渐变时长（毫秒），0 表示禁用
@@ -110,10 +114,10 @@ const api = {
     getOutputDevices: () => ipcRenderer.invoke("player:getOutputDevices"),
     // 获取系统默认输出设备名称
     getDefaultDeviceName: () => ipcRenderer.invoke("player:getDefaultDeviceName"),
-    // 切换输出设备（传 null 使用系统默认）
-    setOutputDevice: (deviceName: string | null) =>
-      ipcRenderer.invoke("player:setOutputDevice", deviceName),
-    // 获取当前选择的输出设备名称
+    // 切换输出设备（传设备 ID，null 使用系统默认）
+    setOutputDevice: (deviceId: string | null, pauseBeforeSwitch = false) =>
+      ipcRenderer.invoke("player:setOutputDevice", deviceId, pauseBeforeSwitch),
+    // 获取当前选择的输出设备 ID
     getSelectedDeviceName: () => ipcRenderer.invoke("player:getSelectedDeviceName"),
     // 获取当前歌曲的原始高清封面（base64 data URL）
     getCoverRaw: () => ipcRenderer.invoke("player:getCoverRaw"),
@@ -413,6 +417,14 @@ const api = {
     // 选择本地 TTML 歌词库目录
     pickLyricRepoDir: () => ipcRenderer.invoke("lyrics:pickLyricRepoDir"),
   },
+  opencc: {
+    // 转换单个文本
+    convert: (text: string, config: CjkTransformMode): Promise<string> =>
+      ipcRenderer.invoke("opencc:convert", text, config),
+    // 批量转换文本
+    convertBatch: (texts: string[], config: CjkTransformMode): Promise<string[]> =>
+      ipcRenderer.invoke("opencc:convertBatch", texts, config),
+  },
   comments: {
     sources: () => ipcRenderer.invoke("comments:sources"),
     get: (args: MusicCommentQuery) => ipcRenderer.invoke("comments:get", args),
@@ -420,10 +432,17 @@ const api = {
   download: {
     // 入队下载
     start: (req: unknown) => ipcRenderer.invoke("download:start", req),
+    // 批量入队下载
+    startMany: (reqs: unknown[]) => ipcRenderer.invoke("download:startMany", reqs),
     // 取消任务
     cancel: (taskId: string) => ipcRenderer.invoke("download:cancel", taskId),
-    // 重试（携带重新解析的 URL）
+    // 重试（复用 taskId 重新入队）
     retry: (req: unknown) => ipcRenderer.invoke("download:retry", req),
+    // 回传即时解析结果
+    submitResolution: (taskId: string, res: unknown) =>
+      ipcRenderer.invoke("download:resolution", taskId, res),
+    // 上报即时解析失败
+    failResolution: (taskId: string) => ipcRenderer.invoke("download:resolveFailed", taskId),
     // 删除一条任务记录
     remove: (taskId: string) => ipcRenderer.invoke("download:remove", taskId),
     // 清空已结束任务
@@ -440,6 +459,11 @@ const api = {
     onProgress: (callback: (data: unknown) => void) => subscribe("download:progress", callback),
     // 订阅状态变更
     onState: (callback: (task: unknown) => void) => subscribe("download:state", callback),
+    // 订阅解析请求
+    onResolve: (callback: (payload: unknown) => void) => {
+      ipcRenderer.removeAllListeners("download:resolve");
+      return subscribe("download:resolve", callback);
+    },
   },
   nowPlaying: {
     // 渲染进程同步当前播放状态到主进程

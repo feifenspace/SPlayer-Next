@@ -350,8 +350,8 @@
     }
   },
   "login": {
-    "qrTipWaiting": "请打开云音乐 APP 扫码登录",
-    "qrTipScanned": "扫描成功，请在客户端确认登录",
+    "qrTipWaiting": "请打开 APP 扫码登录",
+    "qrTipScanned": "扫描成功，请在 APP 中确认登录",
     "qrTipExpired": "二维码已过期，正在重试",
     "qrTipDone": "登录成功",
     "qrTipUnknown": "状态异常，请重试",
@@ -460,7 +460,10 @@
       "loading": "正在开启私人 FM…",
       "entered": "已开启私人 FM",
       "already": "已处于私人 FM",
-      "failed": "私人 FM 开启失败，请稍后重试"
+      "failed": "私人 FM 开启失败，请稍后重试",
+      "modeSettings": "私人 FM 模式选择",
+      "modeTooltip": "FM 模式与场景",
+      "modeSettingsTip": "选择喜好的推荐模式与场景"
     },
     "lyricOffset": {
       "title": "歌词偏移",
@@ -540,7 +543,7 @@
       "selected": "已选 {count} 首",
       "invert": "反选",
       "addToQueue": "添加到播放列表",
-      "download": "下载",
+      "download": "批量下载",
       "exit": "退出"
     },
     "delete": {
@@ -631,8 +634,7 @@
     "clearFinished": "清空已完成",
     "clearConfirmTitle": "清空已完成任务",
     "clearConfirmContent": "将从列表移除所有已完成和出错的任务记录，已下载的本地文件不会被删除。确认清空？",
-    "tabAll": "所有任务",
-    "tabActive": "下载中",
+    "tabActive": "待下载",
     "tabError": "下载出错",
     "tabDone": "已完成",
     "colStatus": "状态",
@@ -718,6 +720,7 @@
       "about": "关于软件"
     },
     "section": {
+      "platformLogin": "平台登录",
       "network": "网络代理",
       "aboutApp": "关于软件",
       "specialThanks": "特别致谢",
@@ -734,6 +737,7 @@
       "lyricExclude": "歌词排除",
       "lyricGeneral": "内容样式",
       "lyricDisplay": "显示效果",
+      "lyricAMLLOptimize": "歌词优化",
       "lyricSpring": "弹簧动画",
       "lyricLayout": "布局与透明度",
       "desktopLyric": "桌面歌词",
@@ -919,6 +923,25 @@
       "label": "自动识别背景歌词",
       "description": "根据括号识别背景人声，误判时可关闭"
     },
+    "cjkTransform": {
+      "label": "繁简转换",
+      "description": "对歌词文本进行简繁中文或日文汉字转换",
+      "none": "不转换",
+      "s2t": "简体 → 繁体",
+      "t2s": "繁体 → 简体",
+      "s2tw": "简体 → 台湾正体",
+      "tw2s": "台湾正体 → 简体",
+      "s2hk": "简体 → 香港繁体",
+      "hk2s": "香港繁体 → 简体",
+      "s2twp": "简体 → 台湾正体",
+      "tw2sp": "台湾正体 → 简体",
+      "t2tw": "繁体 → 台湾正体",
+      "tw2t": "台湾正体 → 繁体",
+      "t2hk": "繁体 → 香港繁体",
+      "hk2t": "香港繁体 → 繁体",
+      "jp2t": "日本新字体 → 繁体",
+      "t2jp": "繁体 → 日本新字体"
+    },
     "enableOnlineTTMLLyric": {
       "label": "启用在线 TTML 歌词",
       "description": "从 AMLL TTML DB 获取歌词，支持逐字、翻译、音译"
@@ -1051,6 +1074,30 @@
     "amllScaleSpringSoft": {
       "label": "缩放强制软弹簧",
       "description": "启用后将强制使用较软的焦点行缩放弹簧动效"
+    },
+    "amllCleanUnintentionalOverlaps": {
+      "label": "清洗时间重叠",
+      "description": "自动截断两行之间非刻意的微小时间重叠，避免多行同时高亮"
+    },
+    "amllTryAdvanceStartTime": {
+      "label": "提前入场动画",
+      "description": "尝试让歌词入场动画提前开始（最多 1 秒），使过渡更加平滑"
+    },
+    "amllConvertExcessiveBackgroundLines": {
+      "label": "合并背景人声",
+      "description": "将多行连续背景人声转换为单行背景人声与主歌词行的形式"
+    },
+    "amllSyncMainAndBackgroundLines": {
+      "label": "同步背景人声时间",
+      "description": "自动同步主歌词与背景人声的时间轴"
+    },
+    "amllNormalizeSpaces": {
+      "label": "规范化空格",
+      "description": "将歌词文本中的多个连续空格合并为单个空格"
+    },
+    "amllResetLineTimestamps": {
+      "label": "重设行时间戳",
+      "description": "将行级时间戳强制重设为字级时间戳范围"
     },
     "autoCenterCover": {
       "label": "自动居中封面",
@@ -1556,6 +1603,27 @@
         "canceled": "已取消授权",
         "failed": "连接失败，请重试",
         "disconnected": "已断开 Last.fm 连接"
+      }
+    },
+    "platformLogin": {
+      "title": "登录 {name} 账号",
+      "desc": "登录后可获取对应平台播放地址",
+      "vipTag": " · VIP 会员",
+      "loginWeb": "网页登录",
+      "loginQr": "扫码登录",
+      "qrTitle": "扫码登录",
+      "manualCookie": "Cookie 登录",
+      "logout": "退出登录",
+      "logoutTitle": "退出 {name} 登录",
+      "logoutConfirm": "确定要退出当前 {name} 账号（{user}）吗？",
+      "cookieTitle": "设置 {name} Cookie",
+      "cookiePlaceholder": "请输入 Cookie",
+      "toast": {
+        "loginSuccess": "{name} 登录成功：{user}",
+        "loginFailed": "{name} 登录失败，请重试",
+        "logoutDone": "已退出 {name} 登录",
+        "cookieSuccess": "{name} Cookie 设置成功",
+        "cookieInvalid": "Cookie 无效，请检查后重试"
       }
     },
     "rememberWindowState": {
@@ -2115,6 +2183,7 @@
     "SCAN_DIR_NOT_SELECTED": "未选择目录",
     "TAG_READ_FAILED": "读取标签失败",
     "TAG_WRITE_FAILED": "写入标签失败",
+    "MAX_CONSECUTIVE_FAILURES": "连续播放失败次数过多",
     "UNKNOWN": "操作失败"
   },
   "tagEditor": {

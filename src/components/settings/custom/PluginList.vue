@@ -223,7 +223,7 @@ const refreshMarket = async (): Promise<void> => {
 
       <!-- 音源插件分区 -->
       <div v-if="sourcePlugins.length > 0" class="flex flex-col gap-2">
-        <div class="text-xs font-medium text-on-surface-variant/60 px-1">
+        <div class="text-sm font-medium text-on-surface-variant/70 px-1">
           {{ t("settings.plugins.sectionSource") }}
         </div>
         <div class="grid gap-2.5 [grid-template-columns:repeat(auto-fill,minmax(220px,1fr))]">
@@ -244,7 +244,7 @@ const refreshMarket = async (): Promise<void> => {
 
       <!-- 控制插件分区 -->
       <div v-if="controlPlugins.length > 0" class="flex flex-col gap-2">
-        <div class="text-xs font-medium text-on-surface-variant/60 px-1">
+        <div class="text-sm font-medium text-on-surface-variant/70 px-1">
           {{ t("settings.plugins.sectionControl") }}
         </div>
         <div class="grid gap-2.5 [grid-template-columns:repeat(auto-fill,minmax(220px,1fr))]">

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+defineOptions({ name: "History" });
+
 import type { PlaybackContext } from "@shared/types/player";
 import type { DropdownMenuItem } from "@/components/ui/SDropdownMenu.vue";
 import { useHistoryStore } from "@/stores/history";
