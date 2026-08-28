@@ -45,6 +45,10 @@ export class ElectronPlayerClient implements IPlayerClient {
     return this.api.setVolume(volume);
   }
 
+  setPauseOnDeviceSwitch(enabled: boolean): Promise<IpcResponse> {
+    return this.api.setPauseOnDeviceSwitch(enabled);
+  }
+
   getVolume(): Promise<IpcResponse<number>> {
     return this.api.getVolume();
   }

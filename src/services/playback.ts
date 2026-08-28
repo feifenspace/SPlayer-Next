@@ -19,6 +19,9 @@ let totalDurationMs = 0;
 /** 上次同步的本地时间戳 */
 let lastSyncAt = 0;
 
+/** 是否已同步过（lastSyncAt 有效）。不能以 lastSyncAt > 0 判断：mock 墙钟从 0 起点时恒为假 */
+let hasSynced = false;
+
 /** 是否正在播放 */
 let playing = false;
 
@@ -70,7 +73,8 @@ export const getCurrentTime = (): number => {
     }
   } catch {}
   if (!isCurrentlyPlaying || seeking) return baseMs;
-  const elapsed = lastSyncAt > 0 ? performance.now() - lastSyncAt : 0;
+  // 从未同步过位置时不做插值，避免以页面加载以来的墙钟偏移产生巨大跳变
+  const elapsed = hasSynced ? performance.now() - lastSyncAt : 0;
   const maxDur = totalDurationMs > 0 ? totalDurationMs : Number.MAX_SAFE_INTEGER;
   return Math.min(baseMs + elapsed * speed, maxDur);
 };
@@ -97,12 +101,14 @@ export const setCurrentTime = (ms: number, options: { force?: boolean } = {}): n
     if (Math.abs(interpolated - ms) < SYNC_TOLERANCE_MS) {
       currentTimeMs = interpolated + (ms - interpolated) * SYNC_CONVERGE_RATE;
       lastSyncAt = performance.now();
+      hasSynced = true;
       return currentTimeMs;
     }
   }
   resyncPending = false;
   currentTimeMs = ms;
   lastSyncAt = performance.now();
+  hasSynced = true;
   return ms;
 };
 
@@ -159,6 +165,7 @@ export const reset = (): void => {
   currentTimeMs = 0;
   totalDurationMs = 0;
   lastSyncAt = 0;
+  hasSynced = false;
   playing = false;
   seeking = false;
   resyncPending = false;

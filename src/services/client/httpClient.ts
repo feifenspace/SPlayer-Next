@@ -17,6 +17,7 @@ interface ServerStatusResponse {
   volume: number;
   is_finished?: boolean;
   current_source?: string | null;
+  speed?: number;
 }
 
 interface ServerWsMessage {
@@ -25,6 +26,7 @@ interface ServerWsMessage {
   duration: number;
   volume: number;
   is_finished?: boolean;
+  speed?: number;
 }
 
 /**
@@ -227,6 +229,7 @@ export class HttpPlayerClient implements IPlayerClient {
         duration: durMs,
         volume: msg.volume ?? 1.0,
         isFinished: Boolean(msg.is_finished),
+        speed: Number(msg.speed ?? 1.0),
       },
     });
   }
@@ -616,6 +619,7 @@ export class HttpPlayerClient implements IPlayerClient {
         duration: Math.round(data.duration * 1000),
         volume: data.volume,
         isFinished: Boolean(data.is_finished),
+        speed: data.speed ?? 1.0,
       },
     };
   }
@@ -682,6 +686,12 @@ export class HttpPlayerClient implements IPlayerClient {
   }
 
   async setPitchSync(_sync: boolean): Promise<IpcResponse> {
+    return { success: true };
+  }
+
+  // 设备切换前暂停开关：headless 模式无热拔插场景，Diretta 目标切换由
+  // selectDirettaTarget 内部处理，此处按 Web 降级语义接受但不生效
+  async setPauseOnDeviceSwitch(_enabled: boolean): Promise<IpcResponse> {
     return { success: true };
   }
 
