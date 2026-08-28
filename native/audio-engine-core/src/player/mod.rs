@@ -96,7 +96,11 @@ impl InnerPlayer {
     /// 设备失效时的重建由 `reinit_output` 显式处理，不在此函数内自动恢复
     fn ensure_output(&mut self) -> Result<&AudioOutput> {
         if self.output.is_none() {
-            self.output = Some(AudioOutput::new(self.selected_device_name.as_deref())?);
+            self.output = Some(AudioOutput::new(
+                self.selected_device_name.as_deref(),
+                (self.audio_sample_rate > 0).then_some(self.audio_sample_rate),
+                (self.audio_channels > 0).then_some(self.audio_channels),
+            )?);
         }
         self.output
             .as_ref()
@@ -197,7 +201,11 @@ impl InnerPlayer {
     pub fn recreate_output_device(&mut self) -> Result<()> {
         info!(device = ?self.selected_device_name, "开始重建音频输出");
         self.output.take();
-        self.output = Some(AudioOutput::new(self.selected_device_name.as_deref())?);
+        self.output = Some(AudioOutput::new(
+            self.selected_device_name.as_deref(),
+            (self.audio_sample_rate > 0).then_some(self.audio_sample_rate),
+            (self.audio_channels > 0).then_some(self.audio_channels),
+        )?);
         Ok(())
     }
 

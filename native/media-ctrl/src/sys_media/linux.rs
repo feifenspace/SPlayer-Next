@@ -102,7 +102,7 @@ impl LinuxImpl {
     }
 
     fn send_cmd(&self, cmd: MprisCommand) {
-        let _ = self.sender.blocking_send(cmd);
+        let _ = self.sender.try_send(cmd);
     }
 }
 

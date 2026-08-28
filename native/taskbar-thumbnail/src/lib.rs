@@ -7,6 +7,8 @@
 //! `DWMWA_HAS_ICONIC_BITMAP`，并子类化窗口拦截两条 DWM 消息，被动应答位图。
 //! 所有访问都在主线程（NAPI 调用与窗口消息同线程），故用 `thread_local` 保存状态。
 
+#![cfg(target_os = "windows")]
+
 use std::cell::RefCell;
 use std::ffi::c_void;
 

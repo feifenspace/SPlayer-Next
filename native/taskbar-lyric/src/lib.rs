@@ -1,6 +1,8 @@
 //! Windows 任务栏歌词原生模块
 //! 通过 NAPI-RS 暴露给 Node.js，将 Electron BrowserWindow 嵌入 Windows 任务栏
 
+#![cfg(target_os = "windows")]
+
 use std::ffi::c_void;
 
 use napi::{

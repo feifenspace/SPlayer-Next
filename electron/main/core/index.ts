@@ -18,6 +18,7 @@ import { initDatabase, closeDatabase } from "@main/database";
 import { init as initSongCache } from "@main/services/songCache";
 import { init as initDownload } from "@main/services/downloadManager";
 import { pluginRegistry } from "@main/plugins/registry";
+import { isHeadless } from "./mode";
 import {
   init as initPlaybackBridge,
   dispose as disposePlaybackBridge,
@@ -105,12 +106,6 @@ export const initApp = (): void => {
     registerIpcHandlers();
     // 初始化数据库
     initDatabase();
-    // 创建主窗口
-    createMainWindow();
-    // 注册 orpheus 协议并处理冷启动唤起
-    initOrpheusRegistration();
-    const coldOrpheusUrl = extractOrpheusUrl(process.argv);
-    if (coldOrpheusUrl) captureOrpheusUrl(coldOrpheusUrl);
     // 启动歌曲缓存
     void initSongCache();
     // 启动下载服务
@@ -122,11 +117,19 @@ export const initApp = (): void => {
     pluginRegistry.init();
     // 初始化播放事件桥（需在 pluginRegistry.init 之后，读 hasEnabledControlPlugin）
     initPlaybackBridge();
-    // 恢复歌词相关窗口
-    restoreLyricWindows();
-    // 注册全局快捷键
-    initGlobalHotkey();
-    // 启动外部 API 服务
+    // 注册 orpheus 协议并处理冷启动唤起
+    initOrpheusRegistration();
+    const coldOrpheusUrl = extractOrpheusUrl(process.argv);
+    if (coldOrpheusUrl) captureOrpheusUrl(coldOrpheusUrl);
+    // 仅在非无头模式创建主窗口
+    if (!isHeadless()) {
+      createMainWindow();
+      // 恢复歌词相关窗口
+      restoreLyricWindows();
+      // 注册全局快捷键
+      initGlobalHotkey();
+    }
+    // 启动外部 API 服务（无论是否无头均启动）
     void startServer();
     // 启动 AI 集成 MCP 服务
     void startMcpServer();

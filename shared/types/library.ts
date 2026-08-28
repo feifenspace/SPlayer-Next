@@ -61,8 +61,8 @@ export interface LibraryApi {
   getRandomTracks: (limit: number) => Promise<IpcResponse<Track[]>>;
   /** 获取扫描状态 */
   isScanning: () => Promise<IpcResponse<boolean>>;
-  /** 弹出目录选择器，添加扫描目录 */
-  addScanDir: () => Promise<IpcResponse<string>>;
+  /** 弹出目录选择器，添加扫描目录（Web 模式下直接传入路径） */
+  addScanDir: (dirPath?: string) => Promise<IpcResponse<string>>;
   /** 移除扫描目录及其下曲目 */
   removeScanDir: (dir: string) => Promise<IpcResponse>;
   /** 获取已配置的扫描目录 */

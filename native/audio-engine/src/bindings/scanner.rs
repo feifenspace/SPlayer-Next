@@ -8,7 +8,7 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use tracing::info;
 
-use crate::scanner;
+use audio_engine_core::scanner;
 
 /// 全局扫描取消标志
 static SCAN_CANCEL: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);

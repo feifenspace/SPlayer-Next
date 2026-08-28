@@ -16,9 +16,8 @@ use walkdir::WalkDir;
 
 use crate::metadata;
 
-/// 支持的音频文件扩展名
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "wav", "ogg", "aac", "m4a", "wma", "opus", "ape",
+    "mp3", "flac", "wav", "ogg", "aac", "m4a", "wma", "opus", "ape", "dsf", "dff", "iso", "cue",
 ];
 
 /// 每批回调的文件数
@@ -107,7 +106,120 @@ fn collect_removed_paths(
 /// 使用 ffmpeg_audio 打开音频文件并读取元数据
 ///
 /// 新 API 下 AudioReader 不再要求重采样参数，扫库每文件省一次 SwrContext 分配
-pub(crate) fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTrack> {
+pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTrack> {
+    if crate::sacd::is_sacd_iso_path(path) {
+        if let Ok(mut reader) = crate::sacd::IsoReader::open(path) {
+            if let Ok(disc) = crate::sacd::SacdDisc::parse(&mut reader) {
+                let area = disc
+                    .stereo_area_idx
+                    .and_then(|idx| disc.areas.get(idx))
+                    .or_else(|| {
+                        disc.multichannel_area_idx
+                            .and_then(|idx| disc.areas.get(idx))
+                    })
+                    .or_else(|| disc.areas.first());
+                if let Some(area) = area {
+                    if let Some(t) = area.tracks.first() {
+                        return Some(ScannedTrack {
+                            path: path.to_string(),
+                            title: disc.album_title.clone().or_else(|| t.title.clone()),
+                            artist: disc.album_artist.clone().or_else(|| t.artist.clone()),
+                            album: disc.album_title.clone(),
+                            track: Some(1),
+                            duration: area.tracks.iter().map(|tr| tr.duration).sum(),
+                            codec: if t.is_dst {
+                                "sacd_dst".to_string()
+                            } else {
+                                "sacd_dsd".to_string()
+                            },
+                            sample_rate: t.sample_rate,
+                            bit_rate: t.bit_rate as i64,
+                            channels: t.channels as u32,
+                            bits_per_sample: 1,
+                            cover: None,
+                            file_size: reader.total_sectors as u64 * 2048,
+                            mtime: 0,
+                            ctime: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    if crate::cue::is_cue_path(path) {
+        if let Ok(cue) = crate::cue::CueSheet::parse_file(path) {
+            let total_dur: f64 = cue.tracks.iter().filter_map(|t| t.duration).sum();
+            return Some(ScannedTrack {
+                path: path.to_string(),
+                title: cue.global_title.clone(),
+                artist: cue.global_performer.clone(),
+                album: cue.global_title.clone(),
+                track: None,
+                duration: total_dur,
+                codec: "cue".to_string(),
+                sample_rate: 44_100,
+                bit_rate: 1_411_200,
+                channels: 2,
+                bits_per_sample: 16,
+                cover: None,
+                file_size: 0,
+                mtime: 0,
+                ctime: 0,
+            });
+        }
+    }
+
+    if crate::dsd::is_dsd_path(path) {
+        if path.to_lowercase().ends_with(".dsf") {
+            if let Ok(dsf) = crate::dsd::DsfReader::open(path) {
+                return Some(ScannedTrack {
+                    path: path.to_string(),
+                    title: Path::new(path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(String::from),
+                    artist: None,
+                    album: None,
+                    track: None,
+                    duration: dsf.duration_seconds,
+                    codec: "dsd_dsf".to_string(),
+                    sample_rate: dsf.sample_rate,
+                    bit_rate: (dsf.sample_rate as i64 * dsf.channels as i64),
+                    channels: dsf.channels as u32,
+                    bits_per_sample: 1,
+                    cover: None,
+                    file_size: dsf.data_size,
+                    mtime: 0,
+                    ctime: 0,
+                });
+            }
+        } else if path.to_lowercase().ends_with(".dff") {
+            if let Ok(dff) = crate::dsd::DffReader::open(path) {
+                return Some(ScannedTrack {
+                    path: path.to_string(),
+                    title: Path::new(path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(String::from),
+                    artist: None,
+                    album: None,
+                    track: None,
+                    duration: dff.duration_seconds,
+                    codec: "dsd_dff".to_string(),
+                    sample_rate: dff.sample_rate,
+                    bit_rate: (dff.sample_rate as i64 * dff.channels as i64),
+                    channels: dff.channels as u32,
+                    bits_per_sample: 1,
+                    cover: None,
+                    file_size: dff.data_size,
+                    mtime: 0,
+                    ctime: 0,
+                });
+            }
+        }
+    }
+
     let file = fs::File::open(path).ok()?;
     let reader = AudioReader::new(file).ok()?;
 
@@ -154,7 +266,7 @@ pub(crate) fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<Sc
 /// 获取文件时间与大小：
 /// - mtime: 修改时间（Unix ms）
 /// - ctime: 创建时间（Unix ms，若不可用回退为 mtime）
-pub(crate) fn file_stat(path: &Path) -> Option<(u64, u64, u64)> {
+pub fn file_stat(path: &Path) -> Option<(u64, u64, u64)> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -346,6 +458,100 @@ pub fn scan_directories(
         cue_files,
         unavailable_dirs,
     });
+}
+
+/// 解析单个 CUE 文件并展开为完整分轨列表
+pub fn probe_cue_tracks(cue_path: &str, _cover_cache_dir: Option<&str>) -> Vec<ScannedTrack> {
+    let (mtime, ctime, file_size) = file_stat(Path::new(cue_path)).unwrap_or((0, 0, 0));
+    let Ok(cue) = crate::cue::CueSheet::parse_file(cue_path) else {
+        return Vec::new();
+    };
+
+    let mut tracks = Vec::new();
+    for t in cue.tracks {
+        let (sample_rate, channels, bit_rate, bits_per_sample, codec) = {
+            if let Some(meta) = probe_fast(&t.physical_path.to_string_lossy(), None) {
+                (
+                    meta.sample_rate,
+                    meta.channels,
+                    meta.bit_rate,
+                    meta.bits_per_sample,
+                    meta.codec,
+                )
+            } else {
+                (44_100, 2, 1_411_200, 16, "flac".to_string())
+            }
+        };
+
+        let duration = t.duration.unwrap_or(0.0);
+        tracks.push(ScannedTrack {
+            path: t.virtual_path,
+            title: t.title,
+            artist: t.artist.or_else(|| cue.global_performer.clone()),
+            album: t.album.or_else(|| cue.global_title.clone()),
+            track: Some(t.track_num),
+            duration,
+            codec,
+            sample_rate,
+            bit_rate,
+            channels,
+            bits_per_sample,
+            cover: None,
+            file_size,
+            mtime,
+            ctime,
+        });
+    }
+    tracks
+}
+
+/// 解析单个 SACD ISO 镜像文件并展开为全部音轨列表
+pub fn probe_sacd_tracks(iso_path: &str) -> Vec<ScannedTrack> {
+    let (mtime, ctime, file_size) = file_stat(Path::new(iso_path)).unwrap_or((0, 0, 0));
+    let Ok(mut reader) = crate::sacd::IsoReader::open(iso_path) else {
+        return Vec::new();
+    };
+    let Ok(disc) = crate::sacd::SacdDisc::parse(&mut reader) else {
+        return Vec::new();
+    };
+
+    let area = if let Some(idx) = disc.stereo_area_idx {
+        disc.areas.get(idx)
+    } else if let Some(idx) = disc.multichannel_area_idx {
+        disc.areas.get(idx)
+    } else {
+        disc.areas.first()
+    };
+
+    let Some(area) = area else {
+        return Vec::new();
+    };
+
+    let mut tracks = Vec::new();
+    for t in &area.tracks {
+        tracks.push(ScannedTrack {
+            path: t.virtual_path.clone(),
+            title: t.title.clone(),
+            artist: t.artist.clone().or_else(|| disc.album_artist.clone()),
+            album: t.album.clone().or_else(|| disc.album_title.clone()),
+            track: Some(t.track_num),
+            duration: t.duration,
+            codec: if t.is_dst {
+                "sacd_dst".to_string()
+            } else {
+                "sacd_dsd".to_string()
+            },
+            sample_rate: t.sample_rate,
+            bit_rate: t.bit_rate as i64,
+            channels: t.channels as u32,
+            bits_per_sample: 1,
+            cover: None,
+            file_size,
+            mtime,
+            ctime,
+        });
+    }
+    tracks
 }
 
 #[cfg(test)]

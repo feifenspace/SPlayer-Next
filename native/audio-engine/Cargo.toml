@@ -7,56 +7,20 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+audio-engine-core = { path = "../audio-engine-core", features = ["napi"] }
 napi = { version = "3.12.1", features = ["napi9", "serde-json", "tokio_rt"] }
 napi-derive = "3.6.3"
 ffmpeg_audio = { version = "0.3.1", default-features = false, features = [
   "http",
   "tracing",
 ] }
-libc = "0.2"
-rodio = { version = "0.22.2", default-features = false, features = [
-  "playback",
-  "tracing",
-] }
 parking_lot = "0.12"
 anyhow = "1"
-thiserror = "2"
-signalsmith-stretch = "0.1.3"
-lofty = "0.24"
-image = { version = "0.25", default-features = false, features = [
-  "jpeg",
-  "png",
-  "bmp",
-  "webp",
-] }
-rustfft = "6"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = [
-  "env-filter",
-  "local-time",
-] }
-tracing-appender = "0.2"
-time = { version = "0.3", features = ["macros", "formatting"] }
-walkdir = "2"
 tokio = { version = "1", features = ["rt"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-core = "0.62.2"
-
-[target.'cfg(target_os = "windows")'.dependencies.windows]
-version = "0.62"
-features = [
-  "Win32_Foundation",
-  "Win32_Media_Audio",
-  "Win32_System_Com",
-  "Win32_System_Threading",
-]
 
 [build-dependencies]
 napi-build = "2.4.1"
-
-[dev-dependencies]
-httpmock = "0.8.3"
 
 [lints]
 workspace = true

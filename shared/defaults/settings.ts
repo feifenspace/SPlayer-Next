@@ -139,6 +139,7 @@ export const defaultSystemConfig: SystemConfig = {
     wsEnabled: false,
     allowLan: false,
     port: 14558,
+    bypassToken: "",
   },
   mcp: {
     enabled: false,

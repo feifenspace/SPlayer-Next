@@ -8,8 +8,8 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
-use crate::player::{self, InnerPlayer, PlayerEvent, PlayerState, SeekTake};
-use crate::{audio_output, decoder, device_watcher};
+use audio_engine_core::player::{self, InnerPlayer, PlayerEvent, PlayerState, SeekTake};
+use audio_engine_core::{audio_output, decoder, device_watcher};
 
 use super::IntoNapiResult;
 
@@ -17,8 +17,8 @@ use super::IntoNapiResult;
 enum SeekOutcome {
     /// seek 成功 + 已启动新解码线程
     Resumed {
-        shared: Arc<crate::shared::Shared>,
-        handle: JoinHandle<crate::decoder::DecoderData>,
+        shared: Arc<audio_engine_core::shared::Shared>,
+        handle: JoinHandle<audio_engine_core::decoder::DecoderData>,
     },
     /// seek 失败，需要 fallback 到完整 load
     Fallback,
@@ -193,15 +193,17 @@ impl AudioPlayer {
             if !decoder_data.seek(position) {
                 return SeekOutcome::Fallback;
             }
-            let shared =
-                crate::shared::Shared::new(output_sample_rate, crate::decoder::TARGET_CHANNELS);
+            let shared = audio_engine_core::shared::Shared::new(
+                output_sample_rate,
+                audio_engine_core::decoder::TARGET_CHANNELS,
+            );
             shared.set_normalization_enabled(normalization_enabled);
             shared.set_normalization_gain(normalization_gain);
             equalizer.lock().set_sample_rate(output_sample_rate);
             equalizer.lock().reset_state();
             tempo.lock().set_sample_rate(output_sample_rate);
             tempo.lock().reset();
-            let handle = match crate::decoder::resume_decode(
+            let handle = match audio_engine_core::decoder::resume_decode(
                 decoder_data,
                 std::sync::Arc::clone(&shared),
                 equalizer,
@@ -348,7 +350,7 @@ impl AudioPlayer {
         source: String,
         #[napi(ts_arg_type = "boolean")] auto_play: Option<bool>,
     ) -> Result<JsMusicMetadata> {
-        use crate::shared::Shared;
+        use audio_engine_core::shared::Shared;
 
         let auto_play = auto_play.unwrap_or(true);
         info!(source = %source, auto_play, "加载音频源");
@@ -392,7 +394,7 @@ impl AudioPlayer {
             if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
                 anyhow::bail!(LOAD_SUPERSEDED_REASON);
             }
-            let output = audio_output::AudioOutput::new(device_name.as_deref())?;
+            let output = audio_output::AudioOutput::new(device_name.as_deref(), None, None)?;
             let shared = Shared::new(output.sample_rate(), decoder::TARGET_CHANNELS);
             shared.set_normalization_enabled(normalization_enabled);
             equalizer.lock().set_sample_rate(output.sample_rate());
@@ -425,7 +427,7 @@ impl AudioPlayer {
                     token,
                     &source,
                     auto_play,
-                    crate::player::LoadedPlayback {
+                    audio_engine_core::player::LoadedPlayback {
                         metadata,
                         decode_handle,
                         shared,
@@ -443,7 +445,7 @@ impl AudioPlayer {
     }
 
     /// 内部：将 AudioMetadata 转为 JS 结构
-    fn meta_to_js(meta: crate::metadata::AudioMetadata) -> JsMusicMetadata {
+    fn meta_to_js(meta: audio_engine_core::metadata::AudioMetadata) -> JsMusicMetadata {
         JsMusicMetadata {
             title: meta.title,
             artist: meta.artist,
@@ -512,7 +514,7 @@ impl AudioPlayer {
     /// seek 失败时 fallback 到完整 load
     #[napi]
     pub async fn seek(&self, position: f64) -> Result<()> {
-        use crate::shared::Shared;
+        use audio_engine_core::shared::Shared;
 
         let take = {
             let mut player = self.inner.lock();

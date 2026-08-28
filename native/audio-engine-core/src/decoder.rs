@@ -133,7 +133,14 @@ pub fn prepare_decode(
     let (reader, cancel_handle) = open_source(source, cancel_handle)?;
 
     let info = reader.source_info();
-    let duration_secs = reader.duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    let mut duration_secs = reader.duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
+    if let Some(cue_info) = crate::cue::parse_cue_virtual_path(source) {
+        if cue_info.duration > 0.0 {
+            duration_secs = cue_info.duration;
+        } else if duration_secs > cue_info.start_time {
+            duration_secs -= cue_info.start_time;
+        }
+    }
     let stream_info = metadata::extract_stream_info(info);
     let codec = info.codec_name.clone().unwrap_or_default();
 
@@ -327,11 +334,22 @@ fn run_dsp_safely(
 }
 
 /// 根据 source 协议打开音频：http(s) 走延迟 Range 源，其他走本地 File
-///
 fn open_source(
     source: &str,
     cancel_handle: HttpCancelHandle,
 ) -> Result<(AudioReader, Option<HttpCancelHandle>)> {
+    if let Some(cue_info) = crate::cue::parse_cue_virtual_path(source) {
+        let file = File::open(&cue_info.physical_path)
+            .with_context(|| format!("打开 CUE 关联母版音频失败: {}", cue_info.physical_path))?;
+        let mut reader = AudioReader::new(file)
+            .with_context(|| format!("打开 CUE 关联音频流失败: {}", cue_info.physical_path))?;
+        if cue_info.start_time > 0.0 {
+            let target = Duration::from_secs_f64(cue_info.start_time);
+            let _ = reader.seek(target, SeekMode::Accurate);
+        }
+        return Ok((reader, None));
+    }
+
     let (reader, cancel) = if source.starts_with("http://") || source.starts_with("https://") {
         let http = HttpAudioSource::new_with_cancel_handle(source, &cancel_handle)?;
         let reader =

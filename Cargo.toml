@@ -1,10 +1,13 @@
 [workspace]
 members = [
   "./native/audio-engine",
+  "./native/audio-engine-core",
   "./native/audio-capture",
   "./native/media-ctrl",
   "./native/taskbar-lyric",
   "./native/taskbar-thumbnail",
+  "./native/headless-server",
+  "./native/diretta-sys",
 ]
 resolver = "3"
 

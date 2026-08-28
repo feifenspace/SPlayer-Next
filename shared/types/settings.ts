@@ -235,6 +235,8 @@ export interface ExternalApiSettings {
   allowLan: boolean;
   /** 监听端口 */
   port: number;
+  /** 可选的跨域免鉴权 Token；前端通过 Authorization: Bearer <token> 传递 */
+  bypassToken: string;
 }
 
 /** MCP 服务配置 */

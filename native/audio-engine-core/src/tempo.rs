@@ -18,7 +18,7 @@ use signalsmith_stretch::Stretch;
 /// 又不会和任何真实档位冲突。
 const FLOAT_EQ_EPS: f32 = 1e-4;
 
-pub(crate) struct StretchProcessor {
+pub struct StretchProcessor {
     stretch: Stretch,
     channels: u16,
     /// 当前 stretch 内核构建所用的采样率，set_sample_rate 比对以决定是否重建
@@ -32,7 +32,7 @@ pub(crate) struct StretchProcessor {
 
 impl StretchProcessor {
     /// 构造一个默认 1.0× / 0 半音 / sync=ON 的处理器，初始即 bypass
-    pub(crate) fn new(channels: u16, sample_rate: u32) -> Self {
+    pub fn new(channels: u16, sample_rate: u32) -> Self {
         let stretch = Stretch::preset_default(channels as u32, sample_rate);
         Self {
             stretch,
@@ -48,7 +48,7 @@ impl StretchProcessor {
     /// 更新采样率（输出设备切换导致播放采样率变化时调用）
     /// 采样率变了必须重建 stretch 内核——否则变速/变调的时间与音高换算全部偏移
     /// 采样率不变时直接返回
-    pub(crate) fn set_sample_rate(&mut self, sample_rate: u32) {
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
         if sample_rate == self.sample_rate {
             return;
         }
@@ -60,7 +60,7 @@ impl StretchProcessor {
     }
 
     /// 1.0 速度 + 当前模式下 transpose 为 0：bypass，可走 passthrough
-    pub(crate) fn is_bypass(&self) -> bool {
+    pub fn is_bypass(&self) -> bool {
         (self.speed - 1.0).abs() < FLOAT_EQ_EPS && self.effective_transpose().abs() < FLOAT_EQ_EPS
     }
 
@@ -84,7 +84,7 @@ impl StretchProcessor {
 
     /// 设置播放速度，自动 clamp 到 [0.5, 2.0]。
     /// 非有限值（NaN/±Inf）降级为 1.0，避免 NaN 经 log2/process 传播导致整段静音
-    pub(crate) fn set_speed(&mut self, speed: f32) {
+    pub fn set_speed(&mut self, speed: f32) {
         let v = if speed.is_finite() { speed } else { 1.0 };
         self.speed = v.clamp(0.5, 2.0);
         // sync=OFF 时 transpose 跟着 speed 变
@@ -95,7 +95,7 @@ impl StretchProcessor {
 
     /// 设置音调偏移（半音），自动 clamp 到 [-12, 12]。
     /// sync=OFF 时只更新内部值不下发，等切回 sync=ON 时生效。
-    pub(crate) fn set_pitch(&mut self, semitones: i8) {
+    pub fn set_pitch(&mut self, semitones: i8) {
         self.pitch_semitones = semitones.clamp(-12, 12);
         // sync=ON 时 pitch 独立调，立即下发
         if self.pitch_sync {
@@ -104,32 +104,32 @@ impl StretchProcessor {
     }
 
     /// 切换"音调同步"开关，立即按新公式重算 transpose 并下发
-    pub(crate) fn set_pitch_sync(&mut self, sync: bool) {
+    pub fn set_pitch_sync(&mut self, sync: bool) {
         self.pitch_sync = sync;
         // 切模式后 effective_transpose 公式变了，强制刷新
         self.sync_transpose_to_stretch();
     }
 
-    pub(crate) fn speed(&self) -> f32 {
+    pub fn speed(&self) -> f32 {
         self.speed
     }
 
-    pub(crate) fn pitch(&self) -> i8 {
+    pub fn pitch(&self) -> i8 {
         self.pitch_semitones
     }
 
-    pub(crate) fn pitch_sync(&self) -> bool {
+    pub fn pitch_sync(&self) -> bool {
         self.pitch_sync
     }
 
     /// 切歌 / seek 时调用，清空 FFT 历史，避免拼接处出现瞬态
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.stretch.reset();
     }
 
     /// 处理一块交错 f32 样本，写入 `output`。
     /// bypass 时直接 extend，零开销。
-    pub(crate) fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
+    pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) {
         if input.is_empty() {
             return;
         }
