@@ -1357,9 +1357,10 @@ async fn lyric_file_handler(
 
 /// 统一在线音源调用 Handler
 async fn apis_call_handler(
+    State(state): State<AppState>,
     Json(payload): Json<crate::api::online_apis::ApiCallRequest>,
 ) -> Json<crate::api::online_apis::ApiCallResponse> {
-    let resp = crate::api::online_apis::dispatch_api_call(payload).await;
+    let resp = crate::api::online_apis::dispatch_api_call(payload, &state.db).await;
     Json(resp)
 }
 

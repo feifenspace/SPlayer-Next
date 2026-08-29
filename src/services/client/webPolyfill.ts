@@ -213,8 +213,13 @@ export const installWebPolyfill = (): void => {
       setCookie: async (platform: string, cookie: string) => {
         return playerClient.callApi(platform, "set_cookie", { cookie });
       },
-      getCookie: async (_platform: string) => "",
-      clearSession: async () => {},
+      getCookie: async (platform: string) => {
+        const res = await playerClient.callApi(platform, "get_cookie", {});
+        return (res?.body as any)?.cookie || "";
+      },
+      clearSession: async (platform: string) => {
+        await playerClient.callApi(platform, "clear_session", {});
+      },
       openLoginWeb: async () => ({ ok: false, error: "not supported in web mode" }),
     },
     library: createSafeProxy("library", {

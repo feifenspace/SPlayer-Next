@@ -101,10 +101,87 @@ fn ncm_method_to_route(method: &str) -> String {
     }
 }
 
+/// 解析 Cookie 字符串为键值对 HashMap（如 "MUSIC_U=xxx; __csrf=yyy"）
+pub fn parse_cookie_str(s: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for part in s.split(';') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once('=') {
+            let k = k.trim();
+            let v = v.trim();
+            if !k.is_empty() {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// 格式化键值对 HashMap 为标准 Cookie 请求头字符串
+pub fn format_cookie_str(map: &HashMap<String, String>) -> String {
+    map.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// 解析 Set-Cookie 响应头列表，提取键值对
+pub fn parse_set_cookies(headers: &[String]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for header_val in headers {
+        if let Some(first) = header_val.split(';').next() {
+            if let Some((k, v)) = first.trim().split_once('=') {
+                let k = k.trim();
+                let v = v.trim();
+                if !k.is_empty() {
+                    map.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
 /// 统一调用在线音源 API
-pub async fn dispatch_api_call(req: ApiCallRequest) -> ApiCallResponse {
+pub async fn dispatch_api_call(
+    req: ApiCallRequest,
+    db: &parking_lot::Mutex<rusqlite::Connection>,
+) -> ApiCallResponse {
+    // 统一处理会话 Cookie 的存取与清除
+    match req.name.as_str() {
+        "set_cookie" | "setCookie" => {
+            let mut cookies_map = HashMap::new();
+            if let Some(c_val) = req.params.get("cookie") {
+                if let Some(s) = c_val.as_str() {
+                    cookies_map = parse_cookie_str(s);
+                } else if let Some(map) = c_val.as_object() {
+                    for (k, v) in map {
+                        if let Some(s) = v.as_str() {
+                            cookies_map.insert(k.clone(), s.to_string());
+                        }
+                    }
+                }
+            }
+            let conn = db.lock();
+            let _ = crate::db::save_account_cookies(&conn, &req.platform, &cookies_map);
+            return ApiCallResponse::ok_data(json!("ok"));
+        }
+        "get_cookie" | "getCookie" => {
+            let conn = db.lock();
+            let cookies_map = crate::db::get_account_cookies(&conn, &req.platform);
+            let cookie_str = format_cookie_str(&cookies_map);
+            return ApiCallResponse::ok_body(200, json!({ "cookie": cookie_str }));
+        }
+        "clear_session" | "clearSession" => {
+            let conn = db.lock();
+            let _ = crate::db::clear_account_cookies(&conn, &req.platform);
+            return ApiCallResponse::ok_data(json!("ok"));
+        }
+        _ => {}
+    }
+
     match req.platform.as_str() {
-        "netease" => call_netease(&req.name, req.params).await,
+        "netease" => call_netease(&req.name, req.params, db).await,
         "qqmusic" => call_qqmusic(&req.name, req.params).await,
         "kugou" => call_kugou(&req.name, req.params).await,
         other => ApiCallResponse::err(format!("Unsupported platform: {}", other)),
@@ -115,17 +192,47 @@ pub async fn dispatch_api_call(req: ApiCallRequest) -> ApiCallResponse {
 // 网易云音乐 (ncm-api-rs)
 // -------------------------------------------------------------------
 
-async fn call_netease(name: &str, params: HashMap<String, Value>) -> ApiCallResponse {
+async fn call_netease(
+    name: &str,
+    mut params: HashMap<String, Value>,
+    db: &parking_lot::Mutex<rusqlite::Connection>,
+) -> ApiCallResponse {
     let route = ncm_method_to_route(name);
     let app = NCM_ROUTER.clone();
 
+    // 1. 读取数据库中已存储的 cookies
+    let mut stored_cookies = {
+        let conn = db.lock();
+        crate::db::get_account_cookies(&conn, "netease")
+    };
+
+    // 2. 如果 params 中有 cookie，合并它
+    if let Some(p_cookie) = params.get("cookie") {
+        if let Some(s) = p_cookie.as_str() {
+            for (k, v) in parse_cookie_str(s) {
+                stored_cookies.insert(k, v);
+            }
+        }
+    }
+
+    let cookie_header_str = format_cookie_str(&stored_cookies);
+    if !cookie_header_str.is_empty() {
+        params.insert("cookie".to_string(), json!(cookie_header_str));
+    }
+
     let json_body = serde_json::to_vec(&params).unwrap_or_default();
-    let http_req = match Request::builder()
+    let mut http_req_builder = Request::builder()
         .uri(&route)
         .method(Method::POST)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(json_body))
-    {
+        .header(header::CONTENT_TYPE, "application/json");
+
+    if !cookie_header_str.is_empty() {
+        if let Ok(hv) = header::HeaderValue::from_str(&cookie_header_str) {
+            http_req_builder = http_req_builder.header(header::COOKIE, hv);
+        }
+    }
+
+    let http_req = match http_req_builder.body(Body::from(json_body)) {
         Ok(r) => r,
         Err(e) => return ApiCallResponse::err(format!("Failed to build NCM request: {}", e)),
     };
@@ -133,10 +240,10 @@ async fn call_netease(name: &str, params: HashMap<String, Value>) -> ApiCallResp
     match app.oneshot(http_req).await {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            let mut cookies = Vec::new();
+            let mut set_cookie_headers = Vec::new();
             for val in resp.headers().get_all(header::SET_COOKIE) {
                 if let Ok(s) = val.to_str() {
-                    cookies.push(s.to_string());
+                    set_cookie_headers.push(s.to_string());
                 }
             }
 
@@ -147,7 +254,23 @@ async fn call_netease(name: &str, params: HashMap<String, Value>) -> ApiCallResp
             let mut body: Value = serde_json::from_slice(&bytes)
                 .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }));
 
-            // 兼容性适配：若返回中包含 unikey 但缺少 data.unikey，则注入 data 包装
+            // 3. 处理登录态变更与 Cookie 持久化
+            if name == "logout" {
+                let conn = db.lock();
+                let _ = crate::db::clear_account_cookies(&conn, "netease");
+            } else if !set_cookie_headers.is_empty() {
+                let new_cookies = parse_set_cookies(&set_cookie_headers);
+                if !new_cookies.is_empty() {
+                    let mut updated = stored_cookies.clone();
+                    for (k, v) in new_cookies {
+                        updated.insert(k, v);
+                    }
+                    let conn = db.lock();
+                    let _ = crate::db::save_account_cookies(&conn, "netease", &updated);
+                }
+            }
+
+            // 4. 兼容性适配：若返回中包含 unikey 但缺少 data.unikey，则注入 data 包装
             let unikey_opt = body.get("unikey").cloned();
             if let Some(unikey) = unikey_opt {
                 if body.get("data").is_none() {
@@ -157,11 +280,11 @@ async fn call_netease(name: &str, params: HashMap<String, Value>) -> ApiCallResp
                 }
             }
 
-            // 如果有 set-cookie，注入到 body.cookie 方便前端读取
-            if !cookies.is_empty() {
+            // 5. 如果有 set-cookie，注入到 body.cookie 方便前端读取
+            if !set_cookie_headers.is_empty() {
                 if let Some(map) = body.as_object_mut() {
                     if map.get("cookie").is_none() {
-                        map.insert("cookie".to_string(), json!(cookies.join("; ")));
+                        map.insert("cookie".to_string(), json!(set_cookie_headers.join("; ")));
                     }
                 }
             }

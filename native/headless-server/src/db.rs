@@ -145,10 +145,59 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             track_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_play_history_started ON play_history(started_at DESC);
+
+        CREATE TABLE IF NOT EXISTS account_sessions (
+            platform TEXT PRIMARY KEY,
+            cookies TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
         "#,
     )?;
 
     Ok(conn)
+}
+
+/// 读取某平台的 session cookies（转换为键值对 Map）
+pub fn get_account_cookies(conn: &Connection, platform: &str) -> std::collections::HashMap<String, String> {
+    let query = "SELECT cookies FROM account_sessions WHERE platform = ?";
+    let cookies_json: Option<String> = conn
+        .query_row(query, [platform], |row| row.get(0))
+        .optional()
+        .unwrap_or(None);
+    if let Some(json_str) = cookies_json {
+        serde_json::from_str(&json_str).unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    }
+}
+
+/// 保存某平台的 session cookies
+pub fn save_account_cookies(
+    conn: &Connection,
+    platform: &str,
+    cookies: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let json_str = serde_json::to_string(cookies)?;
+    conn.execute(
+        r#"
+        INSERT INTO account_sessions (platform, cookies, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(platform) DO UPDATE SET
+            cookies = excluded.cookies,
+            updated_at = excluded.updated_at
+        "#,
+        params![platform, json_str, now],
+    )?;
+    Ok(())
+}
+
+/// 清除某平台的 session cookies
+pub fn clear_account_cookies(conn: &Connection, platform: &str) -> Result<()> {
+    conn.execute("DELETE FROM account_sessions WHERE platform = ?", [platform])?;
+    Ok(())
 }
 
 /// 获取全部扫描目录列表
