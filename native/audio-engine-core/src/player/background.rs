@@ -159,6 +159,7 @@ impl InnerPlayer {
     }
 
     /// 启动 FFT 推送定时器（独立线程，每 50ms 推送一次频谱数据）
+    #[cfg(feature = "fft")]
     pub(super) fn start_fft_timer(&mut self) {
         self.stop_fft_timer();
         if !self.fft_enabled() {
@@ -188,6 +189,7 @@ impl InnerPlayer {
     }
 
     /// 停止 FFT 推送定时器，等待线程退出
+    #[cfg(feature = "fft")]
     pub(super) fn stop_fft_timer(&mut self) {
         if let Some(flag) = self.fft_timer_stop.take() {
             flag.store(true, Ordering::Relaxed);
@@ -198,6 +200,7 @@ impl InnerPlayer {
     }
 
     /// 设置 FFT 推送开关
+    #[cfg(feature = "fft")]
     pub fn set_fft_enabled(&mut self, enabled: bool) {
         self.fft_enabled.store(enabled, Ordering::Relaxed);
         self.fft.set_enabled(enabled);
@@ -209,7 +212,20 @@ impl InnerPlayer {
     }
 
     /// 获取 FFT 推送开关状态
+    #[cfg(feature = "fft")]
     pub fn fft_enabled(&self) -> bool {
         self.fft_enabled.load(Ordering::Relaxed)
+    }
+
+    /// stub：headless 模式下 FFT 永远禁用，不需要这些方法
+    #[cfg(not(feature = "fft"))]
+    pub(super) fn start_fft_timer(&mut self) {}
+    #[cfg(not(feature = "fft"))]
+    pub(super) fn stop_fft_timer(&mut self) {}
+    #[cfg(not(feature = "fft"))]
+    pub fn set_fft_enabled(&mut self, _enabled: bool) {}
+    #[cfg(not(feature = "fft"))]
+    pub fn fft_enabled(&self) -> bool {
+        false
     }
 }

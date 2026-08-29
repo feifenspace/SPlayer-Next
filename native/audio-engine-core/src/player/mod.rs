@@ -10,6 +10,7 @@ use tracing::{debug, info};
 use crate::audio_output::{AudioOutput, OutputFailureCallback};
 use crate::decoder;
 use crate::equalizer::{Equalizer, EQ_BAND_COUNT};
+#[cfg(feature = "fft")]
 use crate::fft::FftAnalyzer;
 use crate::playback::PlaybackHandle;
 use crate::shared::Shared;
@@ -33,6 +34,7 @@ pub struct InnerPlayer {
     shared: Option<Arc<Shared>>,
     /// 解码线程句柄，join 后可回收 DecoderData 复用于 seek
     decoder_thread: Option<JoinHandle<decoder::DecoderData>>,
+    #[cfg(feature = "fft")]
     fft: Arc<FftAnalyzer>,
     /// 当前音频的时长（秒）
     audio_duration: f64,
@@ -58,9 +60,12 @@ pub struct InnerPlayer {
     fade_cancel: Option<Arc<AtomicBool>>,
     fade_handle: Option<JoinHandle<()>>,
     /// FFT 推送开关（前端需要显示频谱时才启用）
+    #[cfg(feature = "fft")]
     fft_enabled: Arc<AtomicBool>,
     /// FFT 推送定时器的停止信号和线程句柄
+    #[cfg(feature = "fft")]
     fft_timer_stop: Option<Arc<AtomicBool>>,
+    #[cfg(feature = "fft")]
     fft_timer_handle: Option<JoinHandle<()>>,
     /// 用户选择的输出设备（设备 ID，None = 跟随系统默认）
     selected_device: Option<String>,
@@ -153,6 +158,7 @@ impl InnerPlayer {
             playback: None,
             shared: None,
             decoder_thread: None,
+            #[cfg(feature = "fft")]
             fft: Arc::new(FftAnalyzer::new()),
             audio_duration: 0.0,
             cover_raw: None,
@@ -167,8 +173,11 @@ impl InnerPlayer {
             position_timer_handle: None,
             fade_cancel: None,
             fade_handle: None,
+            #[cfg(feature = "fft")]
             fft_enabled: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "fft")]
             fft_timer_stop: None,
+            #[cfg(feature = "fft")]
             fft_timer_handle: None,
             selected_device: None,
             normalization_enabled: false,
@@ -426,6 +435,7 @@ impl InnerPlayer {
     }
 
     /// 获取 FFT 频谱数据（128 个频段）
+    #[cfg(feature = "fft")]
     pub fn fft_data(&self) -> (Vec<f32>, Vec<f32>) {
         self.fft.analyze()
     }

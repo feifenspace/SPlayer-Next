@@ -13,7 +13,8 @@ pub enum PlayerEvent {
     SourceError,
     /// 位置更新（秒）—— 由内部定时器推送
     Position { position: f64, duration: f64 },
-    /// FFT 频谱数据推送
+    /// FFT 频谱数据推送（仅在 fft feature 启用时可用）
+    #[cfg(feature = "fft")]
     FftData { ldata: Vec<f32>, rdata: Vec<f32> },
     /// 输出流停滞（输出回调长时间未消费样本，需要外部重建输出）
     OutputStalled,

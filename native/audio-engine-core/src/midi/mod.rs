@@ -1,6 +1,8 @@
 //! MIDI (.mid) 纯 Rust 软波表实时合成与渲染器
 //!
 //! 基于 `rustysynth`（100% Safe Rust SoundFont 2 引擎）。
+//! 仅在 `midi` feature 启用时编译（桌面/Electron 端）；headless 服务端不编译此模块。
+//!
 //! 具备以下能力：
 //! 1. 加载并解析标准 MIDI 文件 (.mid, .midi)；
 //! 2. 加载 SoundFont 2 音色库 (.sf2)；

@@ -1,6 +1,8 @@
-//! FFmpeg 音频解码 + CPAL 播放 + FFT 频谱分析。
+//! FFmpeg 音频解码 + CPAL 播放。
 //!
 //! 在 Headless 环境下直接使用，或通过 NAPI 包装供 Node.js 绑定。
+//! FFT 频谱分析（fft feature）和 MIDI 合成器（midi feature）为可选，
+//! headless-server 不开启这两个 feature 以减小二进制体积。
 
 #![allow(dead_code)]
 
@@ -19,6 +21,7 @@ pub mod hdcd;
 pub mod logger;
 pub mod loudness;
 pub mod metadata;
+#[cfg(feature = "midi")]
 pub mod midi;
 pub mod mqa;
 pub mod playback;

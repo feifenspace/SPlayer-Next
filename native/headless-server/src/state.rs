@@ -150,9 +150,10 @@ impl AppState {
                         *snapshot.write() = Some(ws_state);
                         let _ = ws_tx.send(serde_json::json!({ "type": "sourceError" }));
                     }
-                    PlayerEvent::FftData { .. } | PlayerEvent::OutputStalled
-                    // 输出失败：InnerPlayer 已通过 failure 回调异步重建输出流，WS 侧无需动作
-                    | PlayerEvent::OutputFailed => {}
+                    // 输出停滞/失败：InnerPlayer 已通过 failure 回调异步重建输出流，WS 侧无需动作
+                    PlayerEvent::OutputStalled | PlayerEvent::OutputFailed => {}
+                    #[allow(unreachable_patterns)]
+                    _ => {}
                 }
             })
         };

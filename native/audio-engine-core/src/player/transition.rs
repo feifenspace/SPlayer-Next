@@ -21,6 +21,7 @@ use super::{InnerPlayer, PlayerEvent, PlayerState};
 pub struct OldThreads {
     pub decoder_thread: Option<JoinHandle<decoder::DecoderData>>,
     pub position_timer: Option<JoinHandle<()>>,
+    #[cfg(feature = "fft")]
     pub fft_timer: Option<JoinHandle<()>>,
     pub fade_handle: Option<JoinHandle<()>>,
 }
@@ -29,10 +30,11 @@ impl OldThreads {
     /// 在工作线程上 join 所有旧 timer/fade，返回旧解码线程 handle 供调用方继续使用
     /// 忽略 join 错误：辅助线程 panic 不阻止新加载，主播放路径不依赖它们
     pub fn join_aux(self) -> Option<JoinHandle<decoder::DecoderData>> {
-        for h in [self.position_timer, self.fft_timer, self.fade_handle]
-            .into_iter()
-            .flatten()
-        {
+        #[cfg(feature = "fft")]
+        let aux = [self.position_timer, self.fft_timer, self.fade_handle];
+        #[cfg(not(feature = "fft"))]
+        let aux = [self.position_timer, self.fade_handle];
+        for h in aux.into_iter().flatten() {
             let _ = h.join();
         }
         self.decoder_thread
@@ -89,6 +91,7 @@ impl InnerPlayer {
         if let Some(flag) = self.position_timer_stop.take() {
             flag.store(true, Ordering::Relaxed);
         }
+        #[cfg(feature = "fft")]
         if let Some(flag) = self.fft_timer_stop.take() {
             flag.store(true, Ordering::Relaxed);
         }
@@ -105,6 +108,7 @@ impl InnerPlayer {
         self.shared = None;
         self.cover_raw = None;
         self.seek_base = 0.0;
+        #[cfg(feature = "fft")]
         self.fft.reset();
         self.equalizer.lock().reset_state();
         self.tempo.lock().reset();
@@ -112,6 +116,7 @@ impl InnerPlayer {
         let old_threads = OldThreads {
             decoder_thread: self.decoder_thread.take(),
             position_timer: self.position_timer_handle.take(),
+            #[cfg(feature = "fft")]
             fft_timer: self.fft_timer_handle.take(),
             fade_handle: self.fade_handle.take(),
         };
@@ -162,6 +167,7 @@ impl InnerPlayer {
         if let Some(flag) = self.position_timer_stop.take() {
             flag.store(true, Ordering::Relaxed);
         }
+        #[cfg(feature = "fft")]
         if let Some(flag) = self.fft_timer_stop.take() {
             flag.store(true, Ordering::Relaxed);
         }
@@ -176,6 +182,7 @@ impl InnerPlayer {
         let old_threads = OldThreads {
             decoder_thread: self.decoder_thread.take(),
             position_timer: self.position_timer_handle.take(),
+            #[cfg(feature = "fft")]
             fft_timer: self.fft_timer_handle.take(),
             fade_handle: self.fade_handle.take(),
         };
@@ -188,6 +195,7 @@ impl InnerPlayer {
             None => (self.normalization_enabled, 0.0),
         };
 
+        #[cfg(feature = "fft")]
         self.fft.reset();
 
         Some(SeekTake {
@@ -227,7 +235,10 @@ impl InnerPlayer {
         if let Some(out) = output {
             self.output = Some(out);
         }
+        #[cfg(feature = "fft")]
         let reader = DecoderSource::new(Arc::clone(&shared), Arc::clone(&self.fft));
+        #[cfg(not(feature = "fft"))]
+        let reader = DecoderSource::new(Arc::clone(&shared), Arc::new(crate::fft::FftAnalyzer::new()));
         let was_paused = self.state == PlayerState::Paused;
         let volume = self.target_volume;
         let playback = {
@@ -251,6 +262,7 @@ impl InnerPlayer {
                 state: PlayerState::Playing,
             });
             self.start_position_timer();
+            #[cfg(feature = "fft")]
             self.start_fft_timer();
         }
 
@@ -292,7 +304,10 @@ impl InnerPlayer {
         self.pending_load_handle = cancel;
         self.output = Some(output);
 
+        #[cfg(feature = "fft")]
         let reader = DecoderSource::new(Arc::clone(&shared), Arc::clone(&self.fft));
+        #[cfg(not(feature = "fft"))]
+        let reader = DecoderSource::new(Arc::clone(&shared), Arc::new(crate::fft::FftAnalyzer::new()));
         let volume = self.target_volume;
         let playback = {
             let output = self.ensure_output(None)?;
@@ -314,6 +329,7 @@ impl InnerPlayer {
                 state: PlayerState::Playing,
             });
             self.start_position_timer();
+            #[cfg(feature = "fft")]
             self.start_fft_timer();
         } else {
             self.state = PlayerState::Paused;

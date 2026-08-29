@@ -9,8 +9,8 @@ name = "headless-server"
 path = "src/main.rs"
 
 [dependencies]
-# 音频核心
-audio-engine-core = { path = "../audio-engine-core" }
+# 音频核心（headless 模式：关闭 FFT 频谱分析和 MIDI 合成器）
+audio-engine-core = { path = "../audio-engine-core", default-features = false }
 
 # HTTP 框架
 axum = { version = "0.8", features = ["ws"] }
