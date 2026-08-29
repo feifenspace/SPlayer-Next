@@ -527,6 +527,35 @@ extern "C" int diretta_sync_set_sink_dsd(diretta_sync_t* s, const char* ip_str,
     }
 }
 
+// 显式查询 Target 支持格式（官方 SyncBuffer::inquirySupportFormat，能力查询路径专用；
+// 播放路径不调用，严格对齐官方 SinHost_push.cpp 时序）。
+extern "C" int diretta_sync_inquiry_support_format(diretta_sync_t* s,
+                                                   const char* ip_str,
+                                                   std::uint16_t port,
+                                                   std::uint32_t ifno) {
+    if (s == nullptr || ip_str == nullptr) {
+        set_last_error(DIRETTA_ERR_GENERIC);
+        return DIRETTA_ERR_GENERIC;
+    }
+    diretta_sync_opaque* opaque = reinterpret_cast<diretta_sync_opaque*>(s);
+    if (opaque->sync == nullptr) {
+        set_last_error(DIRETTA_ERR_GENERIC);
+        return DIRETTA_ERR_GENERIC;
+    }
+    try {
+        std::string ip(ip_str);
+        if (opaque->sync->inquiry_support_format(ip, port, ifno)) {
+            set_last_error(DIRETTA_OK);
+            return DIRETTA_OK;
+        }
+        set_last_error(DIRETTA_ERR_NETWORK);
+        return DIRETTA_ERR_NETWORK;
+    } catch (...) {
+        set_last_error(DIRETTA_ERR_GENERIC);
+        return DIRETTA_ERR_GENERIC;
+    }
+}
+
 // DSD 协商变换查询（P3）：返回位反转 / 字节交换标志，供 Rust 直通前做变换。
 extern "C" int diretta_sync_get_dsd_transform(diretta_sync_t* s,
                                               int* bit_reverse, int* byte_swap) {

@@ -245,6 +245,18 @@ int diretta_sync_set_sink_dsd(diretta_sync_t* s,
 int diretta_sync_get_dsd_transform(diretta_sync_t* s,
                                    int* bit_reverse, int* byte_swap);
 
+// 显式查询 Target 支持格式（官方 SyncBuffer::inquirySupportFormat，能力查询路径专用）。
+// 播放路径（set_sink/set_sink_dsd）不内联此调用，严格对齐官方 SinHost_push.cpp 时序。
+//   s      : sync 实例
+//   ip_str : sink IPv6 地址字符串（内部 set_V6_str 解析）
+//   port   : sink 端口（host byte order）
+//   ifno   : 网络接口号
+// 返回：DIRETTA_OK（查询成功并填充 SinkInfo）/ DIRETTA_ERR_NETWORK。
+int diretta_sync_inquiry_support_format(diretta_sync_t* s,
+                                        const char* ip_str,
+                                        std::uint16_t port,
+                                        std::uint32_t ifno);
+
 // 连接到 sink（§11.2 控制操作，mutex 保护）。
 //   s           : sync 实例
 //   timeout_ms  : 连接超时（毫秒），0 表示 SDK 默认

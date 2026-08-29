@@ -81,7 +81,7 @@ impl LinuxImpl {
         let loop_timeline = Arc::clone(&timeline);
 
         thread::spawn(move || {
-            let rt = match Runtime::new() {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[media-ctrl] 无法创建 MPRIS Tokio Runtime: {e:?}");
@@ -93,6 +93,7 @@ impl LinuxImpl {
                     eprintln!("[media-ctrl] MPRIS 循环异常退出: {e:?}");
                 }
             });
+            std::mem::forget(rt);
         });
 
         Self {

@@ -52,6 +52,26 @@ pub struct PlayerResponse {
     pub error: Option<ApiError>,
 }
 
+/// 在独立 OS 线程中运行阻塞操作，彻底与 Tokio 运行时上下文隔离。
+/// 避免 C/C++ FFI（Diretta）与内部包含单线程 Runtime 的组件（如 HttpAudioSource）
+/// 在 Tokio 工作线程中被 Drop 时触发 "Cannot drop a runtime in a context where blocking is not allowed"。
+pub async fn spawn_isolated_blocking<F, T>(name: &'static str, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let res = f();
+            let _ = tx.send(res);
+        })
+        .map_err(|e| format!("Failed to spawn OS thread {name}: {e}"))?;
+    rx.await
+        .map_err(|e| format!("OS thread {name} panicked or dropped sender: {e}"))
+}
+
 impl PlayerResponse {
     pub fn ok(data: Value) -> Self {
         Self {
@@ -449,7 +469,7 @@ async fn load_handler(
     };
 
     let source_for_decoder = source.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_isolated_blocking("player-load-worker", move || {
         if let Some(h) = old_threads.join_aux() {
             let _ = h.join();
         }
@@ -505,7 +525,8 @@ async fn load_handler(
             if is_remote {
                 player.emit_source_error();
             }
-            return Err(ApiError::bad_request(err.to_string()));
+            // 保留完整错误链：仅 to_string() 只显示最外层 kind，丢失具体原因
+            return Err(ApiError::bad_request(format!("{err:#}")));
         }
     };
 
@@ -595,7 +616,7 @@ async fn seek_handler(
         tempo,
     } = take;
 
-    let outcome: SeekOutcome = tokio::task::spawn_blocking(move || {
+    let outcome: SeekOutcome = spawn_isolated_blocking("player-seek-worker", move || {
         let decoder_data = old_threads.join_aux().and_then(|h| h.join().ok());
         let mut decoder_data = match decoder_data {
             Some(d) => d,
@@ -1413,7 +1434,7 @@ pub struct DirettaSelectRequest {
 /// 扫描局域网内的 Diretta 目标设备
 async fn diretta_scan_handler() -> Result<Json<PlayerResponse>, ApiError> {
     let targets =
-        tokio::task::spawn_blocking(|| match audio_engine_core::diretta::DirettaFinder::new() {
+        spawn_isolated_blocking("diretta-scan-worker", || match audio_engine_core::diretta::DirettaFinder::new() {
             Ok(finder) => finder.scan(5),
             Err(e) => {
                 tracing::warn!("DirettaFinder open failed: {e}");
@@ -1492,7 +1513,7 @@ async fn diretta_target_info_handler(
     Json(payload): Json<DirettaTargetInfoRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
     let target = payload.target.trim().to_string();
-    let info = tokio::task::spawn_blocking(move || query_target_info(&target))
+    let info = spawn_isolated_blocking("diretta-info-worker", move || query_target_info(&target))
         .await
         .map_err(|e| ApiError::internal(format!("Diretta target info task failed: {e}")))?;
 

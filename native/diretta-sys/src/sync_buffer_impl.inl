@@ -93,11 +93,11 @@ public:
 
         if (!opened_.load(std::memory_order_acquire)) {
             ensure_syslog_initialized();
-            DS_DBG("calling SyncBuffer::open THRED_MODE(5) ifno=0");
+            DS_DBG("calling SyncBuffer::open THRED_MODE(5) ifno=%u", ifno);
             bool ok = syncbuffer_.open(
                 static_cast<DIRETTA::Sync::THRED_MODE>(5),
                 ACQUA::Clock::MilliSeconds(100),
-                0,
+                ifno,
                 std::string("SPlayer-Next"),
                 0,
                 0, 0, 0,
@@ -120,7 +120,7 @@ public:
             ACQUA::Clock buf_clock = (buffer_ms == 0)
                 ? ACQUA::Clock::MilliSeconds(100)
                 : ACQUA::Clock::MilliSeconds(buffer_ms);
-            bool ok = syncbuffer_.setSink(sink_addr, buf_clock, false, mtu);
+            bool ok = syncbuffer_.setSink(sink_addr, buf_clock, true, mtu);
             DS_DBG("SyncBuffer::setSink returned %d", ok ? 1 : 0);
             if (!ok) return false;
 
@@ -167,6 +167,7 @@ public:
             const int chunk_fs = std::max(1, (int)(sample_rate / 100)); // 10ms 帧块匹配 Rust 推流粒度
             DS_DBG("calling SyncBuffer::setupBuffer chunk_fs=%d depth=100", chunk_fs);
             syncbuffer_.setupBuffer(chunk_fs, 100, false);
+            syncbuffer_.connectPrepare();
 
             is_dsd_.store(false, std::memory_order_release);
             return true;
@@ -211,7 +212,7 @@ public:
             ACQUA::Clock buf_clock = (buffer_ms == 0)
                 ? ACQUA::Clock::MilliSeconds(100)
                 : ACQUA::Clock::MilliSeconds(buffer_ms);
-            if (!syncbuffer_.setSink(sink_addr, buf_clock, false, mtu)) {
+            if (!syncbuffer_.setSink(sink_addr, buf_clock, true, mtu)) {
                 return false;
             }
 
@@ -240,6 +241,7 @@ public:
 
             const int chunk_fs = std::max(1, (int)(dsd_sample_rate / 8 / 100));
             syncbuffer_.setupBuffer(chunk_fs, 100, false);
+            syncbuffer_.connectPrepare();
 
             is_dsd_.store(true, std::memory_order_release);
             return true;
@@ -249,7 +251,6 @@ public:
     }
 
     int connect_sink(int timeout_ms = 5000) {
-        (void)timeout_ms;
         DS_DBG("enter connect_sink timeout_ms=%d", timeout_ms);
         std::lock_guard<std::mutex> lk(ctrl_mtx_);
         if (!opened_.load(std::memory_order_acquire)) {
@@ -257,16 +258,29 @@ public:
         }
         try {
             syncbuffer_.connectPrepare();
-            DS_DBG("calling SyncBuffer::connect(false, 0) [push mode]");
-            if (!syncbuffer_.connect(false, 0)) {
+            DS_DBG("calling SyncBuffer::connect(false, -1) [push mode]");
+            if (!syncbuffer_.connect(false, -1)) {
                 DS_DBG("connect failed");
                 return DIRETTA_ERR_REFUSED;
             }
             DS_DBG("calling SyncBuffer::connectWait()");
             syncbuffer_.connectWait();
-            DS_DBG("connect_sink ok: is_connect=%d is_online=%d",
+
+            int wait_loops = std::max(1, timeout_ms / 50);
+            for (int i = 0; i < wait_loops; ++i) {
+                if (syncbuffer_.is_connect()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+
+            DS_DBG("connect_sink result: is_connect=%d is_online=%d",
                    syncbuffer_.is_connect() ? 1 : 0,
                    syncbuffer_.is_online() ? 1 : 0);
+
+            if (!syncbuffer_.is_connect()) {
+                DS_DBG("connect_sink timed out waiting for is_connect");
+                return DIRETTA_ERR_TIMEOUT;
+            }
+
             connected_.store(true, std::memory_order_release);
             emit_event(DIRETTA_EVENT_CONNECTED, DIRETTA_OK);
             return DIRETTA_OK;
@@ -355,6 +369,18 @@ public:
         if (bit_reverse) *bit_reverse = dsd_bit_reverse_;
         if (byte_swap)   *byte_swap   = dsd_byte_swap_;
         return true;
+    }
+    bool inquiry_support_format(const std::string& ip_str, std::uint16_t port, std::uint32_t ifno) {
+        std::lock_guard<std::mutex> lk(ctrl_mtx_);
+        try {
+            ACQUA::IPAddress sink_addr;
+            if (!sink_addr.set_V6_str(ip_str)) return false;
+            sink_addr.set_port_host(port);
+            sink_addr.set_ifno(ifno);
+            return syncbuffer_.inquirySupportFormat(sink_addr);
+        } catch (...) {
+            return false;
+        }
     }
     DIRETTA::FormatConfigure get_sink_configure() const {
         return syncbuffer_.getSinkConfigure();

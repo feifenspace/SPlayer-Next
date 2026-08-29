@@ -101,6 +101,11 @@ extern "C" {
                                       bit_reverse: *mut std::os::raw::c_int,
                                       byte_swap: *mut std::os::raw::c_int)
         -> std::os::raw::c_int;
+    // 显式查询 Target 支持格式（官方 SyncBuffer::inquirySupportFormat，能力查询路径专用；
+    // 播放路径不调用，严格对齐官方 SinHost_push.cpp 时序）
+    fn diretta_sync_inquiry_support_format(s: DirettaSyncRaw, ip_str: *const c_char,
+                                           port: u16, ifno: u32)
+        -> std::os::raw::c_int;
     fn diretta_sync_connect(s: DirettaSyncRaw,
                             timeout_ms: std::os::raw::c_int) -> std::os::raw::c_int;
     fn diretta_sync_disconnect(s: DirettaSyncRaw) -> std::os::raw::c_int;
@@ -1245,7 +1250,7 @@ impl DirettaSync {
     /// - `port`：sink 端口（host byte order）
     /// - `ifno`：网络接口号（从扫描结果 `addr.get_ifno()` 提取，`Sync::open` 与 `setSink` 需要）
     /// - `mtu`：期望 MTU（0 表示使用默认；tinyLMS-old 用 `measSendMTU` 实测）
-    /// - `buffer_ms`：sink 缓冲毫秒数（0 表示使用 sink 默认值；tinyLMS-old 用 30）
+    /// - `buffer_ms`：sink 缓冲毫秒数（官方示例 SinHost_push.cpp 用 100）
     /// - `sample_rate`：PCM 采样率（Hz，如 44100 / 48000 / 96000 / 192000），
     ///   用于 `setSinkConfigure` 与 `cycle_time_us` 动态计算
     /// - `channels`：声道数（1 = 单声道，2 = 立体声）
@@ -1266,6 +1271,32 @@ impl DirettaSync {
         let ret = unsafe {
             diretta_sync_set_sink(self.raw, c_ip.as_ptr(), port, ifno, mtu, buffer_ms,
                                   sample_rate, channels, bits_per_sample)
+        };
+        if ret == DIRETTA_OK {
+            Ok(())
+        } else {
+            Err(DirettaError::from(ret))
+        }
+    }
+
+    /// 显式查询 Target 支持格式（官方 `SyncBuffer::inquirySupportFormat`）。
+    ///
+    /// 仅供能力查询路径（如 `query_sink_info`）调用：网络查询会填充 SinkInfo 的
+    /// supportPCM / supportDSD 标志。播放路径不调用此方法——官方示例
+    /// `SinHost_push.cpp` 的播放时序（setSink → setSinkConfigure → connect...）
+    /// 中不含 inquiry，内联网络查询可能污染握手时序。
+    ///
+    /// # 参数
+    /// - `ip`：sink IPv6 地址字符串（同 `set_sink`，内部 `set_V6_str` 解析）
+    /// - `port`：sink 端口（host byte order）
+    /// - `ifno`：网络接口号
+    pub fn inquiry_support_format(&self, ip: &str, port: u16, ifno: u32) -> Result<(), DirettaError> {
+        let c_ip = std::ffi::CString::new(ip).unwrap_or_else(|_| {
+            std::ffi::CString::new(ip.replace('\0', "")).unwrap_or_default()
+        });
+        // SAFETY: self.raw 合法；c_ip 在调用期间有效；C 侧 std::string 复制
+        let ret = unsafe {
+            diretta_sync_inquiry_support_format(self.raw, c_ip.as_ptr(), port, ifno)
         };
         if ret == DIRETTA_OK {
             Ok(())

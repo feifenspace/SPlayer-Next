@@ -255,18 +255,6 @@ impl DirettaStream {
             }
         };
 
-        // #region debug-point H2:parse-address
-        let debug_payload = format!(
-            "{{\"raw\":\"{}\",\"raw_debug\":\"{}\"}}",
-            target_addr.replace('\\', "\\\\").replace('"', "\\\""),
-            format!("{:?}", target_addr)
-        );
-        let _ = std::fs::write(
-            ".dbg/diretta-parse-raw.txt",
-            debug_payload.as_bytes(),
-        );
-        // #endregion
-
         // 解析 IP, port, ifno
         let mut ip_str = target_addr.to_string();
         let mut port = 19644u16;
@@ -286,20 +274,6 @@ impl DirettaStream {
             ip_str = ip.to_string();
         }
 
-        // #region debug-point H2:parsed-address
-        let parsed_payload = format!(
-            "{{\"raw\":\"{}\",\"ip_str\":\"{}\",\"port\":{},\"ifno\":{}}}",
-            target_addr.replace('\\', "\\\\").replace('"', "\\\""),
-            ip_str.replace('\\', "\\\\").replace('"', "\\\""),
-            port,
-            ifno
-        );
-        let _ = std::fs::write(
-            ".dbg/diretta-parse-result.txt",
-            parsed_payload.as_bytes(),
-        );
-        // #endregion
-
         info!(
             target_addr,
             ip = %ip_str,
@@ -317,7 +291,8 @@ impl DirettaStream {
         // 1. 设备必须在 connect 前收到 MTU 探测包 (measSendMTU)，否则设备拒绝响应 0x48 CR 导致 connectWait 挂起/失败
         // 2. Finder 实例必须在整个会话生命周期内保持打开（维持组播监听与底层 socket 绑定）
         let (finder_opt, measured_mtu) = match DirettaFinder::new() {
-            Ok(finder) => {
+            Ok(mut finder) => {
+                let _ = finder.scan(8);
                 let m = finder.measure_mtu(&ip_str, port, ifno as i32);
                 info!(ip = %ip_str, port, ifno, measured_mtu = m, "DirettaFinder::measure_mtu 测量完成");
                 (Some(finder), m)
@@ -357,22 +332,22 @@ impl DirettaStream {
                 port,
                 ifno,
                 actual_mtu,
-                30,
+                100, // 官方 SinHost_push.cpp L118: buffer 请求 100ms
                 mult,
                 dsd_byte_order,
                 channels as u32,
             )
             .map_err(|e| anyhow::anyhow!("set_sink_dsd failed: {:?}", e))?;
         } else {
-            // tinyLMS-old DirettaDriver.cpp L747: setSink(..., Clock::MilliSeconds(30), ...)
-            // buffer_ms=30 对齐 tinyLMS-old，SinHost.cpp 使用 100ms 但实际测试 30ms 更稳定
+            // 官方 SinHost_push.cpp L118: setSink(addr, Clock::MilliSeconds(100), false, mtu)
+            // buffer_ms=100 严格对齐官方 push 模式示例。
             // tinyLMS-old 总是请求 32-bit PCM 物理槽位（L793-832），这是 DSD 兼容的通用选择。
             sync.set_sink(
                 &ip_str,
                 port,
                 ifno,
                 actual_mtu,
-                30,
+                100,
                 sample_rate,
                 channels as u32,
                 32, // tinyLMS-old: 始终优先请求 32-bit 物理槃位，规避 3-byte 对齐问题
@@ -663,10 +638,12 @@ pub fn query_sink_info(target_addr: &str, if_idx: i32, mtu: u32) -> Result<Diret
     let sync = DirettaSync::open(None, std::ptr::null_mut())
         .map_err(|e| anyhow::anyhow!("DirettaSync::open failed: {e:?}"))?;
 
-    sync.set_sink(&ip, port, ifno, actual_mtu, 30, 48000, 2, 32)
+    sync.set_sink(&ip, port, ifno, actual_mtu, 100, 48000, 2, 32)
         .map_err(|e| anyhow::anyhow!("Diretta set_sink failed: {e:?}"))?;
     
-    // set_sink 内部已调用 inquirySupportFormat 填充 SinkInfo，无需冗余 connect
+    // 播放路径严格对齐官方示例（SinHost_push.cpp）不再内联 inquiry；
+    // 能力查询路径在此显式查询 Target 支持格式以填充 SinkInfo
+    let _ = sync.inquiry_support_format(&ip, port, ifno);
     let info = sync
         .get_sink_info()
         .map_err(|e| anyhow::anyhow!("Diretta sink info unavailable: {e:?}"));

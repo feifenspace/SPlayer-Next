@@ -9,6 +9,7 @@ pub mod cue;
 pub mod decoder;
 pub mod device_watcher;
 pub mod diretta;
+pub mod diretta_output;
 pub mod dsd;
 pub mod dts;
 pub mod equalizer;
