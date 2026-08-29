@@ -291,7 +291,7 @@ impl DirettaStream {
         // 1. 设备必须在 connect 前收到 MTU 探测包 (measSendMTU)，否则设备拒绝响应 0x48 CR 导致 connectWait 挂起/失败
         // 2. Finder 实例必须在整个会话生命周期内保持打开（维持组播监听与底层 socket 绑定）
         let (finder_opt, measured_mtu) = match DirettaFinder::new() {
-            Ok(mut finder) => {
+            Ok(finder) => {
                 let _ = finder.scan(8);
                 let m = finder.measure_mtu(&ip_str, port, ifno as i32);
                 info!(ip = %ip_str, port, ifno, measured_mtu = m, "DirettaFinder::measure_mtu 测量完成");

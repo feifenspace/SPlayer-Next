@@ -327,9 +327,9 @@ fn run_push_loop(mut stream: DirettaStream, cmd_rx: Receiver<DirettaCmd>, inner:
             watchdog_offline_ticks = 0;
         }
 
-        // 低频诊断日志：前 5 拍 + 每 100 拍（~1s）一次
+        // 诊断日志：前 5 拍 + 每 500 拍（~5s）一次
         tick += 1;
-        if tick < 5 || tick % 100 == 0 {
+        if tick < 5 || tick % 500 == 0 {
             info!(
                 tick,
                 max_amp,

@@ -19,10 +19,16 @@
 #include <cstdlib>
 #include <fstream>
 
-#define DS_DBG(fmt, ...) do { \
-    std::fprintf(stderr, "[DS_DBG %s:%d] " fmt "\n", __func__, __LINE__, ##__VA_ARGS__); \
-    std::fflush(stderr); \
+#ifdef NDEBUG
+#  define DS_DBG(...) ((void)0)
+#else
+#  define DS_DBG(fmt, ...) do { \
+    if (std::getenv("DIRETTA_DEBUG")) { \
+        std::fprintf(stderr, "[DS_DBG %s:%d] " fmt "\n", __func__, __LINE__, ##__VA_ARGS__); \
+        std::fflush(stderr); \
+    } \
 } while (0)
+#endif
 
 #if defined(DIRETTA_SDK_148)
 #  include "Find.hpp"
