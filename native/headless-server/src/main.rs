@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
         .with_env_filter(
             std::env::var("RUST_LOG")
                 .as_deref()
-                .unwrap_or("headless_server=info,axum=info"),
+                .unwrap_or("headless_server=info,audio_engine_core=info,axum=warn"),
         )
         .init();
 

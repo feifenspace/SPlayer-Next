@@ -287,18 +287,17 @@ impl DirettaStream {
             "DirettaStream::connect: Setting sink"
         );
 
-        // 关键步骤（DirettaHostSDK & tinyLMS-old 要求）：
-        // 1. 设备必须在 connect 前收到 MTU 探测包 (measSendMTU)，否则设备拒绝响应 0x48 CR 导致 connectWait 挂起/失败
-        // 2. Finder 实例必须在整个会话生命周期内保持打开（维持组播监听与底层 socket 绑定）
+        // SDK 要求：connect 前必须发送 MTU 探测包 (measSendMTU)，否则设备拒绝响应 0x48 CR 导致 connectWait 挂起/失败；
+        // Finder 实例必须在整个会话生命周期内保持打开（维持组播监听与底层 socket 绑定）
         let (finder_opt, measured_mtu) = match DirettaFinder::new() {
             Ok(finder) => {
                 let _ = finder.scan(8);
                 let m = finder.measure_mtu(&ip_str, port, ifno as i32);
-                info!(ip = %ip_str, port, ifno, measured_mtu = m, "DirettaFinder::measure_mtu 测量完成");
+                info!(ip = %ip_str, port, ifno, measured_mtu = m, "MTU 测量完成");
                 (Some(finder), m)
             }
             Err(e) => {
-                warn!(error = ?e, "DirettaFinder::new 失败（用于 measure_mtu），回退到 1500");
+                warn!(error = ?e, "DirettaFinder::new 失败，回退到 1500");
                 (None, 1500)
             }
         };
@@ -319,29 +318,21 @@ impl DirettaStream {
                     ))
                 }
             };
-            info!(
-                sample_rate,
-                mult,
-                dsd_byte_order = dsd_byte_order,
-                "DirettaStream::connect: DSD Native, mult={} byte_order={}",
-                mult,
-                dsd_byte_order
-            );
+            info!(sample_rate, mult, dsd_byte_order, "DirettaStream::connect: DSD Native");
             sync.set_sink_dsd(
                 &ip_str,
                 port,
                 ifno,
                 actual_mtu,
-                100, // 官方 SinHost_push.cpp L118: buffer 请求 100ms
+                100,
                 mult,
                 dsd_byte_order,
                 channels as u32,
             )
             .map_err(|e| anyhow::anyhow!("set_sink_dsd failed: {:?}", e))?;
         } else {
-            // 官方 SinHost_push.cpp L118: setSink(addr, Clock::MilliSeconds(100), false, mtu)
-            // buffer_ms=100 严格对齐官方 push 模式示例。
-            // tinyLMS-old 总是请求 32-bit PCM 物理槽位（L793-832），这是 DSD 兼容的通用选择。
+            // buffer_ms=100 对齐官方 push 模式示例（SinHost_push.cpp）。
+            // 始终请求 32-bit PCM 物理槽位，规避 3-byte 对齐问题，兼容 DSD 模式。
             sync.set_sink(
                 &ip_str,
                 port,
@@ -350,7 +341,7 @@ impl DirettaStream {
                 100,
                 sample_rate,
                 channels as u32,
-                32, // tinyLMS-old: 始终优先请求 32-bit 物理槃位，规避 3-byte 对齐问题
+                32,
             )
             .map_err(|e| anyhow::anyhow!("set_sink failed: {:?}", e))?;
         }
@@ -361,7 +352,6 @@ impl DirettaStream {
             .map_err(|e| anyhow::anyhow!("connect_sink failed: {:?}", e))?;
 
         // 查询实际协商的物理字节宽度（Diretta 可能强制 32-bit）
-        // tinyLMS-old DirettaDriver.cpp L842-849: getSinkConfigure().getWid()
         let actual_wid = sync.negotiated_sample_bytes().unwrap_or(4); // fallback to 32-bit if query fails
         let actual_bit_depth = actual_wid * 8;
         info!(
@@ -406,21 +396,21 @@ impl DirettaStream {
     ///
     /// 也接受 48000×N 形式（DSD 专业速率），因为设备能力查询中常见。
     fn dsd_rate_multiplier(sample_rate: u32) -> Option<u32> {
-        const VALID_MULTS: &[(u32, u32)] = &[
-            (64, 2822400),   // 44100 * 64
-            (128, 5644800),  // 44100 * 128
-            (256, 11289600), // 44100 * 256
-            (512, 22579200), // 44100 * 512
+        const VALID: &[(u32, u32)] = &[
+            (64, 2822400),   // 44100 * 64  = DSD64
+            (128, 5644800),  // 44100 * 128 = DSD128
+            (256, 11289600), // 44100 * 256 = DSD256
+            (512, 22579200), // 44100 * 512 = DSD512
         ];
-        for &(mult, rate) in VALID_MULTS {
+        for &(mult, rate) in VALID {
             if sample_rate == rate {
                 return Some(mult);
             }
         }
-        // 48000基数变体
-        for &(_mult, _rate) in VALID_MULTS {
-            if sample_rate == 48000 * _mult {
-                return Some(_mult);
+        // 48000 基数少数设备常见的变体
+        for &(mult, rate_base) in VALID {
+            if sample_rate == 48000 * (rate_base / 44100) {
+                return Some(mult);
             }
         }
         None
@@ -560,8 +550,7 @@ impl DirettaStream {
         self.is_connected.load(Ordering::Acquire) && self.sync.is_online()
     }
 
-    /// 判断是否处于连接"宽容期"内（P2，对齐 tinyLMS-old last_hard_reset_time_ 10s 宽容期）。
-    /// 刚连接建立后的短暂抖动（SDK 状态同步滞后）不应触发 watchdog 误杀。
+    /// P2 宽容期内判定：刚建立连接后的短暂抖动（SDK 状态同步滞后）不应触发 watchdog 误杀。
     pub fn just_connected(&self, within: std::time::Duration) -> bool {
         self.connected_at.elapsed() < within
     }

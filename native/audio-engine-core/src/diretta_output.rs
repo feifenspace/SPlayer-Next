@@ -1,14 +1,14 @@
 //! Diretta 网络音频输出后端。
 //!
-//! cpal 重构（纯 cpal 输出流）后恢复的 Diretta 集成：`diretta:` / `diretta@`
-//! 前缀的设备选择器不再进入 cpal 设备查找，而是路由到本模块的常驻推流线程。
+//! `diretta:` / `diretta@` 前缀的设备选择器不进入 cpal 设备查找，
+//! 而是路由到本模块的常驻推流线程。
 //!
-//! 与旧版（rodio mixer owner 线程）行为对齐的关键点：
+//! 架构要点：
 //! - 连接长持：`DirettaStream` 按目标地址缓存复用，切歌/seek 只替换推流源，
-//!   不断开 Target 连接，避免时钟断流导致 Target 端 Refused
+//!   不断开 Target 连接，避免时钟断流导致 Target 端拒绝
 //! - 10ms 节拍推流 + 100ms 预填充，消除起播爆音与时钟抖动
 //! - P1 watchdog：链路 stall 时干净退出，避免静音挂死
-//! - 运行期失败通过 `OutputFailureCallback` 上报（与 cpal 流错误同一事件链）
+//! - 运行期失败通过 `OutputFailureCallback` 上报
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -27,9 +27,9 @@ use crate::diretta::{
 use crate::priority::boost_current_audio_thread;
 use crate::source::DecoderSource;
 
-/// 推流节拍：10ms 一批，对齐旧版 Diretta owner 线程
+/// 推流节拍：10ms 一批
 const PUSH_STEP: Duration = Duration::from_millis(10);
-/// 预填充 30 个 10ms 块（共 300ms 缓冲池），对齐起播平滑策略
+/// 预填充 30 个 10ms 块（共 300ms 缓冲池）
 const PREFILL_CHUNKS: usize = 30;
 /// watchdog 宽容窗口 500ms（连接初期 is_online 可能尚未就绪）
 const WATCHDOG_GRACE_TICKS: u32 = 50;
@@ -85,8 +85,8 @@ impl DirettaShared {
         requested_sample_rate: Option<u32>,
         on_failure: OutputFailureCallback,
     ) -> Result<Self> {
-        // 新官方 Target 固件在 48k clock lock 后易 Refused；固定使用 44.1k 系列标准速率（无值或 48k 系列默认 44.1k）
-        // 解码侧 DecoderData 会根据输出速率（44.1k）自动将 48k 等音源重采样，确保时钟锁定理性稳定
+        // 新官方 Target 固件在 48k clock lock 后易 Refused；固定使用 44.1k 系列标准速率，
+        // 解码侧会自动将 48k 等音源重采样以确保时钟锁定稳定
         let sample_rate = match requested_sample_rate {
             Some(sr) if sr == 44100 || sr == 88200 || sr == 176400 || sr == 352800 => sr,
             _ => 44100,
@@ -307,8 +307,8 @@ fn run_push_loop(mut stream: DirettaStream, cmd_rx: Receiver<DirettaCmd>, inner:
         }
         runtime_state_set_connection(stream.is_online(), playing);
 
-        // P1 watchdog：连接初期宽容，之后 is_online 持续离线判定链路 stall，
-        // 干净退出避免静音挂死（对齐 tinyLMS-old WatchdogLoop）
+        // P1 watchdog：连接初期宽容，之后 is_online 持续离线则判定链路 stall
+        // 干净退出避免静音挂死
         if watchdog_grace_remaining > 0 {
             watchdog_grace_remaining -= 1;
             watchdog_offline_ticks = 0;

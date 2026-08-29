@@ -200,13 +200,11 @@ async fn call_netease(
     let route = ncm_method_to_route(name);
     let app = NCM_ROUTER.clone();
 
-    // 1. 读取数据库中已存储的 cookies
+    // 从 DB 读取已持久化的 cookies，并与 params 中透传的 cookie 合并
     let mut stored_cookies = {
         let conn = db.lock();
         crate::db::get_account_cookies(&conn, "netease")
     };
-
-    // 2. 如果 params 中有 cookie，合并它
     if let Some(p_cookie) = params.get("cookie") {
         if let Some(s) = p_cookie.as_str() {
             for (k, v) in parse_cookie_str(s) {
@@ -254,7 +252,7 @@ async fn call_netease(
             let mut body: Value = serde_json::from_slice(&bytes)
                 .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes).to_string() }));
 
-            // 3. 处理登录态变更与 Cookie 持久化
+            // 登录态变更：logout 清除 session，其他响应若携带 Set-Cookie 则持久化
             if name == "logout" {
                 let conn = db.lock();
                 let _ = crate::db::clear_account_cookies(&conn, "netease");
@@ -270,7 +268,7 @@ async fn call_netease(
                 }
             }
 
-            // 4. 兼容性适配：若返回中包含 unikey 但缺少 data.unikey，则注入 data 包装
+            // 兼容性适配：login_qr_key 返回的 unikey 包在顶层，前端期望在 data.unikey 中
             let unikey_opt = body.get("unikey").cloned();
             if let Some(unikey) = unikey_opt {
                 if body.get("data").is_none() {
@@ -280,7 +278,7 @@ async fn call_netease(
                 }
             }
 
-            // 5. 如果有 set-cookie，注入到 body.cookie 方便前端读取
+            // 将 Set-Cookie 原始值注入 body.cookie，方便前端提取 token
             if !set_cookie_headers.is_empty() {
                 if let Some(map) = body.as_object_mut() {
                     if map.get("cookie").is_none() {
