@@ -919,6 +919,10 @@
       "label": "自动升级歌词格式",
       "description": "当前歌词格式较低时，从其他平台获取更高级的格式覆盖"
     },
+    "preferPluginLyric": {
+      "label": "优先使用插件歌词",
+      "description": "开启后同时请求插件歌词，若返回更优格式则自动替换"
+    },
     "detectBackgroundLyrics": {
       "label": "自动识别背景歌词",
       "description": "根据括号识别背景人声，误判时可关闭"

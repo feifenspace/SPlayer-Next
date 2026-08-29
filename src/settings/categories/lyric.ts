@@ -45,6 +45,12 @@ const lyricCategory: SettingCategory = {
           ],
         },
         {
+          key: "preferPluginLyric",
+          type: "switch",
+          binding: { store: "settings", path: "lyric.preferPluginLyric" },
+          defaultValue: false,
+        },
+        {
           key: "lyricSourceOrder",
           type: "custom",
           component: LyricSourceOrderConfig,
