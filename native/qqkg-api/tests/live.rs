@@ -99,3 +99,36 @@ async fn qq_live_user_detail_fallback() {
     println!("qq user profile: {:?}", profile);
 }
 
+#[tokio::test]
+async fn kugou_live_song_url() {
+    let c = KugouClient::new(HashMap::new());
+    // 先搜一首歌拿到真实 hash
+    let search_res = c.search(&sp("海底", 0)).await.unwrap();
+    assert_eq!(search_res["code"], 200);
+    let songs = search_res["songs"].as_array().unwrap();
+    assert!(!songs.is_empty());
+    let hash = songs[0]["hash"].as_str().unwrap();
+
+    let mut p = HashMap::new();
+    p.insert("hash".to_string(), serde_json::json!(hash));
+    p.insert("level".to_string(), serde_json::json!("hq"));
+    p.insert("freePart".to_string(), serde_json::json!(true));
+    let res = c.song_url(&p).await.unwrap();
+    println!("kugou song_url res for {}: {:?}", hash, res);
+    assert!(res["code"] == 200 || res["code"] == 500 || res["code"] == 403);
+}
+
+#[tokio::test]
+async fn qq_live_song_url() {
+    let c = QqmusicClient::new(HashMap::new());
+    let mut p = HashMap::new();
+    p.insert("mid".to_string(), serde_json::json!("0039MnYb0qxYhV"));
+    p.insert("mediaMid".to_string(), serde_json::json!("0039MnYb0qxYhV"));
+    p.insert("level".to_string(), serde_json::json!("hq"));
+    let res = c.song_url(&p).await.unwrap();
+    println!("qq song_url res: {:?}", res);
+    assert!(res["code"] == 200 || res["code"] == 403);
+}
+
+
+

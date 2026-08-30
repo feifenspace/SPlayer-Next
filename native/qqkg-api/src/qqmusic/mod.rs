@@ -4,7 +4,9 @@
 //! 明文 JSON POST（无加密），靠 okhttp UA + 移动端 comm 参数伪装客户端。
 
 mod search;
+mod song_url;
 mod user_detail;
+
 
 use std::collections::HashMap;
 use std::time::Duration;

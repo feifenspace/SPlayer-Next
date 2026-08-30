@@ -6,7 +6,9 @@
 
 mod login_qr;
 mod search;
+mod song_url;
 mod user_detail;
+
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
