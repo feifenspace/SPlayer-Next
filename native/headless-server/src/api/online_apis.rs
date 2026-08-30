@@ -353,8 +353,28 @@ async fn call_qqmusic(
             let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
             to_qqkg_resp(client.song_url(&params).await)
         }
-
+        "album" | "album_detail" | "album_songs" => {
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.album(&params).await)
+        }
+        "artist" | "artist_detail" | "artist_songs" => {
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.artist(&params).await)
+        }
+        "song_list" | "playlist" => {
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.playlist(&params).await)
+        }
+        "leaderboard" | "toplist" => {
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.leaderboard(&params).await)
+        }
+        "hot_search" => {
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.hot_search().await)
+        }
         "lyric" => {
+
             let song_mid = params
                 .get("songmid")
                 .or_else(|| params.get("mid"))
@@ -503,7 +523,20 @@ async fn call_kugou(
             let client = KugouClient::new(load_platform_cookies(db, "kugou"));
             to_qqkg_resp(client.song_url(&params).await)
         }
+        "playlist" | "song_list" => {
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            to_qqkg_resp(client.playlist(&params).await)
+        }
+        "album" => {
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            to_qqkg_resp(client.album(&params).await)
+        }
+        "artist" => {
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            to_qqkg_resp(client.artist(&params).await)
+        }
         "lyric" => {
+
 
             let hash = params.get("hash").and_then(|v| v.as_str()).unwrap_or("");
             let keyword = params.get("keyword").and_then(|v| v.as_str()).unwrap_or("");
