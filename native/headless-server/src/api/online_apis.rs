@@ -349,6 +349,11 @@ async fn call_qqmusic(
                 Err(e) => ApiCallResponse::err(format!("QM user_detail error: {e}")),
             }
         }
+        "song_url" => {
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.song_url(&params).await)
+        }
+
         "lyric" => {
             let song_mid = params
                 .get("songmid")
@@ -494,7 +499,12 @@ async fn call_kugou(
                 Err(e) => ApiCallResponse::err(format!("Kugou user_detail error: {e}")),
             }
         }
+        "song_url" => {
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            to_qqkg_resp(client.song_url(&params).await)
+        }
         "lyric" => {
+
             let hash = params.get("hash").and_then(|v| v.as_str()).unwrap_or("");
             let keyword = params.get("keyword").and_then(|v| v.as_str()).unwrap_or("");
             let duration = params.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
