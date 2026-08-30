@@ -102,21 +102,27 @@ async fn qq_live_user_detail_fallback() {
 #[tokio::test]
 async fn kugou_live_song_url() {
     let c = KugouClient::new(HashMap::new());
-    // 先搜一首歌拿到真实 hash
-    let search_res = c.search(&sp("海底", 0)).await.unwrap();
+    // 搜索周杰伦《晴天》
+    let search_res = c.search(&sp("晴天", 0)).await.unwrap();
     assert_eq!(search_res["code"], 200);
     let songs = search_res["songs"].as_array().unwrap();
     assert!(!songs.is_empty());
-    let hash = songs[0]["hash"].as_str().unwrap();
+    let song = &songs[0];
+    let hash = song["hash"].as_str().unwrap();
 
     let mut p = HashMap::new();
     p.insert("hash".to_string(), serde_json::json!(hash));
+    p.insert("audioId".to_string(), song["audioId"].clone());
+    p.insert("albumId".to_string(), song["albumId"].clone());
     p.insert("level".to_string(), serde_json::json!("hq"));
-    p.insert("freePart".to_string(), serde_json::json!(true));
     let res = c.song_url(&p).await.unwrap();
     println!("kugou song_url res for {}: {:?}", hash, res);
-    assert!(res["code"] == 200 || res["code"] == 500 || res["code"] == 403);
+    assert_eq!(res["code"], 200);
+    let url = res["data"]["url"].as_str().unwrap();
+    assert!(url.starts_with("http"));
+    println!("kugou playable URL: {}", url);
 }
+
 
 #[tokio::test]
 async fn qq_live_song_url() {
@@ -184,13 +190,22 @@ async fn kugou_live_m4_browsing_endpoints() {
     assert_eq!(alb["code"], 200);
     println!("kugou album: {} songs: {}", alb["name"], alb["songs"].as_array().unwrap().len());
 
-    // 3. 歌手
+    // 3. 歌手 (按数字 ID)
     let mut art_p = HashMap::new();
     art_p.insert("id".to_string(), serde_json::json!("3060"));
     let art = c.artist(&art_p).await.unwrap();
     assert_eq!(art["code"], 200);
-    println!("kugou artist: {} songs: {}", art["artist"]["name"], art["songs"].as_array().unwrap().len());
+    println!("kugou artist (by id): {} songs: {}", art["artist"]["name"], art["songs"].as_array().unwrap().len());
+
+    // 4. 歌手 (按中文名)
+    let mut art_name_p = HashMap::new();
+    art_name_p.insert("id".to_string(), serde_json::json!("周杰伦"));
+    let art2 = c.artist(&art_name_p).await.unwrap();
+    assert_eq!(art2["code"], 200);
+    println!("kugou artist (by name): {} songs: {} albums: {}", art2["artist"]["name"], art2["songs"].as_array().unwrap().len(), art2["albums"].as_array().unwrap().len());
+    assert!(art2["songs"].as_array().unwrap().len() > 0);
 }
+
 
 
 

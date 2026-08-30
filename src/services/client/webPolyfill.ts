@@ -493,6 +493,19 @@ export const installWebPolyfill = (): void => {
                 },
               };
             }
+          } else if (platform === "kugou") {
+            const resp = await playerClient.callApi("kugou", "lyric", { hash: id });
+            const rawLyric = resp?.data?.lyric || resp?.body?.lyric || resp?.data?.decodeContent;
+            if (rawLyric && String(rawLyric).trim()) {
+              return {
+                ok: true,
+                data: {
+                  platform: "kugou",
+                  format: "lrc",
+                  content: String(rawLyric).trim(),
+                },
+              };
+            }
           }
           return { ok: false, error: `No lyric found for ${platform}:${id}` };
         } catch (e) {
@@ -515,6 +528,7 @@ export const installWebPolyfill = (): void => {
             }
           } else if (platform === "qqmusic") {
             const resp = await playerClient.callApi("qqmusic", "search", {
+              keyword,
               keywords: keyword,
               limit: 5,
             });
@@ -522,12 +536,24 @@ export const installWebPolyfill = (): void => {
             if (list.length > 0 && (list[0].mid || list[0].id)) {
               return (polyfillApi.lyrics as any).matchById("qqmusic", list[0].mid || list[0].id);
             }
+          } else if (platform === "kugou") {
+            const resp = await playerClient.callApi("kugou", "search", {
+              keyword,
+              keywords: keyword,
+              type: 1,
+              limit: 5,
+            });
+            const list = resp?.data?.songs || [];
+            if (list.length > 0 && (list[0].hash || list[0].id)) {
+              return (polyfillApi.lyrics as any).matchById("kugou", list[0].hash || list[0].id);
+            }
           }
           return { ok: false, error: "No match found" };
         } catch (e) {
           return { ok: false, error: String(e) };
         }
       },
+
       fetchTTMLOverlay: async (track: any, platform: string) => {
         try {
           const path = platform === "netease" ? "ncm-lyrics" : "qq-lyrics";

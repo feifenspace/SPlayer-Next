@@ -141,25 +141,30 @@ impl KugouClient {
             .cloned()
             .unwrap_or_else(|| "-".to_string());
 
-        let mut merged: Vec<(String, String)> = vec![
-            ("dfid".into(), dfid.clone()),
-            ("mid".into(), mid.clone()),
-            ("uuid".into(), "-".into()),
-            ("appid".into(), KG_APPID.to_string()),
-            ("clientver".into(), KG_CLIENTVER.to_string()),
-            ("clienttime".into(), clienttime.to_string()),
-        ];
+        use std::collections::BTreeMap;
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        map.insert("dfid".into(), dfid.clone());
+        map.insert("mid".into(), mid.clone());
+        map.insert("uuid".into(), "-".into());
+        map.insert("appid".into(), KG_APPID.to_string());
+        map.insert("clientver".into(), KG_CLIENTVER.to_string());
+        map.insert("clienttime".into(), clienttime.to_string());
+
         if let Some(token) = self.cookies.get("token").filter(|v| !v.is_empty()) {
-            merged.push(("token".into(), token.clone()));
+            map.insert("token".into(), token.clone());
         }
         if let Some(userid) = self.cookies.get("userid").filter(|v| !v.is_empty()) {
-            merged.push(("userid".into(), userid.clone()));
+            map.insert("userid".into(), userid.clone());
         }
-        merged.extend(params.iter().cloned());
+        for (k, v) in params {
+            map.insert(k.clone(), v.clone());
+        }
 
+        let mut merged: Vec<(String, String)> = map.into_iter().collect();
         // 签名按参数名排序后拼接，带 body（signature_android_params 内部处理顺序）
         let signature = signature_android_params(&merged, body);
         merged.push(("signature".into(), signature));
+
 
         let query: Vec<String> = merged
             .iter()
