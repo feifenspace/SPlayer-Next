@@ -3,9 +3,15 @@
 //! 对齐桌面端 electron/main/apis/qqmusic/core/request.ts + config.ts：
 //! 明文 JSON POST（无加密），靠 okhttp UA + 移动端 comm 参数伪装客户端。
 
+mod album;
+mod artist;
+mod hot_search;
+mod leaderboard;
 mod search;
+mod song_list;
 mod song_url;
 mod user_detail;
+
 
 
 use std::collections::HashMap;

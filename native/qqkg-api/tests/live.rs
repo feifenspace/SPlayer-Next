@@ -130,5 +130,68 @@ async fn qq_live_song_url() {
     assert!(res["code"] == 200 || res["code"] == 403);
 }
 
+#[tokio::test]
+async fn qq_live_m4_browsing_endpoints() {
+    let c = QqmusicClient::new(HashMap::new());
+
+    // 1. 热搜
+    let hot = c.hot_search().await.unwrap();
+    assert_eq!(hot["code"], 200);
+    assert!(hot["list"].as_array().unwrap().len() > 0);
+    println!("qq hot search count: {}", hot["list"].as_array().unwrap().len());
+
+    // 2. 排行榜
+    let mut top_p = HashMap::new();
+    top_p.insert("topid".to_string(), serde_json::json!(4));
+    let lb = c.leaderboard(&top_p).await.unwrap();
+    println!("qq leaderboard res: {:?}", lb);
+    assert_eq!(lb["code"], 200);
+
+
+    // 3. 专辑
+    let mut alb_p = HashMap::new();
+    alb_p.insert("mid".to_string(), serde_json::json!("000MkMni19ClKG"));
+    let alb = c.album(&alb_p).await.unwrap();
+    assert_eq!(alb["code"], 200);
+    assert!(alb["songs"].as_array().unwrap().len() > 0);
+    println!("qq album songs: {}", alb["songs"].as_array().unwrap().len());
+
+
+    // 4. 歌手
+    let mut art_p = HashMap::new();
+    art_p.insert("mid".to_string(), serde_json::json!("0025NhlN2yWrP4"));
+    let art = c.artist(&art_p).await.unwrap();
+    assert_eq!(art["code"], 200);
+    assert!(art["songs"].as_array().unwrap().len() > 0);
+    println!("qq artist songs: {} albums: {}", art["songs"].as_array().unwrap().len(), art["albums"].as_array().unwrap().len());
+}
+
+#[tokio::test]
+async fn kugou_live_m4_browsing_endpoints() {
+    let c = KugouClient::new(HashMap::new());
+
+    // 1. 歌单
+    let mut pl_p = HashMap::new();
+    pl_p.insert("id".to_string(), serde_json::json!("878985"));
+    let pl = c.playlist(&pl_p).await.unwrap();
+    assert_eq!(pl["code"], 200);
+    println!("kugou playlist: {} songs: {}", pl["name"], pl["songs"].as_array().unwrap().len());
+
+    // 2. 专辑
+    let mut alb_p = HashMap::new();
+    alb_p.insert("id".to_string(), serde_json::json!("960537"));
+    let alb = c.album(&alb_p).await.unwrap();
+    assert_eq!(alb["code"], 200);
+    println!("kugou album: {} songs: {}", alb["name"], alb["songs"].as_array().unwrap().len());
+
+    // 3. 歌手
+    let mut art_p = HashMap::new();
+    art_p.insert("id".to_string(), serde_json::json!("3060"));
+    let art = c.artist(&art_p).await.unwrap();
+    assert_eq!(art["code"], 200);
+    println!("kugou artist: {} songs: {}", art["artist"]["name"], art["songs"].as_array().unwrap().len());
+}
+
+
 
 

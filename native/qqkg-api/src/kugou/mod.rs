@@ -4,10 +4,14 @@
 //! - `kg_request`：基础 GET（mobilecdn / songsearch / lyrics 等公开接口）
 //! - `kg_gateway_request`：Android 签名 + 设备标识注入（complexsearch 等网关路由）
 
+mod album;
+mod artist;
 mod login_qr;
+mod playlist;
 mod search;
 mod song_url;
 mod user_detail;
+
 
 
 use std::collections::HashMap;

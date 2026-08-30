@@ -20,6 +20,16 @@ pub fn join_artists(artists: &[String]) -> String {
     artists.join(" / ")
 }
 
+/// 从 JSON 对象数组（`[{"name": "周杰伦"}]`）中拼接歌手名。
+pub fn join_singers(singers: &[Value]) -> String {
+    singers
+        .iter()
+        .filter_map(|s| s.get("name").or_else(|| s.get("title")).and_then(Value::as_str))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
 /// HTML 实体反转义（对齐桌面端 kugou/core/config.ts 的 decodeName）。
 pub fn decode_name(s: &str) -> String {
     s.replace("&nbsp;", " ")
@@ -33,7 +43,15 @@ pub fn decode_name(s: &str) -> String {
 
 /// 填充酷狗封面模板的 `{size}` 占位符并升级 https。
 pub fn fill_cover(url: &str, size: u32) -> String {
+    if url.is_empty() {
+        return String::new();
+    }
     secure_url(&url.replace("{size}", &size.to_string()))
+}
+
+/// 填充 Option 类型的酷狗封面模板。
+pub fn fill_cover_opt(url: Option<&str>, size: u32) -> String {
+    url.map(|u| fill_cover(u, size)).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -110,6 +128,12 @@ mod tests {
     }
 
     #[test]
+    fn join_singers_from_json() {
+        let arr = vec![json!({"name": "周杰伦"}), json!({"name": "阿信"})];
+        assert_eq!(join_singers(&arr), "周杰伦 / 阿信");
+    }
+
+    #[test]
     fn decode_name_entities() {
         assert_eq!(decode_name("A&nbsp;&amp;&nbsp;B"), "A & B");
         assert_eq!(decode_name("&lt;em&gt;X&lt;/em&gt;"), "<em>X</em>");
@@ -122,6 +146,11 @@ mod tests {
             fill_cover("http://imge.kugou.com/temple/{size}/a.jpg", 300),
             "https://imge.kugou.com/temple/300/a.jpg"
         );
+        assert_eq!(
+            fill_cover_opt(Some("http://imge.kugou.com/temple/{size}/a.jpg"), 300),
+            "https://imge.kugou.com/temple/300/a.jpg"
+        );
+        assert_eq!(fill_cover_opt(None, 300), "");
     }
 
     #[test]
