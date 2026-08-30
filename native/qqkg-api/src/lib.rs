@@ -5,8 +5,12 @@
 
 pub mod crypto;
 pub mod error;
+pub mod kugou;
 pub mod normalize;
+pub mod qqmusic;
 pub mod types;
 
 pub use error::QqkgError;
+pub use kugou::KugouClient;
+pub use qqmusic::QqmusicClient;
 pub use types::{KG_APPID, KG_CLIENTVER, SearchParams, SearchType};
