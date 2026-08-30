@@ -3,6 +3,7 @@
 //! 纯 Rust 实现，零 Node 运行时依赖；桌面端 Electron/TS 实现仅作移植参考，
 //! 加密层输出与桌面端逐字节一致（由对照单测向量锁定）。
 
+pub mod crypto;
 pub mod error;
 pub mod normalize;
 pub mod types;
