@@ -1,0 +1,17 @@
+[workspace]
+# 独立 crate（自带空 workspace 表，脱离仓库根工作区）：
+# 根 Cargo.toml 的 members 列表零改动，上游 merge 零冲突。
+# 构建/测试：cargo test --manifest-path native/qqkg-api/Cargo.toml
+
+[package]
+name = "qqkg-api"
+version = "0.1.0"
+edition = "2021"
+description = "QQ Music / Kugou online API client for the headless server (pure Rust, zero Node runtime)"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md5 = "0.7"
+num-bigint-dig = "0.8"
+thiserror = "2"
