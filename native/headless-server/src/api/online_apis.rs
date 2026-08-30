@@ -342,6 +342,13 @@ async fn call_qqmusic(
             let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
             to_qqkg_resp(client.search(&SearchParams::from_map(&params)).await)
         }
+        "user_detail" => {
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            match client.user_detail().await {
+                Ok(resp) => ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default()),
+                Err(e) => ApiCallResponse::err(format!("QM user_detail error: {e}")),
+            }
+        }
         "lyric" => {
             let song_mid = params
                 .get("songmid")
@@ -421,6 +428,71 @@ async fn call_kugou(
         "search" => {
             let client = KugouClient::new(load_platform_cookies(db, "kugou"));
             to_qqkg_resp(client.search(&SearchParams::from_map(&params)).await)
+        }
+        "login_qr_key" => {
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            match client.login_qr_key().await {
+                Ok(resp) => ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default()),
+                Err(e) => ApiCallResponse::err(format!("Kugou login_qr_key error: {e}")),
+            }
+        }
+        "login_qr_check" => {
+            let key = params.get("key").and_then(Value::as_str).unwrap_or("");
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            match client.login_qr_check(key).await {
+                Ok(check_resp) => {
+                    // 当扫码成功 (status == 4) 时，将返回的凭据持久化到 account_sessions
+                    if check_resp.status == 4 {
+                        let mut cookies_map = load_platform_cookies(db, "kugou");
+                        if let Some(token) = &check_resp.token {
+                            cookies_map.insert("token".to_string(), token.clone());
+                        }
+                        if let Some(userid) = &check_resp.userid {
+                            cookies_map.insert("userid".to_string(), userid.clone());
+                        }
+                        if let Some(vip_token) = &check_resp.vip_token {
+                            cookies_map.insert("vip_token".to_string(), vip_token.clone());
+                        }
+                        if let Some(vip_type) = &check_resp.vip_type {
+                            cookies_map.insert("vip_type".to_string(), vip_type.clone());
+                        }
+                        if let Some(nickname) = &check_resp.nickname {
+                            cookies_map.insert("nickname".to_string(), nickname.clone());
+                        }
+                        if let Some(avatar) = &check_resp.avatar_url {
+                            cookies_map.insert("avatar".to_string(), avatar.clone());
+                        }
+                        let conn = db.lock();
+                        let _ = crate::db::save_account_cookies(&conn, "kugou", &cookies_map);
+                    }
+                    ApiCallResponse::ok_data(serde_json::to_value(check_resp).unwrap_or_default())
+                }
+                Err(e) => ApiCallResponse::err(format!("Kugou login_qr_check error: {e}")),
+            }
+        }
+        "user_detail" => {
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            match client.user_detail().await {
+                Ok(resp) => {
+                    // 若已登录且有新资料，同步更新数据库缓存
+                    if resp.logged_in {
+                        if let Some(profile) = &resp.profile {
+                            let mut cookies_map = load_platform_cookies(db, "kugou");
+                            if !profile.nickname.is_empty() {
+                                cookies_map.insert("nickname".to_string(), profile.nickname.clone());
+                            }
+                            if !profile.avatar_url.is_empty() {
+                                cookies_map.insert("avatar".to_string(), profile.avatar_url.clone());
+                            }
+                            cookies_map.insert("vip_type".to_string(), profile.vip_level.to_string());
+                            let conn = db.lock();
+                            let _ = crate::db::save_account_cookies(&conn, "kugou", &cookies_map);
+                        }
+                    }
+                    ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default())
+                }
+                Err(e) => ApiCallResponse::err(format!("Kugou user_detail error: {e}")),
+            }
         }
         "lyric" => {
             let hash = params.get("hash").and_then(|v| v.as_str()).unwrap_or("");
