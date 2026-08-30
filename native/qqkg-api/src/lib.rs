@@ -13,4 +13,8 @@ pub mod types;
 pub use error::QqkgError;
 pub use kugou::KugouClient;
 pub use qqmusic::QqmusicClient;
-pub use types::{KG_APPID, KG_CLIENTVER, SearchParams, SearchType};
+pub use types::{
+    KugouQrCheckResponse, KugouQrKeyResponse, PlatformProfile, SearchParams, SearchType,
+    UserDetailResponse, KG_APPID, KG_CLIENTVER,
+};
+

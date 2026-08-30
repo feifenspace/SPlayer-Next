@@ -4,7 +4,9 @@
 //! - `kg_request`：基础 GET（mobilecdn / songsearch / lyrics 等公开接口）
 //! - `kg_gateway_request`：Android 签名 + 设备标识注入（complexsearch 等网关路由）
 
+mod login_qr;
 mod search;
+mod user_detail;
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,6 +18,7 @@ use crate::crypto::kg_sign::signature_android_params;
 use crate::error::QqkgError;
 use crate::types::KG_APPID;
 use crate::types::KG_CLIENTVER;
+
 
 const KG_GATEWAY_URL: &str = "https://gateway.kugou.com";
 const KG_GATEWAY_UA: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
@@ -89,14 +92,35 @@ impl KugouClient {
         parse_kg_body(&text)
     }
 
-    /// 带签名的网关请求（对齐桌面端 kgGatewayRequest）。
-    ///
-    /// `params` 为业务参数（keyword/page 等），自动合并 dfid/mid/uuid/appid/clientver/clienttime
-    /// 与登录态 token/userid 后统一签名；`extra_headers` 传递 x-router 等路由头。
+    /// 带签名的网关 GET 请求（对齐桌面端 kgGatewayRequest）。
     pub async fn kg_gateway_request(
         &self,
         path: &str,
         params: &[(String, String)],
+        extra_headers: &[(&str, String)],
+    ) -> Result<Value, QqkgError> {
+        self.kg_gateway_execute(reqwest::Method::GET, path, params, "", extra_headers)
+            .await
+    }
+
+    /// 带签名的网关 POST 请求（对齐桌面端 kgGatewayRequest method=POST）。
+    pub async fn kg_gateway_post(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+        body: &str,
+        extra_headers: &[(&str, String)],
+    ) -> Result<Value, QqkgError> {
+        self.kg_gateway_execute(reqwest::Method::POST, path, params, body, extra_headers)
+            .await
+    }
+
+    async fn kg_gateway_execute(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        params: &[(String, String)],
+        body: &str,
         extra_headers: &[(&str, String)],
     ) -> Result<Value, QqkgError> {
         let clienttime = SystemTime::now()
@@ -127,8 +151,8 @@ impl KugouClient {
         }
         merged.extend(params.iter().cloned());
 
-        // 签名按参数名排序后拼接（signature_android_params 内部处理顺序）
-        let signature = signature_android_params(&merged, "");
+        // 签名按参数名排序后拼接，带 body（signature_android_params 内部处理顺序）
+        let signature = signature_android_params(&merged, body);
         merged.push(("signature".into(), signature));
 
         let query: Vec<String> = merged
@@ -139,7 +163,7 @@ impl KugouClient {
 
         let mut req = self
             .http
-            .get(&url)
+            .request(method.clone(), &url)
             .header("User-Agent", KG_GATEWAY_UA)
             .header("dfid", &dfid)
             .header("clienttime", clienttime.to_string())
@@ -148,6 +172,13 @@ impl KugouClient {
             .header("kg-thash", "5d816a0")
             .header("kg-rec", "1")
             .header("kg-rf", "B9EDA08A64250DEFFBCADDEE00F8F25F");
+
+        if method == reqwest::Method::POST {
+            req = req
+                .header("Content-Type", "application/json")
+                .body(body.to_string());
+        }
+
         for (k, v) in extra_headers {
             req = req.header(*k, v);
         }

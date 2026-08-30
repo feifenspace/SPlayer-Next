@@ -69,3 +69,33 @@ async fn kugou_live_search_all_types() {
     assert!(count(&r, "playlists") > 0, "kg playlists empty: {r}");
     println!("kg playlist: {} creator={}", r["playlists"][0]["name"], r["playlists"][0]["creator"]);
 }
+
+#[tokio::test]
+async fn kugou_live_login_qr_key_and_check() {
+    let c = KugouClient::new(HashMap::new());
+    let qr_key_res = c.login_qr_key().await.unwrap();
+    assert_eq!(qr_key_res.code, 200);
+    assert!(!qr_key_res.key.is_empty());
+    assert!(qr_key_res.content.starts_with("https://h5.kugou.com/"));
+    println!("kugou qr key: {} url: {}", qr_key_res.key, qr_key_res.content);
+
+    let check_res = c.login_qr_check(&qr_key_res.key).await.unwrap();
+    assert_eq!(check_res.code, 200);
+    println!("kugou check status: {}", check_res.status);
+}
+
+#[tokio::test]
+async fn qq_live_user_detail_fallback() {
+    let mut cookies = HashMap::new();
+    cookies.insert("uin".to_string(), "10001".to_string());
+    cookies.insert("qm_keyst".to_string(), "dummy_token".to_string());
+    let c = QqmusicClient::new(cookies);
+    let res = c.user_detail().await.unwrap();
+    assert_eq!(res.code, 200);
+    assert_eq!(res.logged_in, true);
+    let profile = res.profile.unwrap();
+    assert_eq!(profile.user_id, "10001");
+    assert!(profile.avatar_url.contains("qlogo.cn"));
+    println!("qq user profile: {:?}", profile);
+}
+

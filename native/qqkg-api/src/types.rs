@@ -1,10 +1,84 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 酷狗客户端常量（对齐桌面端 kugou/core/config.ts）。
 pub const KG_APPID: u32 = 1005;
 pub const KG_CLIENTVER: u32 = 20489;
+
+/// 统一音乐平台用户信息（对齐前端 PlatformProfile）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformProfile {
+    pub user_id: String,
+    pub nickname: String,
+    pub avatar_url: String,
+    pub is_vip: bool,
+    #[serde(default)]
+    pub vip_level: i64,
+}
+
+/// 用户详情统一响应。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDetailResponse {
+    pub code: i32,
+    pub logged_in: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<PlatformProfile>,
+}
+
+impl UserDetailResponse {
+    pub fn logged_in(profile: PlatformProfile) -> Self {
+        Self {
+            code: 200,
+            logged_in: true,
+            message: None,
+            profile: Some(profile),
+        }
+    }
+
+    pub fn not_logged_in(message: Option<&str>) -> Self {
+        Self {
+            code: 200,
+            logged_in: false,
+            message: message.map(ToString::to_string),
+            profile: None,
+        }
+    }
+}
+
+/// 酷狗扫码 Key 响应（对齐前端 KugouQrKeyResponse）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KugouQrKeyResponse {
+    pub code: i32,
+    pub key: String,
+    pub content: String,
+}
+
+/// 酷狗扫码状态轮询响应（对齐前端 KugouQrCheckResponse 及凭据下发）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KugouQrCheckResponse {
+    pub code: i32,
+    pub status: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub userid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vip_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vip_type: Option<String>,
+}
+
 
 /// 搜索类型（前端 type 参数的内部表示）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

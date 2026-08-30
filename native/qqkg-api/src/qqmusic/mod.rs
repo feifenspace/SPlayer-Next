@@ -4,6 +4,7 @@
 //! 明文 JSON POST（无加密），靠 okhttp UA + 移动端 comm 参数伪装客户端。
 
 mod search;
+mod user_detail;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -22,7 +23,12 @@ const QM_MAX_RETRY: usize = 2;
 const QM_RETRY_BACKOFF: Duration = Duration::from_millis(300);
 
 /// 伪装 Android 客户端的 comm 字段（对齐桌面端 getCommonParams）。
-fn common_params(uin: &str) -> Value {
+fn common_params(
+    uin: &str,
+    session_uid: Option<&str>,
+    session_sid: Option<&str>,
+    session_userip: Option<&str>,
+) -> Value {
     let mut comm = json!({
         "ct": 11,
         "cv": "1003006",
@@ -38,6 +44,15 @@ fn common_params(uin: &str) -> Value {
     });
     if !uin.is_empty() && uin != "0" {
         comm["uin"] = json!(uin);
+    }
+    if let Some(uid) = session_uid {
+        comm["uid"] = json!(uid);
+    }
+    if let Some(sid) = session_sid {
+        comm["sid"] = json!(sid);
+    }
+    if let Some(userip) = session_userip {
+        comm["userip"] = json!(userip);
     }
     comm
 }
@@ -82,6 +97,33 @@ impl QqmusicClient {
         }
     }
 
+    /// 获取客户端会话 uid / sid / userip（对齐桌面端 ensureSession）。
+    async fn fetch_session(&self) -> (Option<String>, Option<String>, Option<String>) {
+        let uin = self.uin();
+        let body = json!({
+            "comm": common_params(&uin, None, None, None),
+            "request": {
+                "module": "music.getSession.session",
+                "method": "GetSession",
+                "param": { "caller": 0, "uid": uin, "vkey": 0 }
+            }
+        });
+
+        if let Ok(resp) = self.post_fcg_raw(&body).await {
+            let info = resp
+                .get("request")
+                .and_then(|r| r.get("data"))
+                .and_then(|d| d.get("session"));
+            if let Some(s) = info {
+                let uid = s.get("uid").and_then(Value::as_str).map(ToString::to_string);
+                let sid = s.get("sid").and_then(Value::as_str).map(ToString::to_string);
+                let userip = s.get("userip").and_then(Value::as_str).map(ToString::to_string);
+                return (uid, sid, userip);
+            }
+        }
+        (None, None, None)
+    }
+
     /// 发送一次 musicu.fcg 请求，返回 `request.data` 业务数据段。
     ///
     /// 对齐桌面端 qmRequest 的重试策略：QM 后端偶发瞬时错误（如 inner=2001），
@@ -92,8 +134,9 @@ impl QqmusicClient {
         method: &str,
         param: Value,
     ) -> Result<Value, QqkgError> {
+        let (uid, sid, userip) = self.fetch_session().await;
         let body = json!({
-            "comm": common_params(&self.uin()),
+            "comm": common_params(&self.uin(), uid.as_deref(), sid.as_deref(), userip.as_deref()),
             "request": { "module": module, "method": method, "param": param }
         });
 
@@ -104,7 +147,7 @@ impl QqmusicClient {
                 Err(e) => {
                     last_err = Some(e);
                     if attempt < QM_MAX_RETRY {
-                        tokio::time::sleep(QM_RETRY_BACKOFF).await;
+                        tokio::time::sleep(QM_RETRY_BACKOFF * (attempt as u32 + 1)).await;
                     }
                 }
             }
@@ -112,7 +155,7 @@ impl QqmusicClient {
         Err(last_err.expect("retry loop runs at least once"))
     }
 
-    async fn post_fcg_once(&self, body: &Value) -> Result<Value, QqkgError> {
+    async fn post_fcg_raw(&self, body: &Value) -> Result<Value, QqkgError> {
         let resp = self
             .http
             .post(QM_API_URL)
@@ -128,7 +171,11 @@ impl QqmusicClient {
             .json()
             .await
             .map_err(|e| QqkgError::BadResponse(format!("QM non-JSON response: {e}")))?;
+        Ok(data)
+    }
 
+    async fn post_fcg_once(&self, body: &Value) -> Result<Value, QqkgError> {
+        let data = self.post_fcg_raw(body).await?;
         let outer = data.get("code").and_then(Value::as_i64).unwrap_or(0);
         let inner = data
             .get("request")
@@ -180,12 +227,14 @@ mod tests {
 
     #[test]
     fn common_params_anonymous_vs_logged_in() {
-        let anon = common_params("0");
+        let anon = common_params("0", None, None, None);
         assert_eq!(anon["uin"], json!("0"));
         assert_eq!(anon["ct"], json!(11));
         assert_eq!(anon["tmeAppID"], json!("qqmusiclight"));
 
-        let logged = common_params("12345");
+        let logged = common_params("12345", Some("uid_1"), Some("sid_1"), None);
         assert_eq!(logged["uin"], json!("12345"));
+        assert_eq!(logged["uid"], json!("uid_1"));
+        assert_eq!(logged["sid"], json!("sid_1"));
     }
 }

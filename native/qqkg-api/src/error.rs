@@ -12,7 +12,11 @@ pub enum QqkgError {
     /// 需要登录态但未找到已保存的凭据。
     #[error("missing credentials: {0}")]
     MissingCredentials(String),
+    /// 参数不合法。
+    #[error("invalid parameter: {0}")]
+    InvalidParam(String),
     /// 序列化 / 反序列化失败。
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 }
+
