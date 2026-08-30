@@ -518,7 +518,7 @@ export const installWebPolyfill = (): void => {
               keywords: keyword,
               limit: 5,
             });
-            const list = resp?.data?.list || resp?.body?.list || [];
+            const list = resp?.data?.songs || resp?.data?.list || resp?.body?.list || [];
             if (list.length > 0 && (list[0].mid || list[0].id)) {
               return (polyfillApi.lyrics as any).matchById("qqmusic", list[0].mid || list[0].id);
             }

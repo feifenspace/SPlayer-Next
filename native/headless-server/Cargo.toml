@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 在线音源与网络
 ncm-api-rs = { path = "/home/songlian/ncm-api-rs", features = ["server"] }
+qqkg-api = { path = "../qqkg-api" }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # 工具

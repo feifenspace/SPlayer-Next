@@ -10,6 +10,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use ncm_api_rs::server::build_app;
 use ncm_api_rs::ApiClient;
+use qqkg_api::{KugouClient, QqmusicClient, SearchParams};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -182,8 +183,8 @@ pub async fn dispatch_api_call(
 
     match req.platform.as_str() {
         "netease" => call_netease(&req.name, req.params, db).await,
-        "qqmusic" => call_qqmusic(&req.name, req.params).await,
-        "kugou" => call_kugou(&req.name, req.params).await,
+        "qqmusic" => call_qqmusic(db, &req.name, req.params).await,
+        "kugou" => call_kugou(db, &req.name, req.params).await,
         other => ApiCallResponse::err(format!("Unsupported platform: {}", other)),
     }
 }
@@ -314,57 +315,32 @@ fn get_qm_common_params() -> Value {
     })
 }
 
-async fn call_qqmusic(name: &str, params: HashMap<String, Value>) -> ApiCallResponse {
+/// qqkg-api crate 调用结果转 ApiCallResponse
+fn to_qqkg_resp(r: Result<Value, qqkg_api::QqkgError>) -> ApiCallResponse {
+    match r {
+        Ok(v) => ApiCallResponse::ok_data(v),
+        Err(e) => ApiCallResponse::err(format!("QQKG API error: {e}")),
+    }
+}
+
+/// 从数据库读取平台登录态 Cookie
+fn load_platform_cookies(
+    db: &parking_lot::Mutex<rusqlite::Connection>,
+    platform: &str,
+) -> HashMap<String, String> {
+    let conn = db.lock();
+    crate::db::get_account_cookies(&conn, platform)
+}
+
+async fn call_qqmusic(
+    db: &parking_lot::Mutex<rusqlite::Connection>,
+    name: &str,
+    params: HashMap<String, Value>,
+) -> ApiCallResponse {
     match name {
         "search" => {
-            let keyword = params
-                .get("keyword")
-                .or_else(|| params.get("keywords"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let page = params.get("page").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
-            let page_size = params
-                .get("pageSize")
-                .or_else(|| params.get("limit"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as u32;
-
-            let payload = json!({
-                "comm": get_qm_common_params(),
-                "request": {
-                    "module": "music.search.SearchCgiService",
-                    "method": "DoSearchForQQMusicDesktop",
-                    "param": {
-                        "query": keyword,
-                        "page_num": page,
-                        "num_per_page": page_size,
-                        "search_type": 0
-                    }
-                }
-            });
-
-            match HTTP_CLIENT
-                .post(QM_API_URL)
-                .header(header::REFERER, "https://y.qq.com")
-                .header(
-                    header::USER_AGENT,
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                )
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let json_val: Value = resp.json().await.unwrap_or_default();
-                    let data = json_val
-                        .get("request")
-                        .and_then(|r| r.get("data"))
-                        .cloned()
-                        .unwrap_or(json_val);
-                    ApiCallResponse::ok_data(data)
-                }
-                Err(e) => ApiCallResponse::err(format!("QM search error: {}", e)),
-            }
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.search(&SearchParams::from_map(&params)).await)
         }
         "lyric" => {
             let song_mid = params
@@ -436,43 +412,15 @@ async fn call_qqmusic(name: &str, params: HashMap<String, Value>) -> ApiCallResp
 // 酷狗音乐 (Pure Rust)
 // -------------------------------------------------------------------
 
-async fn call_kugou(name: &str, params: HashMap<String, Value>) -> ApiCallResponse {
+async fn call_kugou(
+    db: &parking_lot::Mutex<rusqlite::Connection>,
+    name: &str,
+    params: HashMap<String, Value>,
+) -> ApiCallResponse {
     match name {
         "search" => {
-            let keyword = params
-                .get("keyword")
-                .or_else(|| params.get("keywords"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let page = params.get("page").and_then(|v| v.as_u64()).unwrap_or(1);
-            let page_size = params
-                .get("pageSize")
-                .or_else(|| params.get("limit"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20);
-
-            let url = format!(
-                "http://mobilecdn.kugou.com/api/v3/search/song?format=json&keyword={}&page={}&pagesize={}&showtype=1",
-                urlencoding::encode(keyword),
-                page,
-                page_size
-            );
-
-            match HTTP_CLIENT
-                .get(&url)
-                .header(
-                    header::USER_AGENT,
-                    "Android712-AndroidPhone-8983-18-0-NetMusic-wifi",
-                )
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let json_val: Value = resp.json().await.unwrap_or_default();
-                    ApiCallResponse::ok_data(json_val)
-                }
-                Err(e) => ApiCallResponse::err(format!("Kugou search error: {}", e)),
-            }
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            to_qqkg_resp(client.search(&SearchParams::from_map(&params)).await)
         }
         "lyric" => {
             let hash = params.get("hash").and_then(|v| v.as_str()).unwrap_or("");
