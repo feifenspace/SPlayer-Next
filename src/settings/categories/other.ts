@@ -36,6 +36,30 @@ const otherCategory: SettingCategory = {
             "settings.platformLogin.manualCookie",
           ],
         },
+        {
+          key: "qobuzAccount",
+          type: "custom",
+          component: PlatformAccount,
+          componentProps: { platform: "qobuz" },
+          fullWidth: true,
+          keywords: [
+            "settings.platformLogin.title",
+            "settings.platformLogin.desc",
+            "qobuz",
+          ],
+        },
+        {
+          key: "tidalAccount",
+          type: "custom",
+          component: PlatformAccount,
+          componentProps: { platform: "tidal" },
+          fullWidth: true,
+          keywords: [
+            "settings.platformLogin.title",
+            "settings.platformLogin.desc",
+            "tidal",
+          ],
+        },
       ],
     },
     {

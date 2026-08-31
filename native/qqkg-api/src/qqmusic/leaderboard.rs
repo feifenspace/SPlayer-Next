@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::error::QqkgError;
-use crate::normalize::join_singers;
 use crate::qqmusic::QqmusicClient;
+
 
 
 impl QqmusicClient {
@@ -63,44 +63,11 @@ impl QqmusicClient {
 
         let mut songs: Vec<Value> = Vec::new();
         for item in raw_song_list {
-            let song = match item.get("songInfo") {
-                Some(s) => s,
-                None => continue,
-            };
-            let mid = match song.get("mid").and_then(Value::as_str) {
-                Some(m) if !m.is_empty() => m,
-                _ => continue,
-            };
-
-            let singers = song.get("singer").and_then(Value::as_array);
-            let artist_name = singers.map(|s| join_singers(s)).unwrap_or_default();
-
-            let album_name = song
-                .get("album")
-                .and_then(|a| a.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let album_mid = song
-                .get("album")
-                .and_then(|a| a.get("mid"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let interval = song.get("interval").and_then(Value::as_u64).unwrap_or(0);
-
-            let cover = format!("https://y.gtimg.cn/music/photo_new/T002R300x300M000{album_mid}.jpg");
-
-            songs.push(json!({
-                "id": song.get("id").and_then(|v| v.as_i64()).map(|n| n.to_string()).unwrap_or_default(),
-                "mid": mid,
-                "name": song.get("title").and_then(Value::as_str).unwrap_or(""),
-                "artist": artist_name,
-                "artists": singers.cloned().unwrap_or_default(),
-                "album": album_name,
-                "albumMid": album_mid,
-                "cover": cover,
-                "duration": interval * 1000,
-            }));
+            if let Some(song) = item.get("songInfo") {
+                songs.push(crate::qqmusic::search::normalize_song(song));
+            }
         }
+
 
         Ok(json!({
             "code": 200,

@@ -76,8 +76,9 @@ fn quality_hashes(raw: &Value) -> (Vec<String>, Map<String, Value>, Map<String, 
     (qualities, hashes, sizes)
 }
 
-fn normalize_from_mobile(raw: &Value) -> Value {
+pub(crate) fn normalize_from_mobile(raw: &Value) -> Value {
     let (qualities, hashes, sizes) = quality_hashes(raw);
+
 
     let artist_name = format_mobile_artist(&val_str(raw, "singername"));
     let artists: Vec<Value> = artist_name

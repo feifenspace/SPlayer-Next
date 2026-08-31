@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SPlayer Headless 极致 HIFI 修复计划 v3</title>
+<style>
+  :root {
+    --bg: #FAFAFA;
+    --surface: #FFFFFF;
+    --text: #1A1A1A;
+    --muted: #666666;
+    --border: #E5E5E5;
+    --accent: #4B3FE3;
+    --accent-soft: #EEF0FF;
+    --green: #16A34A;
+    --green-soft: #F0FDF4;
+    --red: #DC2626;
+    --red-soft: #FEF2F2;
+    --amber: #D97706;
+    --amber-soft: #FFFBEB;
+    --blue: #2563EB;
+    --blue-soft: #EFF6FF;
+    --gray-soft: #F4F4F5;
+    --code-bg: #F4F4F5;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.75;
+    font-size: 15px;
+    padding: 40px 20px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  header { margin-bottom: 36px; padding-bottom: 24px; border-bottom: 2px solid var(--text); }
+  .ver { display: inline-block; background: var(--accent); color: #fff; font-size: 12px; font-weight: 700; padding: 2px 12px; border-radius: 999px; margin-bottom: 12px; letter-spacing: 1px; }
+  h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 8px; }
+  .subtitle { color: var(--muted); font-size: 14px; }
+  .meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 16px; font-size: 13px; color: var(--muted); }
+  .meta span { display: inline-flex; align-items: center; gap: 6px; }
+  .meta span::before { content: "·"; font-weight: 700; color: var(--accent); }
+  h2 {
+    font-size: 20px; font-weight: 700; margin: 44px 0 16px;
+    padding-left: 12px; border-left: 4px solid var(--accent);
+    letter-spacing: -0.3px;
+  }
+  h3 { font-size: 16px; font-weight: 600; margin: 28px 0 10px; }
+  p { margin-bottom: 12px; color: #333; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px 24px; margin-bottom: 16px;
+  }
+  .card.callout { background: var(--accent-soft); border-color: #C9C4F5; }
+  .card.danger { background: var(--red-soft); border-color: #FECACA; }
+  .card.ok { background: var(--green-soft); border-color: #BBF7D0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+  th { text-align: left; padding: 9px 12px; background: var(--gray-soft); font-weight: 600; border: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 9px 12px; border: 1px solid var(--border); vertical-align: top; }
+  code {
+    font-family: "SF Mono", Consolas, "Cascadia Code", monospace;
+    background: var(--code-bg); padding: 2px 6px; border-radius: 4px;
+    font-size: 12.5px; color: #B91C1C;
+  }
+  pre {
+    background: #1E1E2E; color: #CDD6F4; padding: 16px 20px; border-radius: 8px;
+    overflow-x: auto; font-family: "SF Mono", Consolas, monospace;
+    font-size: 12.5px; line-height: 1.7; margin: 14px 0;
+  }
+  pre code { background: none; padding: 0; color: inherit; }
+  ul, ol { padding-left: 22px; margin-bottom: 12px; }
+  li { margin-bottom: 6px; color: #333; }
+  .tag {
+    display: inline-block; padding: 1px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; white-space: nowrap;
+  }
+  .tag.p0 { background: var(--red-soft); color: var(--red); }
+  .tag.p1 { background: var(--amber-soft); color: var(--amber); }
+  .tag.p2 { background: var(--blue-soft); color: var(--blue); }
+  .tag.ok { background: var(--green-soft); color: var(--green); }
+  .tag.no { background: var(--red-soft); color: var(--red); }
+  .tag.warn { background: var(--amber-soft); color: var(--amber); }
+  .tag.gray { background: var(--gray-soft); color: var(--muted); }
+  .tag.strike { background: var(--gray-soft); color: var(--muted); text-decoration: line-through; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 14px 0; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .stat .num { font-size: 26px; font-weight: 700; color: var(--accent); }
+  .stat .label { font-size: 13px; color: var(--muted); }
+  .phase-head { display: flex; align-items: center; gap: 12px; margin: 32px 0 14px; }
+  .phase-head .pnum {
+    background: var(--accent); color: #fff; width: 32px; height: 32px;
+    border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 15px; flex-shrink: 0;
+  }
+  .phase-head .ptitle { font-size: 18px; font-weight: 700; }
+  .phase-head .pest { margin-left: auto; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 24px; margin-bottom: 8px; }
+  .toc-title { font-weight: 700; font-size: 14px; margin-bottom: 10px; color: var(--muted); }
+  .toc ol { margin: 0; columns: 2; column-gap: 32px; }
+  .toc li { break-inside: avoid; margin-bottom: 5px; font-size: 14px; color: var(--accent); }
+  .toc a { color: inherit; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  .diff-note { font-size: 13px; color: var(--muted); background: var(--gray-soft); border-radius: 6px; padding: 8px 14px; margin: -6px 0 16px; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <div class="ver">V3.1 · 全部改动上游零冲突</div>
+  <h1>SPlayer Headless · 极致 HIFI 修复计划</h1>
+  <p class="subtitle">目标从"功能补全"调整为"bit-perfect 直通 + 极简依赖" — 基于 2026-08-29 全量排查与信号链源码核实；v3 新增 P4 QQ/酷狗登录功能修复；v3.1 经 git 实证修订：全部改动收敛至 headless 独有文件，上游同步零冲突</p>
+  <div class="meta">
+    <span>仓库 SPlayer-Next-Headless @ dev</span>
+    <span>基线提交 c1a11b8</span>
+    <span>更新日期 2026-08-30</span>
+    <span>预计总工作量 ≈ 1.5 天</span>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="stat"><div class="num">1</div><div class="label">崩溃级缺陷修复（P0）</div></div>
+  <div class="stat"><div class="num">1</div><div class="label">核心新增：bit-perfect 直通模式</div></div>
+  <div class="stat"><div class="num">1</div><div class="label">P4 · QQ/酷狗登录链路打通</div></div>
+  <div class="stat"><div class="num">≈1.5 天</div><div class="label">含 P4 端口移植与协议桥接</div></div>
+</div>
+
+<div class="toc">
+  <div class="toc-title">目录</div>
+  <ol>
+    <li><a href="#shift">方向调整说明（v1 → v2 → v3）</a></li>
+    <li><a href="#principle">防上游覆盖的架构原则</a></li>
+    <li><a href="#p0">P0 · 切歌 panic 修复</a></li>
+    <li><a href="#p1">P1 · bit-perfect 直通模式</a></li>
+    <li><a href="#p2">P2 · 依赖与二进制裁剪</a></li>
+    <li><a href="#p3">P3 · 前端 HIFI 化</a></li>
+    <li><a href="#p4">P4 · QQ/酷狗登录链路打通（v3 新增）</a></li>
+    <li><a href="#keep">保留清单（HIFI 本体）</a></li>
+    <li><a href="#verify">验证与部署流程</a></li>
+    <li><a href="#sync">上游同步防护流程</a></li>
+  </ol>
+</div>
+
+<h2 id="shift">一、方向调整说明（v1 → v2 → v3）</h2>
+<p class="diff-note">v1 计划的目标是"把桌面版功能补齐到 headless"。用户定位变更：headless 模式打造为<strong>极致 HIFI 专用形态</strong>——信号从文件比特到 DAC 比特零加工（bit-perfect）。因此大量 v1 修复项转为"反向裁剪"。v3 新增 P4：QQ/酷狗登录链路打通——设置页有 UI 入口但登录按钮全链路未实现。</p>
+
+<table>
+  <tr><th>v1 计划项</th><th>v2 决策</th><th>理由</th></tr>
+  <tr><td>P0 stop 接口 panic 修复</td><td><span class="tag p0">保留</span></td><td>稳定性前提，与音质方向无关</td></tr>
+  <tr><td>P1 补全 DSP API（速度/音调/EQ/均衡/淡入淡出 9 条路由）</td><td><span class="tag strike">取消</span> → 前端隐藏</td><td>每一项都是信号加工：Biquad 滤波改频响、时间拉伸有损、限幅/均衡/淡出改增益——与 bit-perfect 直接冲突</td></tr>
+  <tr><td>P2 输出设备列表 API</td><td><span class="tag gray">简化</span></td><td>固定 HIFI 系统（Diretta Target + 固定 DAC），现有 Diretta 面板已够用</td></tr>
+  <tr><td>P2 stats 汇总修复</td><td><span class="tag strike">取消</span></td><td>行为统计与听音无关；play_history 保留（歌单"最近播放"依赖）</td></tr>
+  <tr><td>P3 FFT 频谱可视化</td><td><span class="tag strike">取消</span></td><td>与听音无关，还要求开 fft feature + 解码侧多一条重采样支路；维持 <code>default-features = false</code></td></tr>
+  <tr><td>P4 次要功能（cover_raw / deleteTracks / 歌词文件）</td><td><span class="tag gray">搁置</span></td><td>与 HIFI 无关，需要时再做</td></tr>
+  <tr><td>（新增）数字音量控制</td><td><span class="tag p1">反向处理</span></td><td>音量 &lt; 1.0 的 f32 乘法等效损失位深（-20dB 约丢 3.3 bit），锁 1.0，音量交给 DAC/Diretta 模拟端</td></tr>
+</table>
+
+<h2 id="principle">二、防上游覆盖的架构原则（2026-08-30 git 实证修订）</h2>
+
+<div class="card callout">
+<p><strong>所有改动仍落在"上游不存在的文件"中，与 <code>origin/dev</code> 文件集合零重叠，未来 merge 上游零冲突、零覆盖。</strong></p>
+</div>
+
+<table>
+  <tr><th>改动位置</th><th>上游是否有此文件</th><th>冲突风险</th><th>用途</th></tr>
+  <tr><td><code>native/headless-server/src/api/player_ext.rs</code>（新建）</td><td><span class="tag no">无</span></td><td>零</td><td>bit-perfect 开关路由集中于此</td></tr>
+  <tr><td><code>src/services/client/httpClient.ts</code> + <code>webPolyfill.ts</code></td><td><span class="tag no">无</span>（整个 src/services/client/ 目录独有）</td><td>零</td><td>直通开关接线 + DSP 方法改为明确拒绝 + 前端干预唯一入口</td></tr>
+  <tr><td><code>native/headless-server/src/api/routes.rs</code></td><td><span class="tag no">无</span>（整个 headless-server 目录独有）</td><td>零</td><td>stop 隔离修复 + 一行 router merge</td></tr>
+  <tr><td><code>native/audio-engine-core</code>（整个 crate）</td><td><span class="tag no">无</span>（上游只有 audio-engine，无此 crate）</td><td>零</td><td>bit-perfect 短路、feature 裁剪、limiter 直通验证——<strong>全部随意改，无上游顾虑</strong></td></tr>
+  <tr><td>上游前端文件（<code>src/core/player/</code>、设置页组件、<code>src/apis/**</code> 等）</td><td><span class="tag warn">有</span></td><td>—</td><td><strong>一律不改</strong>——所有前端行为干预（控件隐藏、功能禁用）集中到 webPolyfill.ts（headless 独有的 window.api 桥，main.ts:1 引入）实施</td></tr>
+</table>
+
+<div class="card ok">
+<p><strong>git 实证方法</strong>（2026-08-30 执行，今后每次新增改动文件前照此验证）：</p>
+<pre><code>git cat-file -e origin/dev:native/audio-engine-core/Cargo.toml   # 不存在 → 独有，随便改
+git cat-file -e origin/dev:src/components/settings/custom/PlatformAccount.vue  # 存在 → 上游文件，禁改</code></pre>
+</div>
+
+<p>四条纪律不变：不动上游文件既有行；每阶段独立提交（<code>feat(hifi):</code> / <code>fix(headless):</code> 前缀）；PlayerApi 类型接口作为上游同步哨兵；<strong>headless 后端纯 Rust、零 Node 运行时依赖</strong>（见下方硬约束）。</p>
+
+<div class="card danger">
+<p><strong>硬约束（2026-08-30 新增，已四项实证达标）</strong>：headless 后端<strong>必须纯 Rust 实现，禁止引入 Node 运行时依赖</strong>。运行时形态 = 单一 Rust 二进制 + 静态 web 资源；Node 工具链仅允许构建期（pnpm build）。实证：① Rust 代码零 <code>Command::new</code> 子进程调用；② 运行进程仅 <code>/opt/splayer-headless/splayer-headless</code>，无 node；③ /opt 目录无 node_modules；④ 依赖栈全 Rust（axum/tokio/reqwest/rusqlite-bundled/md5/ncm-api-rs 纯 Rust crate）。<strong>对后续实施的含义</strong>：任何新功能（QQ/酷狗解析的 MD5/RSA/3DES、歌词、元数据等）一律用 Rust crate 在 headless 独有文件中实现，禁止 spawn node、禁止复用 Electron TS 代码运行时、禁止引入 npm 包侧车服务。桌面端 TS 实现只作移植参考。</p>
+</div>
+
+<div class="card warn">
+<p><strong>既有冲突面提醒（历史遗留，非本计划产生）</strong>：当前 dev 相对 origin/dev 已有约 33 个文件存在内容差异（src/main.ts、src/services/playback.ts、src/stores/library.ts、src/utils/quality.ts、shared/types/*.ts 等，系此前 headless 适配所改）。这些是当前 merge 时真正的冲突处理点，建议后续有机会逐步收敛：将其中可迁移的逻辑挪入 headless 独有文件，差异面越小火花越小。本计划所有新增改动<strong>不再扩大</strong>此差异面。</p>
+</div>
+
+<h2 id="p0">三、P0 · 切歌 panic 修复</h2>
+
+<div class="phase-head"><div class="pnum">0</div><div class="ptitle">stop 接口隔离</div><div class="pest">≈ 0.5 小时</div></div>
+
+<div class="card danger">
+<p><strong>现状</strong>：前端切歌先调 stop，headless-server 的 <code>stop_handler</code>（routes.rs:408）在 tokio worker 上直接执行 <code>player.stop()</code>，drop 内嵌 Runtime 的 <code>HttpAudioSource</code> 时触发 panic；与 load 竞争时会杀死新曲目（已实测复现：一次静音 4 小时）。</p>
+</div>
+
+<pre><code>async fn stop_handler(State(state): State&lt;AppState&gt;) -> Result&lt;Json&lt;PlayerResponse&gt;, ApiError&gt; {
+    let player = state.player.clone();
+    // 与 load/seek 一致：独立线程 drop 解码器，避免内嵌 Runtime panic
+    let result = spawn_isolated_blocking(move || {
+        player.lock().stop()
+    }).await;
+    ...
+}</code></pre>
+
+<p>仅改 <code>stop_handler</code> 一个函数体。验证：连续切歌 20 次 <code>journalctl | grep -i panic</code> 零输出；在线曲播放 30 分钟无中断。</p>
+
+<h2 id="p1">四、P1 · bit-perfect 直通模式（核心新增）</h2>
+
+<div class="phase-head"><div class="pnum">1</div><div class="ptitle">服务端直通开关 + DSP 链全旁路</div><div class="pest">≈ 1.5 小时</div></div>
+
+<div class="card ok">
+<p><strong>重大利好（已源码核实）</strong>：直通所需的大部分旁路逻辑<strong>引擎里已经有了</strong>，本阶段主要是"把现有开关组合成一个模式"：</p>
+<ul style="margin-top:8px">
+  <li>EQ：<code>equalizer.rs:199</code> — <code>if !self.enabled { return; }</code> 禁用时<strong>完全旁路，零信号改动</strong></li>
+  <li>变速变调：<code>tempo.rs:62 is_bypass()</code> — speed=1.0 且 transpose=0 时整段跳过（decoder.rs:323 已接此判定）</li>
+  <li>音量均衡 / 淡入淡出 / 数字音量：均有现成 setter 可归零</li>
+</ul>
+</div>
+
+<h3>4.1 API 设计（新文件 player_ext.rs）</h3>
+<pre><code>GET  /api/v1/player/bitperfect          // → { enabled, sample_rate, channels }
+POST /api/v1/player/bitperfect          // { "enabled": true } → 应用并返回状态</code></pre>
+
+<h3>4.2 开启时执行的 setter 组合（全部现成）</h3>
+<pre><code>player.set_equalizer_enabled(false);     // EQ 全旁路（equalizer.rs:199 生效）
+player.set_speed(1.0);                   // 触发 tempo is_bypass（tempo.rs:62）
+player.set_pitch(0);
+player.set_normalization_enabled(false); // 响度均衡关闭
+player.set_fade_duration(0);            // 无淡入淡出包络
+player.set_volume(1.0);                  // f32×1.0 位级无损</code></pre>
+
+<h3>4.3 锁定语义（新增的少量代码）</h3>
+<ul>
+  <li>bit-perfect 开启时，AppState 记录 <code>bit_perfect: AtomicBool</code>；所有 DSP 类写请求（若未来接入）返回 409 <code>"bit-perfect mode active"</code>，防止误操作破坏直通状态</li>
+  <li>音量接口在直通下同样返回 409（前端音量条已隐藏，此处是兜底）</li>
+  <li>持久化到 <code>config.yaml</code>（<code>bit_perfect: true</code>），服务重启自动恢复</li>
+</ul>
+
+<h3>4.4 需要验证/小改的一个点：输出限幅器</h3>
+<p><code>decoder.rs:324</code> 显示 stretch 旁路路径仍会过 <code>limiter.process()</code>。恒定增益下限幅器理论上 bit-identical（×1.0），但需验证其是否有 lookahead 延迟或攻击包络。验证方法见第七节 bit-compare 测试；若对比不一致，在 <code>process_audio_chunk</code> 加一个直通短路（<code>if shared.is_bit_perfect() { return chunk; }</code>，Shared 上加 AtomicBool，约 5 行）。</p>
+
+<h3>4.5 数据面事实说明（写进文档供参考）</h3>
+<ul>
+  <li>内部管线是 f32（24-bit 尾数）：16/24-bit 整数 PCM → f32 → DAC 数值无损，不存在精度损失</li>
+  <li>本地输出按音源原始采样率打开设备（已实现）；<strong>Diretta 只接受 44.1k 系列</strong>（44.1/88.2/176.4/352.8k），48k 音源会在解码侧重采样——选音源优先 44.1k 系无损</li>
+</ul>
+
+<h2 id="p2">五、P2 · 依赖与二进制裁剪</h2>
+
+<div class="phase-head"><div class="pnum">2</div><div class="ptitle">砍掉与 HIFI 无关的重依赖</div><div class="pest">≈ 1 小时</div></div>
+
+<table>
+  <tr><th>裁剪项</th><th>做法</th><th>收益</th></tr>
+  <tr><td><code>signalsmith-stretch</code>（变速变调，DSP 链最重依赖）</td><td>audio-engine-core 的 Cargo.toml 将其改为 optional，新增 <code>tempo</code> feature（桌面版 default 开启，headless-server 不启用）</td><td>二进制再减一截；headless 构建彻底不含时间拉伸代码</td></tr>
+  <tr><td><code>device_watcher</code> 模块 + <code>pipewire 0.10</code> 硬依赖</td><td>device_watcher 改为 feature-gated 模块（headless 不启用）</td><td><code>libpipewire</code> 依赖消失——之前 ldd 出现的 <code>libpipewire not found</code> 移植性问题直接解决；固定 HIFI 系统无热插拔需求</td></tr>
+  <tr><td><code>fft</code> / <code>midi</code></td><td>维持现状（<code>default-features = false</code>，昨天已完成）</td><td>已省 4–6 MB，无额外动作</td></tr>
+  <tr><td>cpal 的 <code>pipewire</code> feature</td><td>若确认只用 Diretta + ALSA 兜底，可从 cpal features 移除 pipewire（保留基础 alsa 后端）</td><td>可选：进一步缩二进制；保留本地输出能力则不动</td></tr>
+</table>
+
+<p>实施注意：feature 改动集中在 <code>audio-engine-core/Cargo.toml</code>（追加 optional 与 feature 声明，纯增量）+ 少量 <code>#[cfg(feature)]</code> 门控（tempo 相关字段与 device_watcher 的 mod 声明）。改完必须跑 <code>cargo check -p audio-engine-core --no-default-features</code> 与桌面侧 <code>cargo check -p audio-engine</code> 双向验证。</p>
+
+<h2 id="p3">六、P3 · 前端 HIFI 化</h2>
+
+<div class="phase-head"><div class="pnum">3</div><div class="ptitle">隐藏信号加工控件与无关入口</div><div class="pest">≈ 1.5 小时</div></div>
+
+<h3>6.1 httpClient（src/services/client/httpClient.ts）</h3>
+<ul>
+  <li>新增 <code>setBitPerfect(enabled)</code> / <code>getBitPerfect()</code> 接线到 4.x 节点 API</li>
+  <li>DSP 类方法（setSpeed/setPitch/setEqualizer*/setNormalizationEnabled/setFadeDuration/setVolume）从"假成功"改为<strong>明确报错</strong> <code>{ success: false, error: "bit-perfect mode" }</code>——假成功是本次排查发现的最大陷阱，宁可报错也不静默无效</li>
+</ul>
+
+<h3>6.2 前端行为干预（全部在 webPolyfill.ts，headless 独有文件；上游组件零改动）</h3>
+<div class="card danger">
+<p><strong>设计约束（git 实证）</strong>：设置页组件（设置项渲染）、<code>src/settings/categories/*</code>、<code>src/core/player/</code> 均为上游文件，<strong>一律不改</strong>。所有干预通过 webPolyfill.ts（headless 模式 window.api 唯一提供者，main.ts:1 引入）实施——这是 headless 形态下唯一的前端"钩子层"。</p>
+</div>
+<table>
+  <tr><th>处理</th><th>具体项</th><th>webPolyfill 实施方式</th></tr>
+  <tr>
+    <td><span class="tag no">明确拒绝</span></td>
+    <td>播放速度、音调偏移、速度音调联动、均衡器（开关/频段/前级）、音量均衡、淡入淡出时长、音量条操作</td>
+    <td>setSpeed/setPitch/setEqualizer*/setNormalizationEnabled/setFadeDuration/setVolume 等 DSP 方法不再"假成功"，改为返回 <code>{ success: false, error: "bit-perfect mode" }</code>——控件仍显示，但操作即时报错，杜绝静默无效</td>
+  </tr>
+  <tr>
+    <td><span class="tag p2">CSS 隐藏（可选增强）</span></td>
+    <td>下载管理、云盘、流媒体服务器、听歌识曲、插件系统、Last.fm、AI/MCP、全局快捷键设置区</td>
+    <td>webPolyfill 初始化时（仅 headless）注入 <code>&lt;style&gt;</code> 标签按稳定选择器隐藏无关入口；选择器以 data-* 属性/路由 path 为锚（实施时逐个探查），上游改版只会导致隐藏失效（降级为可见），不会报错</td>
+  </tr>
+  <tr>
+    <td><span class="tag ok">新增</span></td>
+    <td>设置页"极致 HIFI"区块：bit-perfect 总开关（默认开）+ 直通状态指示（当前采样率/位深/声道数，数据来自 <code>/api/v1/player/bitperfect</code>）</td>
+    <td>渲染层需挂载到设置页——为避免改上游组件，采用<strong>独立挂载</strong>：webPolyfill 初始化时向 document.body 追加悬浮"直通状态指示条"（采样率/位深实时显示），开关则复用现有配置系统（config set 端点已可用）</td>
+  </tr>
+</table>
+<p>降级链设计：CSS 隐藏失效（上游改版）→ 控件重新可见 → 操作时被 DSP 明确拒绝兜底 → 用户感知为"功能锁定"而非"功能损坏"。三层防御全部不依赖上游文件。</p>
+
+<h2 id="p4">七、P4 · QQ/酷狗登录链路打通（v3 新增）</h2>
+
+<div class="card callout">
+<p><strong>本章节已有独立完整版</strong>：<code>qq-kg-integration-plan.html</code>（QQ音乐/酷狗音乐 Headless 完整打通实施计划）——含 P4 未覆盖的<strong>搜索显示修复（S1）</strong>与<strong>在线播放 song_url（S3）</strong>，共三阶段递进（S1 搜索 → S2 登录 → S3 播放）。实施以独立计划为准，本章节为其 S2 阶段的摘要。两份计划的全部改动均落在 headless 独有文件（<code>native/headless-server/</code>、<code>src/services/client/</code>），上游 merge 零冲突（2026-08-30 git 实证）。</p>
+</div>
+
+<div class="phase-head"><div class="pnum">4</div><div class="ptitle">设置页登录功能补全</div><div class="pest">≈ 1 天</div></div>
+
+<div class="card danger">
+<p><strong>现状</strong>：设置页 QQ/酷狗登录 UI 完整存在（手动 Cookie / 扫码登录 / 网页登录三个按钮），前端适配层完整存在，但<strong>整条登录链路在 headless 后端大面积缺失</strong>——按钮点了要么无响应要么报错。前端代码零改动即可复用，全部缺口在 Rust 侧。</p>
+</div>
+
+<h3>7.1 链路诊断（三层对照）</h3>
+
+<table>
+  <tr><th>层</th><th>QQ音乐</th><th>酷狗</th></tr>
+  <tr><td>前端适配层<br><code>src/apis/login/</code></td><td><span class="tag ok">完备</span> user_detail / clearSession / setCookie / openWebLogin（无扫码）</td><td><span class="tag ok">完备</span> user_detail / clearSession / setCookie / <strong>qrLogin 完整扫码流</strong></td></tr>
+  <tr><td>前端桥接<br><code>webPolyfill.ts</code></td><td>setCookie / clearSession → 伪 API 转发 <span class="tag ok">可用</span>；openLoginWeb 硬编码 <code>{ok:false, "not supported in web mode"}</code> <span class="tag no">死路</span></td><td>同左，扫码走 <code>apis.call</code> 通道 <span class="tag ok">可用</span></td></tr>
+  <tr><td>Rust 后端<br><code>online_apis.rs</code></td><td>仅 search/lyric；<strong>user_detail 缺失</strong>；请求不带 Cookie <span class="tag no">缺失</span></td><td>仅 search/lyric；<strong>login_qr_key / login_qr_check / user_detail 全缺失</strong>（其余返回 "Unsupported Kugou API"）<span class="tag no">缺失</span></td></tr>
+  <tr><td>基础设施<br><code>db.rs account_sessions</code></td><td colspan="2"><span class="tag ok">现成且平台无关</span>：表结构 <code>platform TEXT PRIMARY KEY</code>；<code>dispatch_api_call</code> 的 set_cookie/get_cookie/clear_session 伪 API 在平台分派<strong>之前</strong>处理（online_apis.rs:152-180），QQ/酷狗的 Cookie 存取/登出已经能用，只差读取方</td></tr>
+</table>
+
+<h3>7.2 桌面端移植蓝本（关键算法清单）</h3>
+
+<table>
+  <tr><th>算法/接口</th><th>桌面端位置</th><th>移植难度</th><th>说明</th></tr>
+  <tr><td>KG 参数签名</td><td><code>kugou/core/crypto.ts</code> signatureWebParams</td><td><span class="tag ok">低</span> ≈20 行</td><td>盐值 <code>NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt</code> + 参数名排序拼接 + 盐值 → MD5（Rust 用 <code>md-5</code> crate）</td></tr>
+  <tr><td>KG 设备 MID</td><td>calculateMid / getDeviceMid</td><td><span class="tag ok">低</span></td><td>MD5 + 大整数进制转换；首版直接用桌面默认 GUID 固定 mid 即可</td></tr>
+  <tr><td>KG RSA no-padding</td><td>rsaEncryptKugou</td><td><span class="tag warn">中</span> ≈40 行</td><td>1024 位公钥 + RSA_NO_PADDING + 128 字节零填充块；user_detail 的 <code>p</code> 参数必需。Rust 用 <code>rsa</code> crate 或 <code>num-bigint-dig</code> 的 pow_mod</td></tr>
+  <tr><td>KG 扫码接口</td><td><code>kugou/modules/login_qr.ts</code></td><td><span class="tag ok">低</span></td><td>GET <code>login-user.kugou.com/v2/qrcode</code>（type=1, plat=4, srcappid=2919）+ <code>/v2/get_userinfo_qrcode</code>；status=4 时 token/userid/vip_token 落库</td></tr>
+  <tr><td>QM user_detail</td><td><code>qqmusic/modules/user_detail.ts</code></td><td><span class="tag ok">低</span> ≈60 行</td><td><strong>纯 HTTP 无加密</strong>：GET <code>c.y.qq.com/.../fcg_get_profile_homepage.fcg?userid={uin}</code> 带 Cookie + Referer；失败降级返回 <code>QQ用户_xxxx</code> 兜底资料（与桌面一致）</td></tr>
+  <tr><td>QM 网页登录窗口</td><td><code>window/login.ts</code> BrowserWindow 分区轮询 cookie</td><td><span class="tag no">不可移植</span></td><td>headless 无 GUI —— 不移植，QQ 改走"手动 Cookie"路径（见 7.3-D）</td></tr>
+</table>
+
+<h3>7.3 实施步骤</h3>
+
+<div class="card">
+<p><strong>P4-A · 酷狗扫码登录</strong>（<code>login_qr_key</code> + <code>login_qr_check</code>，≈3h）</p>
+<ul style="margin-top:6px">
+  <li>新建 <code>native/headless-server/src/api/kg_crypto.rs</code>：签名 + MID + RSA no-padding（上游不存在的文件，零冲突）</li>
+  <li>login_qr_key 返回 <code>{code:200, key, content}</code>，content = <code>https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode={key}</code></li>
+  <li>login_qr_check 返回 <code>{code:200, status, nickname, avatarUrl}</code>；status=4 时 save_account_cookies 写入 token/userid/vip_token/vip_type/nickname/avatar</li>
+  <li>响应统一用 <code>ApiCallResponse::ok_data</code> 封装（匹配 httpClient.callApi 的解包路径；netease 的 login_qr_key 兼容层 online_apis.rs:271 是同款先例）</li>
+</ul>
+</div>
+
+<div class="card">
+<p><strong>P4-B · 双平台 user_detail</strong>（≈3h）</p>
+<ul style="margin-top:6px">
+  <li>酷狗：token/userid 从 DB 读 → POST <code>/v3/get_my_info</code>（<code>x-router: usercenter.kugou.com</code>，p 参数用 P4-A 的 RSA）；无 token 返回 <code>{code:200, loggedIn:false}</code></li>
+  <li>QQ：从 DB 读 uin/qm_keyst → GET fcg_get_profile_homepage.fcg → 解析 nick/headpic/is_vip/vip_level</li>
+  <li>返回统一 <code>{code:200, loggedIn, profile:{userId, nickname, avatarUrl, isVip, vipLevel}}</code> —— 前端校验点：qqmusic.ts:33 读 <code>code===200 && loggedIn && profile</code>，kugou.ts:43 读 <code>loggedIn && profile</code></li>
+</ul>
+</div>
+
+<div class="card">
+<p><strong>P4-C · Cookie 注入 QQ/酷狗请求</strong>（≈1h）</p>
+<ul style="margin-top:6px">
+  <li>照抄 netease 模式（online_apis.rs:203-229）：请求前从 DB 读平台 cookie，合并后注入 Cookie 请求头</li>
+  <li>酷狗网关请求带 token/userid；QQ 请求带全量 cookie 串（uin/qm_keyst/pskey 等）</li>
+</ul>
+</div>
+
+<div class="card">
+<p><strong>P4-D · 前端微调</strong>（≈0.5h，仅改 webPolyfill.ts，上游文件零改动）</p>
+<ul style="margin-top:6px">
+  <li>QQ"网页登录"按钮保留渲染（渲染逻辑在上游 platform.ts 静态定义），点击时 webPolyfill 的 <code>openLoginWeb</code> 抛出异常 → handleLogin catch 捕获 → toast 弹"QM 登录失败"——明确反馈而非静默无响应</li>
+  <li>QQ 主推"手动 Cookie"闭环：浏览器登录 y.qq.com → 复制 cookie → 粘贴提交 → setCookie（已可用）→ user_detail（P4-B）→ 头像昵称显示。PlatformAccount.vue 的 handleManualCookieSubmit 现有逻辑已含"提交后立即 fetchProfile 验证、失败自动登出"，零改动</li>
+  <li>酷狗为完整扫码闭环：扫码 → login_qr_check status=4 落库 → user_detail 出 profile → 断开连接（clear_session 已可用）</li>
+</ul>
+</div>
+
+<h3>7.4 边界说明（与 HIFI 方向的关系）</h3>
+<p>P4 只打通<strong>登录态</strong>（认证 + 资料 + 会话持久化）。QQ 的 song_url（vkey 机制）、酷狗 VIP 音质解析属于"在线音源补全"，涉及 3DES/sign 更多移植，<strong>不在 P4 范围</strong>——是否做取决于是否需要 QQ/酷狗作为在线音源（当前 HIFI 主音源是本地 + 网易云）。登录打通后这些能力可随时增量补充。</p>
+
+<h3>7.5 验收标准</h3>
+<table>
+  <tr><th>场景</th><th>操作路径</th><th>通过标准</th></tr>
+  <tr><td>酷狗扫码登录</td><td>设置页 → 扫码登录 → 手机酷狗 App 扫码确认</td><td>轮询状态经历 waiting→scanned→success，头像/昵称/VIP 标签正确显示</td></tr>
+  <tr><td>QQ 手动 Cookie</td><td>浏览器登录 y.qq.com → 复制 cookie → 设置页粘贴提交</td><td>UIN + 昵称显示，无效 cookie 被拒绝并自动登出</td></tr>
+  <tr><td>登出</td><td>断开连接</td><td>profile 清空，重新登录可用</td></tr>
+  <tr><td>持久化</td><td>重启 splayer-headless 服务</td><td>登录态保持（account_sessions 落盘）</td></tr>
+  <tr><td>接口级</td><td><code>curl POST /api/v1/proxy/apis/call {"platform":"kugou","name":"login_qr_key"}</code></td><td>返回含 key/content 的 data</td></tr>
+</table>
+
+<h2 id="keep">八、保留清单（HIFI 本体，一个不动）</h2>
+
+<div class="card ok">
+<ul>
+  <li><strong>解码全家桶</strong>：DSD（DSF/DFF）、SACD 含 DST 解压、MQA、HDCD、CUE、ffmpeg 全格式、DTS</li>
+  <li><strong>原始采样率直出</strong>：按音源原始率打开输出设备（已实现）</li>
+  <li><strong>Diretta 推流</strong>：网卡绑定、Tokio 线程隔离、rt 调度、300ms 预填、watchdog——上周刚调优完的 HIFI 关键路径</li>
+  <li><strong>网易云在线音源</strong>：保留；建议账号内锁定无损/Hi-Res 音质，选源优先 44.1k 系（Diretta 约束）</li>
+  <li><strong>歌词与封面</strong>：不碰信号链，听音体验保留</li>
+  <li><strong>play_history 轻量记录</strong>：歌单"最近播放"依赖</li>
+</ul>
+</div>
+
+<h2 id="verify">九、验证与部署流程</h2>
+
+<h3>9.1 bit-compare 终极验证（P1 的验收标准）</h3>
+<div class="card">
+<pre><code># 1. 用 ffmpeg 解码同一文件得到参考 PCM
+ffmpeg -i test.flac -f f32le -ar 44100 ref.pcm
+# 2. 开启 bit-perfect，播放同一文件，从输出侧抓取管线 PCM
+#    （临时验证路由 GET /api/v1/player/dump_pcm，验证后删除）
+# 3. 比对
+cmp ref.ppm captured.pcm && echo "BIT-PERFECT OK"</code></pre>
+</div>
+<p>比对不一致时按 4.4 节排查限幅器，加直通短路后复测。此测试同时覆盖"EQ 禁用是否真零改动"的验证。</p>
+
+<h3>9.2 常规验证与部署（每阶段）</h3>
+<pre><code>cargo check -p audio-engine-core --no-default-features   # headless 裁剪态
+cargo check -p audio-engine-core -p headless-server       # 默认态 + 服务端
+cargo check -p audio-engine                              # 桌面版不回归
+pnpm typecheck:web && pnpm build
+bash scripts/deploy-headless.sh
+journalctl -u splayer-headless -f                        # 无 panic
+# 浏览器：开关直通、确认设置页隐藏项、Diretta 播放听感</code></pre>
+
+<h3>9.3 提交切分</h3>
+<ol>
+  <li><code>fix(headless): stop 接口隔离修复切歌 panic</code></li>
+  <li><code>feat(hifi): bit-perfect 直通模式（开关 + 锁定 + 持久化）</code></li>
+  <li><code>build(hifi): stretch/pipewire 依赖裁剪</code></li>
+  <li><code>feat(hifi): 前端直通开关与加工类控件隐藏</code></li>
+  <li><code>feat(headless): 酷狗扫码登录与双平台 user_detail（kg_crypto + cookie 注入）</code></li>
+</ol>
+
+<h2 id="sync">十、上游同步防护流程（不变）</h2>
+
+<div class="card callout">
+<pre><code>git fetch origin
+git log dev..origin/dev --oneline        # 确认与 native/headless-server、src/services/client 无交集
+git merge origin/dev                     # merge 不 rebase
+pnpm typecheck:web                       # PlayerApi 哨兵：上游加新方法会在此报错
+cargo check -p headless-server -p audio-engine-core --no-default-features
+pnpm build && 部署 && bit-compare 复测   # 直通是音质底线，每次同步后必跑
+git push fork dev</code></pre>
+</div>
+
+<div class="footer">
+  <p>依据：2026-08-29 全量功能排查（前端 API 面 36 方法 + 30 个 window.api 命名空间、服务端路由实测、浏览器 UI 实测）与 v2 新增源码核实（equalizer.rs:197-201 禁用即旁路、tempo.rs:62 is_bypass、decoder.rs:308-333 DSP 链与限幅路径、playback.rs:83 原子音量、audio-engine-core/Cargo.toml 依赖清单）。v3 依据 2026-08-30 登录链路专项核实：src/apis/login/ 三平台适配层、webPolyfill.ts apis 桥接、online_apis.rs dispatch_api_call 伪 API（152-180）与 netease cookie 注入模式（203-229）、db.rs account_sessions 表、桌面端 kugou/core/crypto.ts（签名盐值 + RSA no-padding）、kugou/modules/login_qr.ts、qqmusic/modules/user_detail.ts、window/login.ts（BrowserWindow 登录窗口）。</p>
+</div>
+
+</div>
+</body>
+</html>

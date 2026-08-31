@@ -28,8 +28,10 @@ export interface ArtistProfile {
   tracks: Track[];
   /** 专辑列表 */
   albums: CoverItem[];
-  /** 歌曲数量 */
+  /** 歌单列表 */
+  playlists?: CoverItem[];
+  /** 歌曲总数 */
   trackCount: number;
-  /** 专辑数量 */
+  /** 专辑总数 */
   albumCount: number;
 }

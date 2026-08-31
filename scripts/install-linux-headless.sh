@@ -42,7 +42,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_DIR="/opt/splayer-headless"
 BIN_PATH="${INSTALL_DIR}/splayer-headless"
 WEB_DIR="${INSTALL_DIR}/web"
-CONFIG_DIR="/etc/splayer-headless"
+CONFIG_DIR="${INSTALL_DIR}/config"
 CONFIG_PATH="${CONFIG_DIR}/config.yaml"
 DATA_DIR="${SPLAYER_DATA_DIR:-/var/lib/splayer-headless}"
 SERVICE_NAME="splayer-headless.service"
@@ -615,7 +615,13 @@ install_files() {
 
 install_config() {
     if [[ ! -f "$CONFIG_PATH" ]]; then
-        cat > "$CONFIG_PATH" <<EOF
+        if [[ -f "/etc/splayer-headless/config.yaml" ]]; then
+            log "迁移现有配置：/etc/splayer-headless/config.yaml -> $CONFIG_PATH"
+            install -d -m 0755 "$CONFIG_DIR"
+            cp -a "/etc/splayer-headless/config.yaml" "$CONFIG_PATH"
+            chmod 0644 "$CONFIG_PATH"
+        else
+            cat > "$CONFIG_PATH" <<EOF
 # SPlayer Linux Headless 配置
 listen_addr: "0.0.0.0:${PORT}"
 cors_origins: "*"
@@ -626,7 +632,8 @@ web_root: "${WEB_DIR}"
 # Diretta Target 地址可写为：fe80::xxxx%2 或 IP%ifno,port
 diretta_target: null
 EOF
-        chmod 0644 "$CONFIG_PATH"
+            chmod 0644 "$CONFIG_PATH"
+        fi
     else
         warn "保留现有配置：$CONFIG_PATH"
     fi
@@ -646,6 +653,7 @@ Group=${RUN_GROUP}
 WorkingDirectory=${INSTALL_DIR}
 Environment=RUST_LOG=headless_server=info,audio_engine_core=info
 Environment=SPLAYER_DATA_DIR=${DATA_DIR}
+Environment=SPLAYER_CONFIG_PATH=${CONFIG_PATH}
 ExecStart=${BIN_PATH}
 Restart=on-failure
 RestartSec=3

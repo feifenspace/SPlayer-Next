@@ -7,10 +7,12 @@
 mod album;
 mod artist;
 mod login_qr;
+mod lyric;
 mod playlist;
 mod search;
 mod song_url;
 mod user_detail;
+
 
 
 

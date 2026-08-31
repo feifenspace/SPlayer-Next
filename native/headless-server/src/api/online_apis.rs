@@ -68,7 +68,7 @@ impl ApiCallResponse {
             ok: true,
             error: None,
             status: Some(200),
-            body: None,
+            body: Some(data.clone()),
             data: Some(data),
         }
     }
@@ -185,6 +185,8 @@ pub async fn dispatch_api_call(
         "netease" => call_netease(&req.name, req.params, db).await,
         "qqmusic" => call_qqmusic(db, &req.name, req.params).await,
         "kugou" => call_kugou(db, &req.name, req.params).await,
+        "qobuz" => call_qobuz(db, &req.name, req.params).await,
+        "tidal" => call_tidal(db, &req.name, req.params).await,
         other => ApiCallResponse::err(format!("Unsupported platform: {}", other)),
     }
 }
@@ -374,40 +376,10 @@ async fn call_qqmusic(
             to_qqkg_resp(client.hot_search().await)
         }
         "lyric" => {
-
-            let song_mid = params
-                .get("songmid")
-                .or_else(|| params.get("mid"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let url = format!(
-                "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid={}&format=json&nobase64=1",
-                urlencoding::encode(song_mid)
-            );
-
-            match HTTP_CLIENT
-                .get(&url)
-                .header(header::REFERER, "https://y.qq.com")
-                .header(
-                    header::USER_AGENT,
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                )
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let text = resp.text().await.unwrap_or_default();
-                    let cleaned = text
-                        .trim_start_matches("MusicJsonCallback(")
-                        .trim_end_matches(')');
-                    let json_val: Value =
-                        serde_json::from_str(cleaned).unwrap_or_else(|_| json!({ "lyric": text }));
-                    ApiCallResponse::ok_data(json_val)
-                }
-                Err(e) => ApiCallResponse::err(format!("QM lyric error: {}", e)),
-            }
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            to_qqkg_resp(client.lyric(&params).await)
         }
+
         _ => {
             // 通用 fcg 请求封装
             let payload = json!({
@@ -536,33 +508,240 @@ async fn call_kugou(
             to_qqkg_resp(client.artist(&params).await)
         }
         "lyric" => {
+            let client = KugouClient::new(load_platform_cookies(db, "kugou"));
+            to_qqkg_resp(client.lyric(&params).await)
+        }
 
+        other => ApiCallResponse::err(format!("Unsupported Kugou API: {}", other)),
+    }
+}
 
-            let hash = params.get("hash").and_then(|v| v.as_str()).unwrap_or("");
-            let keyword = params.get("keyword").and_then(|v| v.as_str()).unwrap_or("");
-            let duration = params.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
+// -------------------------------------------------------------------
+// Qobuz (Pure Rust)
+// -------------------------------------------------------------------
 
-            let url = format!(
-                "http://lyrics.kugou.com/search?ver=1&man=yes&client=pc&keyword={}&duration={}&hash={}",
-                urlencoding::encode(keyword),
-                duration,
-                hash
-            );
+fn to_streaming_resp(r: Result<Value, streaming_api::StreamingError>) -> ApiCallResponse {
+    match r {
+        Ok(v) => ApiCallResponse::ok_data(v),
+        Err(e) => ApiCallResponse::err(format!("Streaming API error: {e}")),
+    }
+}
 
-            match HTTP_CLIENT
-                .get(&url)
-                .header(header::USER_AGENT, "KuGou2012-8000-Official-SearchLyric")
-                .send()
-                .await
-            {
+async fn call_qobuz(
+    db: &parking_lot::Mutex<rusqlite::Connection>,
+    name: &str,
+    params: HashMap<String, Value>,
+) -> ApiCallResponse {
+    let cookies = load_platform_cookies(db, "qobuz");
+    let user_auth_token = cookies.get("user_auth_token").cloned();
+    let user_id = cookies.get("user_id").cloned();
+    let client = streaming_api::QobuzClient::new(user_auth_token, user_id);
+
+    match name {
+        "auth_login" | "login" => {
+            match client.auth_login(&params).await {
                 Ok(resp) => {
-                    let json_val: Value = resp.json().await.unwrap_or_default();
-                    ApiCallResponse::ok_data(json_val)
+                    if let (Some(tok), Some(uid)) = (
+                        resp.get("user_auth_token").and_then(Value::as_str),
+                        resp.get("user_id").and_then(Value::as_str),
+                    ) {
+                        let mut new_cookies = HashMap::new();
+                        new_cookies.insert("user_auth_token".to_string(), tok.to_string());
+                        new_cookies.insert("user_id".to_string(), uid.to_string());
+                        let conn = db.lock();
+                        let _ = crate::db::save_account_cookies(&conn, "qobuz", &new_cookies);
+                    }
+                    ApiCallResponse::ok_data(resp)
                 }
-                Err(e) => ApiCallResponse::err(format!("Kugou lyric search error: {}", e)),
+                Err(e) => ApiCallResponse::err(format!("Qobuz login error: {e}")),
             }
         }
-        other => ApiCallResponse::err(format!("Unsupported Kugou API: {}", other)),
+        "auth_status" | "status" | "user_detail" => {
+            to_streaming_resp(client.auth_status().await)
+        }
+        "auth_logout" | "logout" => {
+            {
+                let conn = db.lock();
+                let _ = crate::db::clear_account_cookies(&conn, "qobuz");
+            }
+            to_streaming_resp(client.auth_logout().await)
+        }
+        "catalog_search" | "search" => {
+            to_streaming_resp(client.catalog_search(&params).await)
+        }
+        "track_getFileUrl" | "song_url" => {
+            to_streaming_resp(client.track_get_file_url(&params).await)
+        }
+        "album_get" | "album" => {
+            to_streaming_resp(client.album_get(&params).await)
+        }
+        "artist_get" | "artist" => {
+            to_streaming_resp(client.artist_get(&params).await)
+        }
+        "artist_getReleasesList" => {
+            to_streaming_resp(client.artist_get_releases_list(&params).await)
+        }
+        "playlist_get" | "playlist" => {
+            to_streaming_resp(client.playlist_get(&params).await)
+        }
+        "user_getFavorites" | "favorites" => {
+            to_streaming_resp(client.user_get_favorites(&params).await)
+        }
+        "favorite_create" => {
+            to_streaming_resp(client.favorite_create(&params).await)
+        }
+        "favorite_delete" => {
+            to_streaming_resp(client.favorite_delete(&params).await)
+        }
+        other => ApiCallResponse::err(format!("Unsupported Qobuz API: {}", other)),
+    }
+}
+
+// -------------------------------------------------------------------
+// TIDAL (Pure Rust)
+// -------------------------------------------------------------------
+
+async fn call_tidal(
+    db: &parking_lot::Mutex<rusqlite::Connection>,
+    name: &str,
+    params: HashMap<String, Value>,
+) -> ApiCallResponse {
+    let cookies = load_platform_cookies(db, "tidal");
+    let access_token = cookies.get("access_token").cloned();
+    let refresh_token = cookies.get("refresh_token").cloned();
+    let user_id = cookies.get("user_id").cloned();
+    let country_code = cookies.get("country_code").cloned();
+    let client_id = cookies.get("client_id").cloned();
+    let client_secret = cookies.get("client_secret").cloned();
+
+    let client = streaming_api::TidalClient::new(
+        access_token,
+        refresh_token,
+        user_id,
+        country_code,
+        client_id,
+        client_secret,
+    );
+
+    match name {
+        "auth_authorize" | "authorize" => {
+            to_streaming_resp(client.auth_authorize(&params).await)
+        }
+        "auth_exchange" | "exchange" => {
+            match client.auth_exchange(&params).await {
+                Ok(resp) => {
+                    let mut new_cookies = HashMap::new();
+                    if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
+                        new_cookies.insert("access_token".to_string(), tok.to_string());
+                    }
+                    if let Some(rtok) = resp.get("refreshToken").and_then(Value::as_str) {
+                        new_cookies.insert("refresh_token".to_string(), rtok.to_string());
+                    }
+                    if let Some(uid) = resp.get("userId").and_then(Value::as_str) {
+                        new_cookies.insert("user_id".to_string(), uid.to_string());
+                    }
+                    if let Some(cc) = resp.get("countryCode").and_then(Value::as_str) {
+                        new_cookies.insert("country_code".to_string(), cc.to_string());
+                    }
+                    if let Some(cid) = resp.get("clientId").and_then(Value::as_str) {
+                        new_cookies.insert("client_id".to_string(), cid.to_string());
+                    }
+                    let conn = db.lock();
+                    let _ = crate::db::save_account_cookies(&conn, "tidal", &new_cookies);
+                    ApiCallResponse::ok_data(resp)
+                }
+                Err(e) => ApiCallResponse::err(format!("TIDAL exchange error: {e}")),
+            }
+        }
+        "auth_device_authorization" | "device_authorization" => {
+            to_streaming_resp(client.auth_device_authorization(&params).await)
+        }
+        "auth_token_poll" | "token_poll" => {
+            match client.auth_token_poll(&params).await {
+                Ok(resp) => {
+                    if resp.get("status").and_then(Value::as_str) == Some("success") {
+                        let mut new_cookies = HashMap::new();
+                        if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
+                            new_cookies.insert("access_token".to_string(), tok.to_string());
+                        }
+                        if let Some(rtok) = resp.get("refreshToken").and_then(Value::as_str) {
+                            new_cookies.insert("refresh_token".to_string(), rtok.to_string());
+                        }
+                        if let Some(uid) = resp.get("userId").and_then(Value::as_str) {
+                            new_cookies.insert("user_id".to_string(), uid.to_string());
+                        }
+                        if let Some(cc) = resp.get("countryCode").and_then(Value::as_str) {
+                            new_cookies.insert("country_code".to_string(), cc.to_string());
+                        }
+                        if let Some(cid) = resp.get("clientId").and_then(Value::as_str) {
+                            new_cookies.insert("client_id".to_string(), cid.to_string());
+                        }
+                        let conn = db.lock();
+                        let _ = crate::db::save_account_cookies(&conn, "tidal", &new_cookies);
+                    }
+                    ApiCallResponse::ok_data(resp)
+                }
+                Err(e) => ApiCallResponse::err(format!("TIDAL poll error: {e}")),
+            }
+        }
+        "auth_token_refresh" | "refresh_token" => {
+            match client.auth_token_refresh(&params).await {
+                Ok(resp) => {
+                    if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
+                        let mut updated = cookies.clone();
+                        updated.insert("access_token".to_string(), tok.to_string());
+                        if let Some(rtok) = resp.get("refreshToken").and_then(Value::as_str) {
+                            updated.insert("refresh_token".to_string(), rtok.to_string());
+                        }
+                        let conn = db.lock();
+                        let _ = crate::db::save_account_cookies(&conn, "tidal", &updated);
+                    }
+                    ApiCallResponse::ok_data(resp)
+                }
+                Err(e) => ApiCallResponse::err(format!("TIDAL refresh error: {e}")),
+            }
+        }
+        "auth_status" | "status" | "user_detail" => {
+            to_streaming_resp(client.auth_status().await)
+        }
+        "auth_logout" | "logout" => {
+            {
+                let conn = db.lock();
+                let _ = crate::db::clear_account_cookies(&conn, "tidal");
+            }
+            to_streaming_resp(client.auth_logout().await)
+        }
+        "search" => {
+            to_streaming_resp(client.search(&params).await)
+        }
+        "track_getStreamUrl" | "song_url" => {
+            to_streaming_resp(client.track_get_stream_url(&params).await)
+        }
+        "album_get" | "album" => {
+            to_streaming_resp(client.album_get(&params).await)
+        }
+        "album_getTracks" => {
+            to_streaming_resp(client.album_get_tracks(&params).await)
+        }
+        "artist_get" | "artist" => {
+            to_streaming_resp(client.artist_get(&params).await)
+        }
+        "artist_getAlbums" => {
+            to_streaming_resp(client.artist_get_albums(&params).await)
+        }
+        "artist_getTopTracks" => {
+            to_streaming_resp(client.artist_get_top_tracks(&params).await)
+        }
+        "playlist_get" | "playlist" => {
+            to_streaming_resp(client.playlist_get(&params).await)
+        }
+        "playlist_getTracks" => {
+            to_streaming_resp(client.playlist_get_tracks(&params).await)
+        }
+        "user_getFavorites" | "favorites" => {
+            to_streaming_resp(client.user_get_favorites(&params).await)
+        }
+        other => ApiCallResponse::err(format!("Unsupported TIDAL API: {}", other)),
     }
 }
 
@@ -638,6 +817,61 @@ pub async fn stream_proxy_handler(
         Err(e) => (
             StatusCode::BAD_GATEWAY,
             format!("Stream proxy error: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageProxyQuery {
+    pub url: String,
+}
+
+pub async fn image_proxy_handler(
+    axum::extract::Query(query): axum::extract::Query<ImageProxyQuery>,
+) -> Response {
+    if query.url.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Missing url parameter").into_response();
+    }
+
+    let mut req_builder = HTTP_CLIENT.get(&query.url);
+    req_builder = req_builder.header(
+        header::USER_AGENT,
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    );
+
+    match req_builder.send().await {
+        Ok(upstream_resp) => {
+            let status = upstream_resp.status();
+            let upstream_headers = upstream_resp.headers().clone();
+
+            let mut resp_headers = HeaderMap::new();
+            if let Some(ct) = upstream_headers.get(header::CONTENT_TYPE) {
+                resp_headers.insert(header::CONTENT_TYPE, ct.clone());
+            } else {
+                resp_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"));
+            }
+            if let Some(cl) = upstream_headers.get(header::CONTENT_LENGTH) {
+                resp_headers.insert(header::CONTENT_LENGTH, cl.clone());
+            }
+            resp_headers.insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=604800"),
+            );
+            resp_headers.insert(
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("*"),
+            );
+
+            let stream = upstream_resp.bytes_stream();
+            let body = Body::from_stream(stream);
+
+            let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
+            (status_code, resp_headers, body).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            format!("Image proxy error: {}", e),
         )
             .into_response(),
     }

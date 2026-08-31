@@ -1,14 +1,11 @@
-/**
- * 在线平台搜索分发
- * 对外暴露 searchSongs / searchAlbums / searchArtists / searchPlaylists
- */
-
 import type { Track } from "@shared/types/player";
 import type { CoverItem } from "@/types/artist";
 import type { Platform } from "@shared/types/platform";
 import * as netease from "./netease";
 import * as qqmusic from "./qqmusic";
 import * as kugou from "./kugou";
+import * as qobuz from "./qobuz";
+import * as tidal from "./tidal";
 
 /** 搜索结果通用 */
 export interface SearchResult<T> {
@@ -31,6 +28,8 @@ export const searchSongs = (
   if (platform === "netease") return netease.songs(keyword, offset, limit);
   if (platform === "qqmusic") return qqmusic.songs(keyword, offset, limit);
   if (platform === "kugou") return kugou.songs(keyword, offset, limit);
+  if (platform === "qobuz") return qobuz.songs(keyword, offset, limit);
+  if (platform === "tidal") return tidal.songs(keyword, offset, limit);
   return unsupported(platform, "songs");
 };
 
@@ -44,6 +43,8 @@ export const searchAlbums = (
   if (platform === "netease") return netease.albums(keyword, offset, limit);
   if (platform === "qqmusic") return qqmusic.albums(keyword, offset, limit);
   if (platform === "kugou") return kugou.albums(keyword, offset, limit);
+  if (platform === "qobuz") return qobuz.albums(keyword, offset, limit);
+  if (platform === "tidal") return tidal.albums(keyword, offset, limit);
   return unsupported(platform, "albums");
 };
 
@@ -57,6 +58,8 @@ export const searchArtists = (
   if (platform === "netease") return netease.artists(keyword, offset, limit);
   if (platform === "qqmusic") return qqmusic.artists(keyword, offset, limit);
   if (platform === "kugou") return kugou.artists(keyword, offset, limit);
+  if (platform === "qobuz") return qobuz.artists(keyword, offset, limit);
+  if (platform === "tidal") return tidal.artists(keyword, offset, limit);
   return unsupported(platform, "artists");
 };
 
@@ -70,5 +73,7 @@ export const searchPlaylists = (
   if (platform === "netease") return netease.playlists(keyword, offset, limit);
   if (platform === "qqmusic") return qqmusic.playlists(keyword, offset, limit);
   if (platform === "kugou") return kugou.playlists(keyword, offset, limit);
+  if (platform === "qobuz") return qobuz.playlists(keyword, offset, limit);
+  if (platform === "tidal") return tidal.playlists(keyword, offset, limit);
   return unsupported(platform, "playlists");
 };

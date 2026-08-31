@@ -8,39 +8,8 @@ use crate::error::QqkgError;
 use crate::kugou::KugouClient;
 use crate::normalize::{decode_name, fill_cover_opt};
 
-fn format_artist(filename: &str, singername: Option<&str>) -> String {
-    if let Some(s) = singername {
-        if !s.is_empty() {
-            let decoded = decode_name(s);
-            let parts: Vec<&str> = decoded
-                .split(|c| c == '、' || c == ',' || c == ';' || c == '/')
-                .map(|p| p.trim())
-                .filter(|p| !p.is_empty())
-                .collect();
-            if !parts.is_empty() {
-                return parts.join(" / ");
-            }
-        }
-    }
-    if let Some((first, _)) = filename.split_once(" - ") {
-        return decode_name(first.trim());
-    }
-    String::new()
-}
-
-fn format_song_name(filename: &str, songname: Option<&str>) -> String {
-    if let Some(s) = songname {
-        if !s.is_empty() {
-            return decode_name(s);
-        }
-    }
-    if let Some((_, rest)) = filename.split_once(" - ") {
-        return decode_name(rest.trim());
-    }
-    decode_name(filename)
-}
-
 impl KugouClient {
+
     /// 自动将歌手名解析为数字 author_id（若传入的已为数字则直接返回）。
     async fn resolve_author_id(&self, id_or_name: &str) -> String {
         if id_or_name.chars().all(|c| c.is_ascii_digit()) && !id_or_name.is_empty() {
@@ -154,43 +123,16 @@ impl KugouClient {
 
         let mut songs: Vec<Value> = Vec::new();
         for raw in raw_songs {
-            let filename = raw.get("filename").and_then(Value::as_str).unwrap_or("");
-            let singername = raw.get("singername").and_then(Value::as_str);
-            let songname = raw.get("songname").and_then(Value::as_str);
-            let artist_name = format_artist(filename, singername);
-            let artists: Vec<Value> = if !artist_name.is_empty() {
-                artist_name
-                    .split(" / ")
-                    .map(|name| json!({ "id": name, "name": name }))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-            let interval = raw.get("duration").and_then(Value::as_u64).unwrap_or(0);
-            let audio_id = raw.get("audio_id").and_then(Value::as_u64).unwrap_or(0);
-            let hash = raw.get("hash").and_then(Value::as_str).unwrap_or("");
-
-            let trans = raw.get("trans_param");
-            let union_cover = trans.and_then(|t| t.get("union_cover")).and_then(Value::as_str);
-            let chosen_cover = union_cover.or(img_url);
-
-            songs.push(json!({
-                "id": if audio_id > 0 { audio_id.to_string() } else { hash.to_string() },
-                "audioId": audio_id,
-                "albumAudioId": raw.get("album_audio_id").and_then(Value::as_u64).unwrap_or(0),
-                "hash": hash,
-                "name": format_song_name(filename, songname),
-                "artist": artist_name,
-                "artists": artists,
-                "album": decode_name(raw.get("album_name").and_then(Value::as_str).unwrap_or("")),
-                "albumId": raw.get("album_id").and_then(|v| v.as_str().map(ToString::to_string).or_else(|| v.as_i64().map(|n| n.to_string()))).unwrap_or_default(),
-                "cover": fill_cover_opt(chosen_cover, 300),
-                "coverOriginal": fill_cover_opt(chosen_cover, 480),
-                "interval": interval,
-                "duration": interval * 1000,
-            }));
+            let mut song_obj = crate::kugou::search::normalize_from_mobile(raw);
+            if song_obj.get("cover").and_then(Value::as_str).unwrap_or("").is_empty() {
+                if let Some(obj) = song_obj.as_object_mut() {
+                    obj.insert("cover".into(), json!(cover));
+                    obj.insert("coverOriginal".into(), json!(cover_orig));
+                }
+            }
+            songs.push(song_obj);
         }
+
 
         let mut albums: Vec<Value> = Vec::new();
         for raw in raw_albums {

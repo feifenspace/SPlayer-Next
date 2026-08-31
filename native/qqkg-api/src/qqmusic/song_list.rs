@@ -102,13 +102,21 @@ impl QqmusicClient {
                 "coverOriginal": cover_orig,
                 "duration": interval * 1000,
                 "mediaMid": item.get("strMediaMid").and_then(Value::as_str).unwrap_or(""),
+                "pay": {
+                    "payalbum": item.get("pay").and_then(|p| p.get("payalbum")).or_else(|| item.get("payalbum")).and_then(Value::as_i64).unwrap_or(0),
+                    "payplay": item.get("pay").and_then(|p| p.get("payplay")).or_else(|| item.get("payplay")).or_else(|| item.get("pay").and_then(|p| p.get("pay_play"))).and_then(Value::as_i64).unwrap_or(0),
+                },
                 "size128": item.get("size128").and_then(Value::as_u64).unwrap_or(0),
                 "size320": item.get("size320").and_then(Value::as_u64).unwrap_or(0),
                 "sizeApe": item.get("sizeape").and_then(Value::as_u64).unwrap_or(0),
                 "sizeFlac": item.get("sizeflac").and_then(Value::as_u64).unwrap_or(0),
                 "sizeOgg": item.get("sizeogg").and_then(Value::as_u64).unwrap_or(0),
+                "sizeHiRes": item.get("size_hires").or_else(|| item.get("sizehires")).and_then(Value::as_u64).unwrap_or(0),
+                "hiResSampleRate": item.get("hires_sample").and_then(Value::as_u64).unwrap_or(0),
+                "hiResBitDepth": item.get("hires_bitdepth").and_then(Value::as_u64).unwrap_or(0),
             }));
         }
+
 
         Ok(json!({
             "code": 200,

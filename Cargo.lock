@@ -1622,6 +1622,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "streaming-api",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -3369,9 +3370,12 @@ checksum = "b5a041e753da8b807c9255f28de81879c78c876392ff2469cde94799b2896b9d"
 name = "qqkg-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "flate2",
  "md5",
  "num-bigint-dig",
  "num-traits",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -4217,6 +4221,21 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "streaming-api"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "md5",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "urlencoding",
+]
 
 [[package]]
 name = "strength_reduce"

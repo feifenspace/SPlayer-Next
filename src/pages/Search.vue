@@ -7,6 +7,8 @@ import type { CoverItem } from "@/types/artist";
 import { searchSongs, searchAlbums, searchArtists, searchPlaylists } from "@/apis/search";
 import SongList from "@/components/list/SongList.vue";
 import CoverList from "@/components/list/CoverList.vue";
+import StreamingLoginDialog from "@/components/modals/StreamingLoginDialog.vue";
+import IconLucideLogIn from "~icons/lucide/log-in";
 import { useStatusStore } from "@/stores/status";
 import { navigateToAlbum, navigateToArtist, navigateToPlaylist } from "@/utils/navigate";
 
@@ -181,11 +183,37 @@ const isInitialLoading = computed(() => {
   return state.loading && !state.loaded;
 });
 
-/** 当前 tab 已加载且为空 */
-const isEmptyResult = computed(() => {
-  const state = states[activeTab.value];
-  return state.loaded && state.items.length === 0;
+const isAuthError = computed(() => {
+  if (!error.value) return false;
+  const lower = error.value.toLowerCase();
+  return (
+    lower.includes("not logged in") ||
+    lower.includes("未登录") ||
+    lower.includes("authentication") ||
+    lower.includes("unauthorized") ||
+    lower.includes("auth error") ||
+    lower.includes("401")
+  );
 });
+
+const loginDialogOpen = ref(false);
+const loginDialogTab = ref<"qobuz" | "tidal">("qobuz");
+
+const openLoginModal = (): void => {
+  if (status.searchPlatform === "tidal") {
+    loginDialogTab.value = "tidal";
+  } else {
+    loginDialogTab.value = "qobuz";
+  }
+  loginDialogOpen.value = true;
+};
+
+const onLoginDialogClose = (open: boolean): void => {
+  if (!open) {
+    // 登录完成后重试加载
+    onRetry();
+  }
+};
 </script>
 
 <template>
@@ -205,11 +233,12 @@ const isEmptyResult = computed(() => {
           </span>
         </h1>
         <!-- 平台切换 -->
-        <div class="shrink-0 w-40">
+        <div class="shrink-0 w-80 max-w-full">
           <STabs
             :model-value="status.searchPlatform"
             :tabs="platformTabs"
             type="segment"
+            size="small"
             round
             @update:model-value="onPlatformSwitch"
           />
@@ -224,7 +253,33 @@ const isEmptyResult = computed(() => {
         <div class="text-sm">{{ t("search.emptyKeyword") }}</div>
       </div>
     </div>
-    <!-- 错误态 -->
+    <!-- 登录提示态 -->
+    <div v-else-if="isAuthError" class="flex-1 flex items-center justify-center px-6">
+      <div class="text-center flex flex-col items-center max-w-sm">
+        <div class="size-16 rounded-2xl bg-primary/10 text-primary flex items-center justify-center mb-4">
+          <IconLucideLogIn class="size-8" />
+        </div>
+        <div class="text-base font-semibold text-on-surface mb-1">
+          {{ (status.searchPlatform === 'tidal' ? 'TIDAL' : status.searchPlatform === 'qobuz' ? 'Qobuz' : status.searchPlatform.toUpperCase()) + ' 尚未登录' }}
+        </div>
+        <div class="text-xs text-on-surface-variant/80 mb-5 leading-relaxed">
+          {{ status.searchPlatform === 'tidal'
+            ? '搜索与播放 TIDAL 曲目需要先绑定授权您的 TIDAL 账号'
+            : '搜索与播放该平台曲目需要先登录账号' }}
+        </div>
+        <div class="flex items-center gap-3">
+          <SButton variant="primary" size="medium" @click="openLoginModal">
+            <template #icon><IconLucideLogIn class="size-4" /></template>
+            登录 {{ status.searchPlatform === 'tidal' ? 'TIDAL' : status.searchPlatform === 'qobuz' ? 'Qobuz' : status.searchPlatform.toUpperCase() }}
+          </SButton>
+          <SButton variant="secondary" size="medium" @click="onRetry">
+            <template #icon><IconLucideRotateCw class="size-4" /></template>
+            {{ t("common.retry") }}
+          </SButton>
+        </div>
+      </div>
+    </div>
+    <!-- 普通错误态 -->
     <div v-else-if="error" class="flex-1 flex items-center justify-center px-6">
       <div class="text-center flex flex-col items-center">
         <div class="text-red-500/85 mb-4">
@@ -314,5 +369,12 @@ const isEmptyResult = computed(() => {
         @reach-bottom="onReachBottom('playlists')"
       />
     </div>
+
+    <!-- 流媒体平台登录弹窗 -->
+    <StreamingLoginDialog
+      v-model:open="loginDialogOpen"
+      :tab="loginDialogTab"
+      @update:open="onLoginDialogClose"
+    />
   </div>
 </template>

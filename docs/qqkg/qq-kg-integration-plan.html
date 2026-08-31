@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QQ音乐 / 酷狗音乐 Headless 完整打通实施计划</title>
+<style>
+  :root {
+    --bg: #FAFAFA;
+    --surface: #FFFFFF;
+    --text: #1A1A1A;
+    --muted: #666666;
+    --border: #E5E5E5;
+    --accent: #4B3FE3;
+    --accent-soft: #EEF0FF;
+    --green: #16A34A;
+    --green-soft: #F0FDF4;
+    --red: #DC2626;
+    --red-soft: #FEF2F2;
+    --amber: #D97706;
+    --amber-soft: #FFFBEB;
+    --blue: #2563EB;
+    --blue-soft: #EFF6FF;
+    --gray-soft: #F4F4F5;
+    --code-bg: #F4F4F5;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.75;
+    font-size: 15px;
+    padding: 40px 20px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  header { margin-bottom: 36px; padding-bottom: 24px; border-bottom: 2px solid var(--text); }
+  .ver { display: inline-block; background: var(--accent); color: #fff; font-size: 12px; font-weight: 700; padding: 2px 12px; border-radius: 999px; margin-bottom: 12px; letter-spacing: 1px; }
+  h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 8px; }
+  .subtitle { color: var(--muted); font-size: 14px; }
+  .meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 16px; font-size: 13px; color: var(--muted); }
+  .meta span { display: inline-flex; align-items: center; gap: 6px; }
+  .meta span::before { content: "·"; font-weight: 700; color: var(--accent); }
+  h2 {
+    font-size: 20px; font-weight: 700; margin: 44px 0 16px;
+    padding-left: 12px; border-left: 4px solid var(--accent);
+    letter-spacing: -0.3px;
+  }
+  h3 { font-size: 16px; font-weight: 600; margin: 28px 0 10px; }
+  h4 { font-size: 14px; font-weight: 600; margin: 18px 0 8px; color: #333; }
+  p { margin-bottom: 12px; color: #333; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 20px 24px; margin-bottom: 16px;
+  }
+  .card.callout { background: var(--accent-soft); border-color: #C9C4F5; }
+  .card.danger { background: var(--red-soft); border-color: #FECACA; }
+  .card.ok { background: var(--green-soft); border-color: #BBF7D0; }
+  .card.warn { background: var(--amber-soft); border-color: #FDE68A; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+  th { text-align: left; padding: 9px 12px; background: var(--gray-soft); font-weight: 600; border: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 9px 12px; border: 1px solid var(--border); vertical-align: top; }
+  code {
+    font-family: "SF Mono", Consolas, "Cascadia Code", monospace;
+    background: var(--code-bg); padding: 2px 6px; border-radius: 4px;
+    font-size: 12.5px; color: #B91C1C;
+  }
+  pre {
+    background: #1E1E2E; color: #CDD6F4; padding: 16px 20px; border-radius: 8px;
+    overflow-x: auto; font-family: "SF Mono", Consolas, monospace;
+    font-size: 12.5px; line-height: 1.7; margin: 14px 0;
+  }
+  pre code { background: none; padding: 0; color: inherit; }
+  ul, ol { padding-left: 22px; margin-bottom: 12px; }
+  li { margin-bottom: 6px; color: #333; }
+  .tag {
+    display: inline-block; padding: 1px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600; white-space: nowrap;
+  }
+  .tag.s1 { background: var(--blue-soft); color: var(--blue); }
+  .tag.s2 { background: var(--amber-soft); color: var(--amber); }
+  .tag.s3 { background: var(--accent-soft); color: var(--accent); }
+  .tag.ok { background: var(--green-soft); color: var(--green); }
+  .tag.no { background: var(--red-soft); color: var(--red); }
+  .tag.warn { background: var(--amber-soft); color: var(--amber); }
+  .tag.gray { background: var(--gray-soft); color: var(--muted); }
+  .tag.easy { background: var(--green-soft); color: var(--green); }
+  .tag.mid { background: var(--amber-soft); color: var(--amber); }
+  .tag.hard { background: var(--red-soft); color: var(--red); }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 14px 0; }
+  @media (max-width: 720px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .stat .num { font-size: 26px; font-weight: 700; color: var(--accent); }
+  .stat .label { font-size: 13px; color: var(--muted); }
+  .phase-head { display: flex; align-items: center; gap: 12px; margin: 32px 0 14px; }
+  .phase-head .pnum {
+    background: var(--accent); color: #fff; width: 32px; height: 32px;
+    border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 15px; flex-shrink: 0;
+  }
+  .phase-head .ptitle { font-size: 18px; font-weight: 700; }
+  .phase-head .pest { margin-left: auto; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 24px; margin-bottom: 8px; }
+  .toc-title { font-weight: 700; font-size: 14px; margin-bottom: 10px; color: var(--muted); }
+  .toc ol { margin: 0; columns: 2; column-gap: 32px; }
+  .toc li { break-inside: avoid; margin-bottom: 5px; font-size: 14px; color: var(--accent); }
+  .toc a { color: inherit; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  .footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  .flow { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+  .flow .node { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; font-size: 13px; font-weight: 600; }
+  .flow .arrow { color: var(--accent); font-weight: 700; }
+  .dep { font-size: 12.5px; color: var(--muted); background: var(--gray-soft); border-radius: 6px; padding: 8px 14px; margin: 10px 0; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <div class="ver">STANDALONE · 独立计划</div>
+  <h1>QQ音乐 / 酷狗音乐 Headless 完整打通实施计划</h1>
+  <p class="subtitle">从"搜不到、登不上、放不出"到全链路可用 — 三阶段递进：搜索显示 → 账号登录 → 在线播放</p>
+  <div class="meta">
+    <span>仓库 SPlayer-Next-Headless @ 192.168.31.47</span>
+    <span>编写日期 2026-08-30</span>
+    <span>预计总工作量 2.5 ~ 3.5 天</span>
+    <span>改动范围 Rust 后端为主，前端仅微调</span>
+  </div>
+  <div class="card danger" style="margin-top:16px">
+    <p><strong>硬约束（2026-08-30 新增，全部已实证满足）</strong>：headless 后端<strong>必须纯 Rust 实现，零 Node 运行时依赖</strong>。运行时形态 = 单一 Rust 二进制 + 静态 web 资源；Node 工具链仅允许出现在<strong>构建期</strong>（pnpm build 产出静态文件）。桌面端 Electron/TS 代码一律只作移植参考，运行时零复用。所有新增依赖必须为 Rust crate。</p>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="stat"><div class="num">3</div><div class="label">递进阶段（S1 搜索 → S2 登录 → S3 播放）</div></div>
+  <div class="stat"><div class="num">≈2.5 天</div><div class="label">S1+S2+S3-酷狗 核心闭环</div></div>
+  <div class="stat"><div class="num">+1 天</div><div class="label">S3-QQ 播放（3DES 移植，唯一路径）</div></div>
+  <div class="stat"><div class="num">0</div><div class="label">与上游 origin/dev 文件冲突</div></div>
+</div>
+
+<div class="toc">
+  <div class="toc-title">目录</div>
+  <ol>
+    <li><a href="#diag">现状诊断（三大断点）</a></li>
+    <li><a href="#deps">阶段依赖关系与实施顺序</a></li>
+    <li><a href="#s1">S1 · 搜索显示修复（翻译层）</a></li>
+    <li><a href="#s2">S2 · 账号登录链路打通</a></li>
+    <li><a href="#s3">S3 · 在线播放 song_url（headless 唯一播放路径）</a></li>
+    <li><a href="#arch">改动文件清单与上游冲突防护</a></li>
+    <li><a href="#accept">验收标准（全场景）</a></li>
+    <li><a href="#risk">风险与边界说明</a></li>
+  </ol>
+</div>
+
+<h2 id="diag">一、现状诊断（三大断点）</h2>
+
+<p>前端 UI、适配层、桥接层三层<strong>基本完备</strong>，QQ/酷狗的断点全部集中在 Rust 后端 <code>online_apis.rs</code>（581 行，每平台仅实现 search/lyric 两个接口）。三个断点相互独立又层层递进：</p>
+
+<table>
+  <tr><th>断点</th><th>现象</th><th>根因（已源码核实）</th><th>影响范围</th></tr>
+  <tr>
+    <td><span class="tag s1">断点 1</span> 搜索无结果</td>
+    <td>Web UI 搜索 QQ/酷狗返回 0 结果，无报错</td>
+    <td>① Rust 返回<strong>原始平台格式</strong>（QQ <code>body.song.list</code> / 酷狗 <code>data.data.info</code>），前端读 <code>body.songs ?? []</code> 得空数组静默吞掉；② QQ <code>search_type</code> 硬编码 0（online_apis.rs:341），四个搜索 tab 返回同一种数据；③ QQ 用的 <code>DoSearchForQQMusicDesktop</code> 接口，桌面端用的是 <code>DoSearchForQQMusicMobile</code>（带 <code>grp:1</code> 分组字段）</td>
+    <td>单曲/专辑/歌手/歌单四个 tab 全部不可用</td>
+  </tr>
+  <tr>
+    <td><span class="tag s2">断点 2</span> 登录不可用</td>
+    <td>扫码按钮报 "Unsupported Kugou API"；QQ 网页登录按钮报 "not supported in web mode"；手动 Cookie 提交后无验证</td>
+    <td>① 酷狗 <code>login_qr_key</code>/<code>login_qr_check</code>/<code>user_detail</code> 全缺失；② QQ <code>user_detail</code> 缺失；③ QQ/酷狗请求<strong>不带 Cookie</strong>（仅 netease 有注入逻辑 online_apis.rs:203-229）；④ QQ 网页登录依赖 Electron BrowserWindow，headless 无 GUI 天然不可用</td>
+    <td>设置页登录区三个按钮全部失效</td>
+  </tr>
+  <tr>
+    <td><span class="tag s3">断点 3</span> 在线播放失败</td>
+    <td>点击 QQ/酷歌曲播放报 URL_RESOLVE_FAILED</td>
+    <td>① QQ <code>song_url</code> 缺失（桌面端 219 行 + 421 行 3DES 核心：fcg_vkey → purl → CDN 探测）；② 酷狗 <code>song_url</code> 缺失（桌面端仅 55 行，依赖 signKey + 设备 mid）；③ 前置依赖：S1 的 hash/mediaMid 字段 + S2 的登录 token</td>
+    <td>QQ/酷狗在线音源完全无法播放</td>
+  </tr>
+</table>
+
+<div class="card callout">
+<p><strong>基础设施现状（可直接复用，零改动）</strong></p>
+<ul style="margin-top:6px">
+  <li><code>db.rs account_sessions</code> 表：<code>platform TEXT PRIMARY KEY</code> 平台无关，save/get/clear 三函数现成</li>
+  <li><code>dispatch_api_call</code> 伪 API（online_apis.rs:152-180）：<code>set_cookie</code>/<code>get_cookie</code>/<code>clear_session</code> 在平台分派<strong>之前</strong>处理——QQ/酷狗的 Cookie 手动写入/登出<strong>现在就能用</strong></li>
+  <li>前端 <code>src/apis/login/platform.ts</code> 适配层：QQ（user_detail/clearSession/setCookie/openWebLogin）、酷狗（+完整 qrLogin 扫码流）接口签名完备</li>
+  <li>前端 <code>audioSource.ts:185-208</code>：resolveQQMusicUrl/resolveKugouUrl 播放接线已就绪（注意：其插件兜底在 headless 下不可用，见 5.3）</li>
+  <li>netease 的 Cookie 注入模式（online_apis.rs:203-229）可直接照抄到 QQ/酷狗</li>
+</ul>
+</div>
+
+<h2 id="deps">二、阶段依赖关系与实施顺序</h2>
+
+<div class="flow">
+  <div class="node">S1 搜索显示修复</div>
+  <div class="arrow">→</div>
+  <div class="node">S2 账号登录</div>
+  <div class="arrow">→</div>
+  <div class="node">S3 在线播放</div>
+</div>
+
+<div class="dep">
+<strong>依赖说明</strong>：S1 与 S2 相互独立可并行或任意顺序；S3 依赖 S1（播放解析需要搜索结果里的 <code>hash</code>/<code>mediaMid</code>/<code>hashes</code> 等凭据字段）+ S2（酷狗播放要 token/userid，QQ 高音质要登录态）。<strong>推荐顺序 S1 → S2 → S3</strong>：S1 最快见效且是用户体验基础，S2 打通后 S3-酷狗几乎是顺水推舟。
+</div>
+
+<h2 id="s1">三、S1 · 搜索显示修复（翻译层）</h2>
+
+<div class="phase-head"><div class="pnum">1</div><div class="ptitle">原始格式 → 规范化格式的翻译</div><div class="pest">≈ 5 小时</div></div>
+
+<h3>3.1 修复原理</h3>
+<p>不改前端一行代码。在 Rust 侧补一个<strong>翻译层</strong>：把上游原始响应映射为桌面端 Electron 已有的规范化格式 <code>{code:200, total, songs|albums|artists|playlists}</code>——前端 <code>qqmusic.ts:24</code>/<code>kugou.ts:24</code> 读的就是这个格式。同时修复 type 路由，让四个 tab 各取所需。</p>
+
+<h4>type 路由表（两平台统一）</h4>
+<table>
+  <tr><th>type 值</th><th>含义</th><th>QQ 上游 search_type</th><th>酷狗桌面实现</th><th>返回键</th></tr>
+  <tr><td>0 / "song"</td><td>单曲</td><td>0</td><td>searchSongs（mobilecdn 端点）</td><td><code>songs</code></td></tr>
+  <tr><td>2 / "playlist"</td><td>歌单</td><td>3</td><td>searchPlaylists</td><td><code>playlists</code></td></tr>
+  <tr><td>8 / "album"</td><td>专辑</td><td>2</td><td>searchAlbums</td><td><code>albums</code></td></tr>
+  <tr><td>9 / "artist"</td><td>歌手</td><td>1</td><td>searchArtists</td><td><code>artists</code></td></tr>
+</table>
+
+<h3>3.2 QQ 搜索重写（call_qqmusic "search" 分支）</h3>
+
+<p><strong>第一步：换上游接口</strong>。<code>DoSearchForQQMusicDesktop</code> → <code>DoSearchForQQMusicMobile</code>（桌面端同款，含 <code>grp:1</code>），search_type 从 <code>params.type</code> 读取（杀死 online_apis.rs:341 的硬编码 0）。</p>
+
+<pre><code>// 请求 payload（对齐桌面端 searchMobile）
+{
+  "comm": get_qm_common_params(),
+  "request": {
+    "module": "music.search.SearchCgiService",
+    "method": "DoSearchForQQMusicMobile",
+    "param": {
+      "query": keyword, "page_num": page, "num_per_page": limit,
+      "search_type": type, "grp": 1
+    }
+  }
+}</code></pre>
+
+<p><strong>第二步：单曲字段映射</strong>（raw <code>body.item_song[]</code> → 规范化 <code>songs[]</code>，为 S3 播放预留凭据字段）：</p>
+
+<table>
+  <tr><th>规范化字段</th><th>QQ 原始来源</th><th>前端消费方 / S3 用途</th></tr>
+  <tr><td><code>id</code></td><td><code>song.id</code></td><td>qqSongToTrack extId</td></tr>
+  <tr><td><code>mid</code></td><td><code>song.mid</code></td><td>Track.id 主键 + S3 song_url 入参</td></tr>
+  <tr><td><code>mediaMid</code></td><td><code>song.file.media_mid</code></td><td><strong>S3 播放必需</strong>（fcg_vkey 入参）</td></tr>
+  <tr><td><code>name</code></td><td><code>song.title</code></td><td>Track.title</td></tr>
+  <tr><td><code>artist</code> / <code>artists</code></td><td><code>song.singer[]</code> 拼接 / 原样</td><td>Track.artists</td></tr>
+  <tr><td><code>album</code> / <code>albumMid</code></td><td><code>song.album.name|title</code> / <code>song.album.mid</code></td><td>Track.album + 封面 URL</td></tr>
+  <tr><td><code>duration</code></td><td><code>song.interval × 1000</code></td><td>Track.duration（注意毫秒）</td></tr>
+  <tr><td><code>pay</code></td><td><code>song.pay.pay_play</code> 等</td><td>qqTrackFee VIP 标记</td></tr>
+  <tr><td><code>size128/size320/sizeApe/sizeFlac/sizeOgg/sizeHiRes</code></td><td><code>song.file.size_*</code></td><td>音质选择 + <strong>S3 必需</strong></td></tr>
+  <tr><td><code>hiResSampleRate/hiResBitDepth</code></td><td><code>song.file.hires_*</code></td><td>Hi-Res 标记（HIFI 定位相关）</td></tr>
+  <tr><td><code>cover / coverOriginal</code></td><td><code>https://y.gtimg.cn/music/photo_new/T002R300x300M000{albumMid|pmid}.jpg</code>（800 为原尺寸）</td><td>封面展示</td></tr>
+</table>
+
+<p><strong>第三步：专辑/歌手/歌单映射</strong>（raw <code>body.item_album[] / body.singer[] / body.item_songlist[]</code>）：</p>
+<table>
+  <tr><th>类型</th><th>规范化字段</th></tr>
+  <tr><td>albums</td><td><code>{id: albummid, name, cover: secureUrl(pic), artist, artistMid, trackCount: song_num}</code></td></tr>
+  <tr><td>artists</td><td><code>{id: singerMID, name: singerName, cover, albumCount: albumNum, songCount: songNum}</code></td></tr>
+  <tr><td>playlists</td><td><code>{id: dissid, name: stripHighlight(dissname), cover, creator: nickname, trackCount: songnum, playCount: listennum}</code></td></tr>
+</table>
+<p class="dep">注意：<code>total</code> 取 <code>meta.sum</code>；<code>secureUrl</code> = http→https 替换；<code>stripHighlight</code> = 去除 <code>&lt;em&gt;</code> 高亮标签（搜索命中词会带）。</p>
+
+<h3>3.3 酷狗搜索重写（call_kugou "search" 分支）</h3>
+
+<p><strong>利好</strong>：headless 现用的 <code>mobilecdn.kugou.com/api/v3/search/song</code> 就是桌面端 <code>searchSongsMobile</code> 的同款端点——单曲 tab 只需补规范化映射，不用换接口。</p>
+
+<p><strong>单曲映射</strong>（raw <code>data.info[]</code> + <code>group[]</code> 展开去重 → <code>songs[]</code>）：</p>
+<table>
+  <tr><th>规范化字段</th><th>酷狗原始来源</th><th>S3 用途</th></tr>
+  <tr><td><code>id</code></td><td><code>audio_id || hash</code></td><td>Track.id</td></tr>
+  <tr><td><code>hash</code></td><td><code>item.hash</code></td><td><strong>S3 播放必需</strong>（song_url 入参）</td></tr>
+  <tr><td><code>hashes</code></td><td><code>{128k: FileHash, 320k: HQFileHash, flac: SQFileHash, flac24bit: ResFileHash}</code></td><td><strong>S3 多音质必需</strong>（每个 hash 对应一档）</td></tr>
+  <tr><td><code>qualities</code></td><td><code>Object.keys(hashes)</code></td><td>音质选择 UI</td></tr>
+  <tr><td><code>sizes</code></td><td><code>{128k: FileSize, ...}</code></td><td>音质大小</td></tr>
+  <tr><td><code>name</code></td><td><code>songname || filename</code>（decodeName）</td><td>Track.title</td></tr>
+  <tr><td><code>artist</code> / <code>artists</code></td><td><code>singername</code> 按 " / " 拆分</td><td>Track.artists</td></tr>
+  <tr><td><code>album</code> / <code>albumId</code></td><td><code>album_name / album_id</code></td><td>Track.album</td></tr>
+  <tr><td><code>cover</code> / <code>coverOriginal</code></td><td><code>trans_param.union_cover</code> 模板填充（300/480）</td><td>封面</td></tr>
+  <tr><td><code>interval</code> / <code>duration</code></td><td><code>raw.duration</code>（秒 / 毫秒）</td><td>Track.duration</td></tr>
+  <tr><td><code>pay</code></td><td><code>feetype/privilege/price</code></td><td>VIP 标记</td></tr>
+</table>
+
+<p><strong>专辑/歌手/歌单</strong>：酷狗 v3 端点仅支持单曲。桌面端走 <code>kgGatewayRequest</code> 网关（<code>x-router</code> 头路由到 complexsearch 等）。需要移植网关签名（S2-A 的 signatureWebParams 复用）——因此 <strong>酷狗三 tab 建议放到 S2 网关基础设施之后做</strong>，或 S1 先交付双平台单曲 tab + QQ 全四 tab。</p>
+
+<h3>3.4 实施切分</h3>
+<table>
+  <tr><th>任务</th><th>工作量</th><th>交付物</th></tr>
+  <tr><td>S1-A QQ 四 tab 翻译层</td><td>≈2.5h</td><td>call_qqmusic search 分支重写（含 type 路由 + 3 组映射函数）</td></tr>
+  <tr><td>S1-B 酷狗单曲 tab 翻译层</td><td>≈1.5h</td><td>call_kugou search 分支补 normalizeFromMobile 映射</td></tr>
+  <tr><td>S1-C 酷狗专辑/歌手/歌单</td><td>≈1h（依赖 S2-A 网关签名）</td><td>call_kugou search 补网关调用与映射</td></tr>
+</table>
+
+<h2 id="s2">四、S2 · 账号登录链路打通</h2>
+
+<div class="phase-head"><div class="pnum">2</div><div class="ptitle">酷狗扫码 + 双平台登录态</div><div class="pest">≈ 7.5 小时</div></div>
+
+<h3>4.1 S2-A · 加密基建（≈2h，位于 qqkg-api crate 的 crypto/ 模块）</h3>
+<p>crate 内 <code>native/qqkg-api/src/crypto/</code>（工程结构见 Rust 实施计划），移植桌面端 <code>kugou/core/crypto.ts</code>（177 行）的三个核心函数：</p>
+<table>
+  <tr><th>函数</th><th>算法</th><th>Rust 实现</th><th>用途</th></tr>
+  <tr><td><code>signature_web_params</code></td><td>盐值 <code>NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt</code> + 参数名 ASCII 排序拼接 <code>k=v</code> + 首尾盐值 → MD5</td><td><code>md5</code> crate（Cargo.toml 已有，git 实证）≈20 行</td><td>所有酷狗网关请求的 <code>signature</code> 参数（S1-C / S2-B / S3 酷狗共用）</td></tr>
+  <tr><td><code>calculate_mid</code></td><td>固定 GUID → MD5 → 大整数进制转换</td><td>首版直接用桌面默认 GUID 固定 mid，≈10 行</td><td>设备指纹参数 <code>mid</code></td></tr>
+  <tr><td><code>rsa_encrypt_kugou</code></td><td>1024 位公钥 RSA <strong>NO_PADDING</strong>：JSON 序列化 → 128 字节零填充块 → 模幂 → hex 大写</td><td><code>num-bigint-dig</code> pow_mod（避免拉全 <code>rsa</code> crate），≈40 行</td><td>user_detail 的 <code>p</code> 参数 + S3 song_url 的 key</td></tr>
+</table>
+<div class="dep">公钥与盐值直接从桌面端 <code>crypto.ts</code> / <code>config.ts</code> 复制常量。signKey（S3 用）用另一个盐值 <code>57ae12eb6890223e355ccfcb74edf70d</code>，一并放入。</div>
+
+<h3>4.2 S2-B · 酷狗扫码登录（≈3h）</h3>
+<pre><code>// login_qr_key：GET login-user.kugou.com/v2/qrcode
+// 公共参数：dfid=-, mid={mid}, uuid=-, appid=1001, clientver=KG_CLIENTVER,
+//          clienttime={unix秒}, signature={signature_web_params(...)}
+// 业务参数：type=1, plat=4, srcappid=2919,
+//          qrcode_txt="https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=1005&"
+// 返回：{code:200, key: data.qrcode, content: "https://h5.kugou.com/.../index.html?qrcode={key}"}
+
+// login_qr_check：GET /v2/get_userinfo_qrcode，参数 plat=4, appid=1005, srcappid=2919, qrcode={key}
+// 返回：{code:200, status: data.status, nickname, avatarUrl}
+// status 语义：0=过期 2=已扫码 4=成功（其他=等待）
+// status==4 时落库：save_account_cookies("kugou", {token, userid, vip_token,
+//   vip_type, nickname, avatar})——凭据就在响应 data 里，无需二次换取</code></pre>
+<p>前端轮询适配已存在（<code>kugou.ts:19-37</code> 的 QrLoginAdapter），Rust 只需按上述契约返回。响应统一用 <code>ApiCallResponse::ok_data</code>（netease login_qr_key 的兼容层 online_apis.rs:271 是同款先例）。</p>
+
+<h3>4.3 S2-C · 双平台 user_detail（≈2h）</h3>
+<table>
+  <tr><th></th><th>酷狗</th><th>QQ</th></tr>
+  <tr><td>登录判定</td><td>DB 有 <code>token</code> + <code>userid</code></td><td>DB 有 <code>uin</code> 且有 <code>qm_keyst/qqmusic_key/pskey/p_skey/skey</code> 任一</td></tr>
+  <tr><td>上游接口</td><td>POST 网关 <code>/v3/get_my_info</code>，<code>x-router: usercenter.kugou.com</code>，<code>p = rsa_encrypt_kugou({token, clienttime}).toUpperCase()</code>，<code>userid</code> 参数</td><td>GET <code>c.y.qq.com/rsc/fcgi-bin/fcg_get_profile_homepage.fcg?cid=205360838&userid={uin}&reqfrom=1&format=json&platform=yqq.json</code> 带 Cookie + Referer y.qq.com</td></tr>
+  <tr><td>资料解析</td><td><code>data.nickname/username/user_name</code> + <code>userpic/avatar</code> + <code>vip_type</code></td><td><code>data.creator.nick/headpic/is_vip/is_super_vip/vip_level</code>，头像兜底 <code>q.qlogo.cn/headimg_dl?dst_uin={uin}&spec=100</code></td></tr>
+  <tr><td>失败兜底</td><td>返回 <code>{code:200, loggedIn:false}</code></td><td>接口失败仍返回基础资料 <code>QQ用户_{uin后4位}</code>（桌面端同款降级）</td></tr>
+</table>
+<p>统一返回契约（前端校验点 qqmusic.ts:33 读 <code>code===200 && loggedIn && profile</code>；kugou.ts:43 读 <code>loggedIn && profile</code>）：</p>
+<pre><code>{ "code": 200, "loggedIn": true,
+  "profile": { "userId", "nickname", "avatarUrl", "isVip", "vipLevel" } }</code></pre>
+
+<h3>4.4 S2-D · Cookie 注入 QQ/酷狗请求（≈1h）</h3>
+<p>照抄 netease 模式（online_apis.rs:203-229）：call_qqmusic/call_kugou 入口处从 DB 读平台 cookie → 拼接 Cookie 请求头 → 附加到所有上游请求。注意给这两个函数加上 <code>db</code> 参数（现签名没有，netease 有）。</p>
+<ul>
+  <li>QQ：全量 cookie 串（uin/qm_keyst/pskey 等）注入 <code>Cookie</code> 头——user_detail、后续 S3 的 fcg_vkey 都需要</li>
+  <li>酷狗：网关请求 URL 带 <code>token</code>/<code>userid</code> 参数 + mid 签名（不是 Cookie 头，是查询参数）</li>
+</ul>
+
+<h3>4.5 S2-E · 前端调整（≈0.5h，全部 headless 独有文件）</h3>
+<div class="card danger">
+<p><strong>设计约束（2026-08-30 git 实证）</strong>：<code>PlatformAccount.vue</code>、<code>src/apis/login/*</code>、<code>src/apis/search/*</code> 等前端文件<strong>全部存在于上游 origin/dev</strong>，一律不改。所有前端干预只能通过 headless 独有文件 <code>webPolyfill.ts</code>（main.ts:1 引入的 web 模式 API 桥）实施。</p>
+</div>
+<ul>
+  <li><strong>零上游文件改动</strong>：QQ"网页登录"按钮保留渲染（渲染逻辑在上游 platform.ts 静态定义，不可干预），点击时 webPolyfill 的 <code>openLoginWeb</code> 抛出异常 → handleLogin 的 catch 捕获 → toast 弹"QM 登录失败"——用户获得明确反馈而非静默无响应</li>
+  <li>QQ 登录主路径 = 手动 Cookie 闭环：浏览器登录 y.qq.com → 复制 cookie → 粘贴提交（setCookie 已可用）→ user_detail 验证 → 头像昵称显示。现有 handleManualCookieSubmit 已含"提交后 fetchProfile 验证、失败自动登出"，零改动</li>
+  <li>酷狗为完整扫码闭环：扫码 → login_qr_check status=4 落库 → user_detail 出 profile → 断开连接（clear_session 已可用）</li>
+</ul>
+
+<h2 id="s3">五、S3 · 在线播放 song_url（headless 唯一播放路径）</h2>
+
+<div class="phase-head"><div class="pnum">3</div><div class="ptitle">在线音源播放打通</div><div class="pest">酷狗 ≈3h · QQ ≈8h</div></div>
+
+<div class="card warn">
+<p><strong>前置依赖</strong>：S1（搜索结果里的 <code>hash</code>/<code>mediaMid</code>/<code>size*</code> 凭据字段）+ S2（登录态）。前端 <code>audioSource.ts</code> 的 resolve 接线已就绪，只需 Rust 侧实现 <code>song_url</code> 接口。<strong>插件兜底在 headless 下不可用（见 5.3 实证），S3 是 QQ/酷狗在线播放的唯一路径</strong>。</p>
+</div>
+
+<h3>5.1 酷狗 song_url（优先做，性价比高）</h3>
+<p>桌面端仅 55 行，核心依赖 S2-A 已建好的 crypto 基建：</p>
+<pre><code>// 入参：hash（S1 搜索已产出，小写）、albumAudioId（可空）
+// 关键参数：key = signKey(hash, mid, userid, appid)  ← 依赖 S2-A + S2 登录 token/userid
+// 网关请求带 x-router 头路由，返回各档位播放 URL（128k/320k/flac/flac24bit hashes 决定档位）
+// 返回规范化：{ code: 200, url, available: true } 或 { code: 200, available: false, reason }</code></pre>
+
+<h3>5.2 QQ song_url（工作量大头）</h3>
+<p>桌面端 219 行模块 + 421 行 3DES 核心（<code>qqmusic/core/tripledes.ts</code>）：</p>
+<table>
+  <tr><th>步骤</th><th>内容</th><th>难度</th></tr>
+  <tr><td>3DES 移植</td><td>QQ 音乐 fcg 请求体加密（3DES-CBC + 自定义填充），421 行 → Rust <code>des</code> crate 或手写</td><td><span class="tag hard">高</span> ≈4h</td></tr>
+  <tr><td>fcg_vkey 调用</td><td>带 <code>songmid + songtype + filename</code>（由 mediaMid + 音质档位拼出）请求 vkey，响应含 <code>purl</code>（CDN 签名 URL，有时效）</td><td><span class="tag mid">中</span> ≈2h</td></tr>
+  <tr><td>CDN 探测</td><td>purl 有效但可能 403，需 Range 请求探测循环换档位重试（128→320→flac 降级链）</td><td><span class="tag easy">低</span> ≈1h</td></tr>
+</table>
+
+<h3>5.3 插件兜底路径实证（2026-08-30 修正：headless 下不可用）</h3>
+<div class="card danger">
+<p><strong>源码实证</strong>：<code>audioSource.ts:77-95</code> 的 <code>resolveByPlugin</code> 依赖 <code>usePluginsStore()</code>——插件注册表来自 Electron 主进程的文件系统扫描（<code>src/</code> 下不存在插件加载目录，git 实证）。headless web 模式下 <code>plugins.list</code> 恒为空 → <code>candidates.length === 0</code> → 直接返回 <code>NO_PLUGIN_AVAILABLE</code>。<strong>结论：插件兜底在 headless 是死路径，S3 官方接口直连是 QQ/酷狗在线播放的唯一可行方案。</strong></p>
+</div>
+<p>这也反证了本计划的必要性：不做 S3，QQ/酷狗搜索登录做得再好，点击播放只会得到"无可用插件"错误。做 S3 的价值 = 官方接口直连 + 支持 VIP 音质（flac/hires 档位）+ 不依赖任何 Electron 生态。</p>
+
+<h2 id="arch">六、改动文件清单与上游零冲突实证</h2>
+
+<div class="card callout">
+<p><strong>工程实施细节已有独立文档</strong>：<code>qq-kg-rust-impl-plan.html</code>（QQ音乐/酷狗音乐 Rust 工程实施计划）——架构升级为独立 crate <code>native/qqkg-api/</code>（对齐 ncm-api-rs 先例：api/ 每端点一文件 + 独立 crypto 层 + <code>cargo test</code> 对照单测），含完整代码骨架、serde 数据结构规格、加密实现规格、online_apis.rs 最小 diff 接线方案与 M0~M4 里程碑。<strong>实施以该文档的工程结构为准，本章节的 S1/S2/S3 功能边界与验收标准继续有效</strong>。</p>
+</div>
+
+<div class="card ok">
+<p><strong>2026-08-30 git 实证结论</strong>（<code>git cat-file -e origin/dev:&lt;file&gt;</code> 逐文件验证）：本计划全部改动落在<strong>上游不存在的文件</strong>中，与 <code>origin/dev</code> 文件集合零重叠，merge 上游时<strong>零冲突、零覆盖</strong>。</p>
+</div>
+
+<table>
+  <tr><th>改动文件</th><th>改动内容</th><th>上游存在性（git 实证）</th><th>冲突风险</th></tr>
+  <tr><td><code>native/qqkg-api/</code>（新建 crate，工程结构见 Rust 实施计划）</td><td>全部平台逻辑：客户端/搜索/登录/播放 + crypto 层（kg_sign/kg_mid/kg_rsa/qq_des）+ normalize 层</td><td><span class="tag no">上游无</span>（新建目录）</td><td>零</td></tr>
+  <tr><td><code>native/headless-server/src/api/online_apis.rs</code></td><td>call_qqmusic/call_kugou 改为转发 crate（签名加 db 参数，分派点 2 行实参）；<strong>lyric 分支保持现状</strong>（现已可用）</td><td><span class="tag no">上游无</span>（整个 headless-server 目录独有）</td><td>零</td></tr>
+  <tr><td><code>native/headless-server/Cargo.toml</code></td><td>追加一行 <code>qqkg-api = { path = "../qqkg-api" }</code>（加密依赖在 crate 自己的 Cargo.toml）</td><td><span class="tag no">上游无</span></td><td>零</td></tr>
+  <tr><td><code>src/services/client/webPolyfill.ts</code>（S2-E）</td><td>openLoginWeb 抛异常给出明确反馈</td><td><span class="tag no">上游无</span>（src/services/client/ 目录独有）</td><td>零</td></tr>
+  <tr><td>其余前端（apis/login、apis/search、utils/format、audioSource.ts 等）</td><td><strong>零改动</strong>——翻译层设计使前端无需任何修改</td><td><span class="tag warn">上游有</span> 但不改</td><td>零</td></tr>
+</table>
+
+<h3>6.1 纯 Rust 运行时实证（2026-08-30 新增硬约束的达标验证）</h3>
+<table>
+  <tr><th>检查项</th><th>实证命令</th><th>结果</th></tr>
+  <tr><td>Rust 代码零进程调用</td><td><code>grep -rn 'Command::new' native/headless-server/src/ native/audio-engine-core/src/</code></td><td><span class="tag ok">通过</span> 仅有 <code>std::process::id()</code> 用于临时文件命名，无任何子进程 spawn</td></tr>
+  <tr><td>运行进程形态</td><td><code>ps aux | grep -iE 'splayer|node'</code></td><td><span class="tag ok">通过</span> 仅单一 <code>/opt/splayer-headless/splayer-headless</code> 二进制，无 node 进程</td></tr>
+  <tr><td>部署目录零 Node 痕迹</td><td><code>ls /opt/splayer-headless/</code></td><td><span class="tag ok">通过</span> 仅二进制 + <code>web/</code> 静态资源，无 node_modules/package.json</td></tr>
+  <tr><td>systemd 启动</td><td><code>systemctl cat splayer-headless</code></td><td><span class="tag ok">通过</span> <code>ExecStart=/opt/splayer-headless/splayer-headless</code> 直启二进制</td></tr>
+  <tr><td>依赖栈全 Rust</td><td>Cargo.toml 全览</td><td><span class="tag ok">通过</span> axum/tokio/reqwest/rusqlite(bundled)/md5/ncm-api-rs（本地纯 Rust crate）</td></tr>
+  <tr><td>QQ/KG 加密实现</td><td>本计划设计</td><td><span class="tag ok">符合</span> MD5/RSA/3DES 全部用 Rust crate 实现（md5 已有、num-bigint-dig、des），桌面 TS 代码仅作移植参考</td></tr>
+</table>
+<div class="dep">约束边界说明：Node 工具链仅存在于<strong>构建期</strong>（<code>pnpm build</code> 用 vite/tsc 产出静态文件，随产物交付），服务器<strong>运行期</strong>零 Node。ncm-api-rs 为本地路径依赖（<code>/home/songlian/ncm-api-rs</code>）的纯 Rust crate——网易云在线音源已是纯 Rust 先例，本计划让 QQ/酷狗对齐同一标准。</div>
+
+<h3>6.2 为什么前端可以零改动（翻译层设计的关键）</h3>
+<p>前端各适配层（<code>src/apis/search/qqmusic.ts:24</code> 等）读取的是桌面端 Electron 的规范化格式 <code>{code:200, total, songs}</code>。本计划把翻译层放在 Rust 侧（headless 独有文件），让 headless 后端直接输出与桌面端一致的规范化格式——前端代码自然工作，无需任何修改。这是"后端适配前端"而非"前端适配后端"，从根本上避免了触碰上游文件。</p>
+
+<h3>6.3 上游同步流程（每次 merge 前的例行检查）</h3>
+<pre><code>git fetch origin
+git log dev..origin/dev --oneline          # 看上游新增提交
+git diff dev..origin/dev --stat            # 确认改动文件与本计划文件无交集
+git merge origin/dev                        # 本计划文件上游不存在，永不冲突
+# 哨兵验证（上游改了前端读取格式时在此暴露）
+pnpm typecheck:web
+# 接口回归（S1/S2/S3 验收 curl 各跑一遍）
+bash scripts/deploy-headless.sh</code></pre>
+<div class="dep">上游若修改了 <code>src/apis/search/*</code> 的字段读取（如 songs → items），merge 后 typecheck 或搜索回归测试会立即暴露——此时只需调整 Rust 翻译层的输出格式（独有文件），依然零冲突。</div>
+
+<h2 id="accept">七、验收标准（全场景）</h2>
+
+<h3>7.1 接口级（curl 直测）</h3>
+<pre><code>BASE=http://192.168.31.47:14558/api/v1/proxy/apis/call
+
+# S1 搜索（四 tab 各测一次，注意 type 变化）
+curl -X POST $BASE -H 'Content-Type: application/json' \
+  -d '{"platform":"qqmusic","name":"search","params":{"keywords":"周杰伦","type":0,"page":1,"limit":30}}'
+# 通过：data.songs 为数组，元素含 mid/mediaMid/sizeFlac/cover
+curl -X POST $BASE -d '{"platform":"kugou","name":"search","params":{"keywords":"周杰伦","type":0}}'
+# 通过：data.songs 含 hash/hashes/qualities
+
+# S2 登录
+curl -X POST $BASE -d '{"platform":"kugou","name":"login_qr_key","params":{}}'        # → key/content
+curl -X POST $BASE -d '{"platform":"qqmusic","name":"user_detail","params":{}}'       # → loggedIn/profile
+curl -X POST $BASE -d '{"platform":"kugou","name":"user_detail","params":{}}'
+
+# S3 播放
+curl -X POST $BASE -d '{"platform":"kugou","name":"song_url","params":{"hash":"..."}}'  # → url</code></pre>
+
+<h3>7.2 UI 级（浏览器操作路径）</h3>
+<table>
+  <tr><th>场景</th><th>操作</th><th>通过标准</th></tr>
+  <tr><td><span class="tag s1">S1</span> 搜索四 tab</td><td>搜索页选 QQ/酷狗源，切单曲/专辑/歌手/歌单</td><td>各有差异化结果；封面/时长/歌手正确；VIP 标记正确</td></tr>
+  <tr><td><span class="tag s1">S1</span> 翻页</td><td>滚动加载第二页</td><td>无重复、total 正确递减</td></tr>
+  <tr><td><span class="tag s2">S2</span> 酷狗扫码</td><td>设置页 → 扫码登录 → 手机酷狗 App 扫</td><td>状态 waiting→scanned→success；头像/昵称/VIP 标签显示</td></tr>
+  <tr><td><span class="tag s2">S2</span> QQ 手动 Cookie</td><td>浏览器登录 y.qq.com → 复制 cookie → 粘贴提交</td><td>UIN + 昵称显示；无效 cookie 拒绝并自动登出</td></tr>
+  <tr><td><span class="tag s2">S2</span> 登出</td><td>断开连接</td><td>profile 清空；重新登录可用</td></tr>
+  <tr><td><span class="tag s2">S2</span> 持久化</td><td>重启 splayer-headless</td><td>登录态保持（account_sessions 落盘）</td></tr>
+  <tr><td><span class="tag s3">S3</span> 酷狗播放</td><td>搜索酷狗歌曲 → 点击播放</td><td>出声、进度走动、音质档位正确</td></tr>
+  <tr><td><span class="tag s3">S3</span> QQ 播放</td><td>同上</td><td>出声（若做了 S3-QQ）；未做时明确报"无可用插件"（插件兜底死路径，见 5.3）</td></tr>
+</table>
+
+<h2 id="risk">八、风险与边界说明</h2>
+
+<table>
+  <tr><th>风险点</th><th>影响</th><th>缓解措施</th></tr>
+  <tr><td>酷狗网关签名被风控（IP/频率）</td><td>S2-B 扫码、S1-C 三 tab 请求被拒</td><td>固定 mid 模拟稳定设备；签名参数逐字段与桌面端 diff 比对（抓桌面端实际请求对照）</td></tr>
+  <tr><td>QQ Mobile 接口字段变动</td><td>S1 映射字段缺失</td><td>映射用 <code>.unwrap_or_default()</code> 容错，缺字段返回空值而非报错</td></tr>
+  <tr><td>RSA no-padding 移植错误</td><td>user_detail / song_url 的 p 参数失效</td><td>用桌面端同输入做单元测试对照：Rust 输出 hex 与 Node 输出必须逐字节一致</td></tr>
+  <tr><td>3DES 移植错误（S3-QQ）</td><td>fcg 请求全挂</td><td>同上对照测试；QQ 3DES 有已知开源参考实现可交叉验证</td></tr>
+  <tr><td>Cookie 时效</td><td>QQ qm_keyst / 酷狗 token 过期</td><td>user_detail 失败时前端已自动清 profile；用户重新登录即可（与桌面行为一致）</td></tr>
+</table>
+
+<div class="card callout">
+<p><strong>边界说明</strong>：本计划不含 QQ/酷狗的歌单详情、专辑详情、歌手作品、评论等浏览类接口（桌面端有但 headless 前端在线库页面依赖度低）。搜索结果点击专辑/歌手后的详情页在 headless 下可能仍不可用，属于后续增量，不在本期范围。</p>
+</div>
+
+<h3>8.1 提交切分</h3>
+<ol>
+  <li><code>feat(headless): QQ 搜索翻译层与四 tab type 路由</code></li>
+  <li><code>feat(headless): 酷狗搜索单曲翻译层</code></li>
+  <li><code>feat(headless): kg_crypto 加密基建（签名/MID/RSA）</code></li>
+  <li><code>feat(headless): 酷狗扫码登录与状态落库</code></li>
+  <li><code>feat(headless): 双平台 user_detail 与 cookie 注入</code></li>
+  <li><code>feat(headless): 酷狗 song_url 在线播放</code></li>
+  <li><code>feat(headless): QQ song_url（3DES 纯 Rust 移植）</code></li>
+  <li><code>fix(headless): webPolyfill 网页登录明确报错反馈</code></li>
+</ol>
+<div class="dep">全部提交仅触及 <code>native/headless-server/</code> 与 <code>src/services/client/</code> 两处 headless 独有区域；依赖追加（num-bigint-dig，S3-QQ 再加 des）写入 headless-server 自己的 Cargo.toml，不触碰 workspace 根 Cargo.toml 与 audio-engine 系列。所有加密为纯 Rust crate 实现，零 Node 运行时依赖（桌面 TS 代码仅作移植参考，运行时零复用）。</div>
+
+<h3>8.2 与 HIFI 主线的协同</h3>
+<ul>
+  <li>本计划全部改动不触碰音频信号链（decoder/equalizer/tempo 零接触），与 bit-perfect 主线<strong>完全正交</strong>；且纯 Rust 约束与 HIFI 定位天然一致——在线解析（MD5/RSA/3DES）均在 Rust 进程内完成，无跨语言桥接开销</li>
+  <li>QQ/酷狗在线音源在 HIFI 定位下是"补充音源"，但<strong>插件兜底已实证不可用（5.3）</strong>——若 QQ/酷狗要能播放，S3 是唯一路径，不存在"暂缓不做还能凑合"的选项</li>
+  <li>实施顺序建议：P0（stop panic）→ S1 → S2 → P1（bit-perfect）→ S3-酷狗 → S3-QQ（QQ 播放需求存在则必做，3DES 移植 ≈8h）</li>
+</ul>
+
+<div class="footer">
+  <p>依据：2026-08-30 源码专项核实——headless 侧 online_apis.rs 全量（dispatch 伪 API:152-180、netease cookie 注入:203-229、call_qqmusic:317-433、call_kugou:439-505）、db.rs account_sessions 表；桌面端侧 qqmusic/modules/search.ts（DoSearchForQQMusicMobile + 四 tab 规范化映射:78-180）、user_detail.ts、song_url.ts（219 行）+ core/tripledes.ts（421 行）、kugou/modules/search.ts（mobilecdn 同款端点 + normalizeFromMobile/Legacy:200-318）、login_qr.ts、user_detail.ts、song_url.ts（55 行）、core/crypto.ts（177 行签名/RSA/MID）；前端侧 src/apis/search/{qqmusic,kugou}.ts 读取点、src/apis/login/ 三平台适配层、utils/format/{qqmusic,kugou}.ts Track 映射、audioSource.ts 播放解析接线、webPolyfill.ts apis 桥接。上游零冲突结论由 <code>git cat-file -e origin/dev:&lt;file&gt;</code> 逐文件验证 + <code>git ls-tree</code> 双树对比支撑；纯 Rust 运行时结论由 <code>grep Command::new</code> / <code>ps aux</code> / <code>systemctl cat</code> / Cargo.toml 全览四项检查支撑；插件兜底死路径结论由 audioSource.ts:77-95 源码 + plugins store 加载机制核实（均 2026-08-30）。</p>
+</div>
+
+</div>
+</body>
+</html>

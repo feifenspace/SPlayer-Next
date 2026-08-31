@@ -6,9 +6,11 @@ import type { TrackSource } from "@shared/types/player";
 import type { ArtistProfile } from "@/types/artist";
 import { useLibraryStore } from "@/stores/library";
 import { useStreamingStore } from "@/stores/streaming";
-import { fetchArtist } from "@/apis/artist/netease";
+import { fetchArtist as fetchNeteaseArtist } from "@/apis/artist/netease";
 import { fetchQQMusicArtist } from "@/apis/artist/qqmusic";
 import { fetchKugouArtist } from "@/apis/artist/kugou";
+import { fetchArtist as fetchQobuzArtist } from "@/apis/artist/qobuz";
+import { fetchArtist as fetchTidalArtist } from "@/apis/artist/tidal";
 import { albumsToCoverItems } from "@/utils/format/coverItem";
 
 export interface LoadArtistOptions {
@@ -22,7 +24,7 @@ export interface LoadArtistOptions {
 
 /**
  * 加载指定歌手
- * @param source 来源：local / streaming / netease / qqmusic / kugou
+ * @param source 来源：local / streaming / netease / qqmusic / kugou / qobuz / tidal
  * @param id     歌手 id（route 原始字符串）
  * @param options 回调与中断信号
  */
@@ -53,6 +55,14 @@ export const loadArtist = async (
     const artistId = decodeURIComponent(id);
     const result = await fetchKugouArtist(artistId, options.fallbackName ?? artistId);
     if (!options.signal?.aborted) options.onUpdate(result);
+    return;
+  }
+  if (source === "qobuz") {
+    await loadQobuz(id, options);
+    return;
+  }
+  if (source === "tidal") {
+    await loadTidal(id, options);
     return;
   }
   options.onUpdate(null);
@@ -96,7 +106,7 @@ const loadStreaming = async (id: string, options: LoadArtistOptions): Promise<vo
 };
 
 const loadNetease = async (id: string, options: LoadArtistOptions): Promise<void> => {
-  const result = await fetchArtist(decodeURIComponent(id));
+  const result = await fetchNeteaseArtist(decodeURIComponent(id));
   if (options.signal?.aborted) return;
   if (!result) {
     options.onUpdate(null);
@@ -108,6 +118,47 @@ const loadNetease = async (id: string, options: LoadArtistOptions): Promise<void
     name: result.artist.name,
     avatar: result.artist.avatar,
     source: "netease",
+    tracks: result.tracks,
+    albums,
+    trackCount: result.tracks.length,
+    albumCount: albums.length,
+  });
+};
+
+const loadQobuz = async (id: string, options: LoadArtistOptions): Promise<void> => {
+  const result = await fetchQobuzArtist(decodeURIComponent(id));
+  if (options.signal?.aborted) return;
+  if (!result) {
+    options.onUpdate(null);
+    return;
+  }
+  const albums = albumsToCoverItems(result.albums);
+  options.onUpdate({
+    id,
+    name: result.artist.name,
+    avatar: result.artist.avatar,
+    source: "qobuz",
+    tracks: result.tracks,
+    albums,
+    playlists: result.playlists,
+    trackCount: result.tracks.length,
+    albumCount: albums.length,
+  });
+};
+
+const loadTidal = async (id: string, options: LoadArtistOptions): Promise<void> => {
+  const result = await fetchTidalArtist(decodeURIComponent(id));
+  if (options.signal?.aborted) return;
+  if (!result) {
+    options.onUpdate(null);
+    return;
+  }
+  const albums = albumsToCoverItems(result.albums);
+  options.onUpdate({
+    id,
+    name: result.artist.name,
+    avatar: result.artist.avatar,
+    source: "tidal",
     tracks: result.tracks,
     albums,
     trackCount: result.tracks.length,

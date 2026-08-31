@@ -272,6 +272,15 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/proxy/stream",
             axum::routing::get(crate::api::online_apis::stream_proxy_handler),
         )
+        // 远程图片代理转发（解决客户端无法直连 static.qobuz.com / resources.tidal.com）
+        .route(
+            "/api/proxy/image",
+            axum::routing::get(crate::api::online_apis::image_proxy_handler),
+        )
+        .route(
+            "/api/v1/proxy/image",
+            axum::routing::get(crate::api::online_apis::image_proxy_handler),
+        )
         // WebSocket（单独鉴权）
         .route("/ws", axum::routing::get(ws_handler))
         // 受保护路由
@@ -378,12 +387,14 @@ async fn status_handler(State(state): State<AppState>) -> Result<Json<Value>, Ap
 
 /// 播放
 async fn play_handler(State(state): State<AppState>) -> Result<Json<PlayerResponse>, ApiError> {
-    let revival_source = {
+    let revival_source = spawn_isolated_blocking("player-play-worker", move || {
         let mut player = state.player.lock();
         player
             .play()
-            .map_err(|e| ApiError::bad_request(e.to_string()))?
-    };
+            .map_err(|e| ApiError::bad_request(e.to_string()))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e))??;
 
     match revival_source {
         None => Ok(Json(PlayerResponse::ok(json!({ "status": "playing" })))),
@@ -396,19 +407,21 @@ async fn play_handler(State(state): State<AppState>) -> Result<Json<PlayerRespon
 
 /// 暂停
 async fn pause_handler(State(state): State<AppState>) -> Json<PlayerResponse> {
-    {
+    let _ = spawn_isolated_blocking("player-pause-worker", move || {
         let mut player = state.player.lock();
         player.pause();
-    }
+    })
+    .await;
     Json(PlayerResponse::ok(json!({ "status": "paused" })))
 }
 
 /// 停止
 async fn stop_handler(State(state): State<AppState>) -> Json<PlayerResponse> {
-    {
+    let _ = spawn_isolated_blocking("player-stop-worker", move || {
         let mut player = state.player.lock();
         player.stop();
-    }
+    })
+    .await;
     Json(PlayerResponse::ok(json!({ "status": "stopped" })))
 }
 
@@ -436,6 +449,19 @@ async fn load_handler(
     let _ = query.cancel_handle_id;
     let auto_play = payload.auto_play.unwrap_or(true);
     let source = payload.source;
+
+    // 若为后台冷启动恢复请求（auto_play: false），且当前播放器已处于活跃播放或暂停状态，直接返回现有状态，不打断后台音频流
+    if !auto_play {
+        let snap = state.snapshot();
+        if matches!(snap.state, audio_engine_core::PlayerState::Playing | audio_engine_core::PlayerState::Paused) {
+            return Ok(Json(PlayerResponse::ok(json!({
+                "status": "active",
+                "source": source,
+                "duration": snap.duration,
+            }))));
+        }
+    }
+
     let handle = audio_engine_core::HttpCancelHandle::new();
 
     let (

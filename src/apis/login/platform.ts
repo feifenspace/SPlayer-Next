@@ -1,11 +1,8 @@
 import type { Platform, PlatformProfile } from "@shared/types/platform";
-import {
-  fetchQQMusicLoginStatus,
-  logoutQQMusic,
-  openQQMusicLoginWeb,
-  setQQMusicCookie,
-} from "./qqmusic";
+import { fetchQQMusicLoginStatus, logoutQQMusic, openQQMusicLoginWeb, setQQMusicCookie } from "./qqmusic";
 import { fetchKugouLoginStatus, kugouQrLoginAdapter, logoutKugou, setKugouCookie } from "./kugou";
+import { fetchQobuzLoginStatus, logoutQobuz } from "./qobuz";
+import { fetchTidalLoginStatus, logoutTidal } from "./tidal";
 
 export type QrLoginState = "expired" | "waiting" | "scanned" | "success";
 
@@ -44,6 +41,18 @@ const adapters: Partial<Record<Platform, PlatformAccountAdapter>> = {
     logout: logoutKugou,
     setCookie: setKugouCookie,
     qrLogin: kugouQrLoginAdapter,
+  },
+  qobuz: {
+    displayName: "Qobuz",
+    userIdLabel: "ID",
+    fetchProfile: fetchQobuzLoginStatus,
+    logout: logoutQobuz,
+  },
+  tidal: {
+    displayName: "TIDAL",
+    userIdLabel: "ID",
+    fetchProfile: fetchTidalLoginStatus,
+    logout: logoutTidal,
   },
 };
 

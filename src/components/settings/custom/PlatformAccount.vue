@@ -4,6 +4,7 @@ import { toast } from "@/composables/useToast";
 import { getPlatformAccountAdapter } from "@/apis/login/platform";
 import { REPO_NAME } from "@/utils/config";
 import type { Platform } from "@shared/types/platform";
+import StreamingLoginDialog from "@/components/modals/StreamingLoginDialog.vue";
 
 defineOptions({ inheritAttrs: false });
 
@@ -19,6 +20,7 @@ const loggingIn = ref(false);
 const confirmOpen = ref(false);
 const cookieModalOpen = ref(false);
 const qrModalOpen = ref(false);
+const streamingDialogOpen = ref(false);
 const cookieSubmitting = ref(false);
 const manualCookie = ref("");
 
@@ -211,9 +213,29 @@ const handleQrSuccess = async (): Promise<void> => {
             </template>
             {{ t("settings.platformLogin.loginWeb") }}
           </SButton>
+          <SButton
+            v-if="props.platform === 'qobuz' || props.platform === 'tidal'"
+            variant="secondary"
+            size="small"
+            type="primary"
+            @click="streamingDialogOpen = true"
+          >
+            <template #icon>
+              <IconLucideLogIn class="size-4" />
+            </template>
+            {{ t("settings.platformLogin.loginWeb") }}
+          </SButton>
         </template>
       </div>
     </div>
+
+    <!-- Qobuz / TIDAL 登录弹窗 -->
+    <StreamingLoginDialog
+      v-if="props.platform === 'qobuz' || props.platform === 'tidal'"
+      v-model:open="streamingDialogOpen"
+      :tab="props.platform === 'tidal' ? 'tidal' : 'qobuz'"
+      @update:open="(val: boolean) => { if (!val) void refresh(); }"
+    />
 
     <!-- 退出确认弹窗 -->
     <SDialog

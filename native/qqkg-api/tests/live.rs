@@ -206,6 +206,35 @@ async fn kugou_live_m4_browsing_endpoints() {
     assert!(art2["songs"].as_array().unwrap().len() > 0);
 }
 
+#[tokio::test]
+async fn qq_live_lyric_decrypt() {
+    let c = QqmusicClient::new(HashMap::new());
+    let mut p = HashMap::new();
+    p.insert("id".to_string(), serde_json::json!("97773")); // 晴天 songID
+    p.insert("name".to_string(), serde_json::json!("晴天"));
+    p.insert("artist".to_string(), serde_json::json!("周杰伦"));
+    let res = c.lyric(&p).await.unwrap();
+    assert_eq!(res["code"], 200);
+    let qrc_or_lrc = res["qrc"].as_str().or_else(|| res["lrc"].as_str()).unwrap();
+    println!("qq lyric decrypted sample (len={}): {}", qrc_or_lrc.len(), &qrc_or_lrc[..qrc_or_lrc.len().min(120)]);
+    assert!(qrc_or_lrc.contains("晴天") || qrc_or_lrc.contains("周杰伦") || qrc_or_lrc.contains("00:"));
+}
+
+#[tokio::test]
+async fn kugou_live_lyric_krc_decrypt() {
+    let c = KugouClient::new(HashMap::new());
+    let mut p = HashMap::new();
+    p.insert("hash".to_string(), serde_json::json!("b3a52a7a958bf0aed0ebfba2e9a818b7")); // 晴天 hash
+    p.insert("name".to_string(), serde_json::json!("晴天"));
+    p.insert("duration".to_string(), serde_json::json!(269));
+    let res = c.lyric(&p).await.unwrap();
+    assert_eq!(res["code"], 200);
+    let lrc = res["lrc"].as_str().unwrap();
+    println!("kugou lyric decrypted sample (len={}): {}", lrc.len(), &lrc[..lrc.len().min(120)]);
+    assert!(lrc.contains("晴天") || lrc.contains("周杰伦") || lrc.contains("00:"));
+}
+
+
 
 
 

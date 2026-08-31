@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QQ音乐 / 酷狗音乐 Rust 工程实施计划</title>
+<style>
+  :root {
+    --bg: #FAFAFA; --surface: #FFFFFF; --text: #1A1A1A; --muted: #666666;
+    --border: #E5E5E5; --accent: #0F766E; --accent-soft: #ECFDF5;
+    --green: #16A34A; --green-soft: #F0FDF4; --red: #DC2626; --red-soft: #FEF2F2;
+    --amber: #D97706; --amber-soft: #FFFBEB; --blue: #2563EB; --blue-soft: #EFF6FF;
+    --gray-soft: #F4F4F5; --code-bg: #F4F4F5;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: "SF Pro Text", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; background: var(--bg); color: var(--text); line-height: 1.75; font-size: 15px; padding: 40px 20px; }
+  .container { max-width: 960px; margin: 0 auto; }
+  header { margin-bottom: 36px; padding-bottom: 24px; border-bottom: 2px solid var(--text); }
+  .ver { display: inline-block; background: var(--accent); color: #fff; font-size: 12px; font-weight: 700; padding: 2px 12px; border-radius: 999px; margin-bottom: 12px; letter-spacing: 1px; }
+  h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.5px; margin-bottom: 8px; }
+  .subtitle { color: var(--muted); font-size: 14px; }
+  .meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 16px; font-size: 13px; color: var(--muted); }
+  .meta span::before { content: "·"; font-weight: 700; color: var(--accent); margin-right: 6px; }
+  h2 { font-size: 20px; font-weight: 700; margin: 44px 0 16px; padding-left: 12px; border-left: 4px solid var(--accent); }
+  h3 { font-size: 16px; font-weight: 600; margin: 28px 0 10px; }
+  h4 { font-size: 14px; font-weight: 600; margin: 18px 0 8px; color: #333; }
+  p { margin-bottom: 12px; color: #333; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; margin-bottom: 16px; }
+  .card.callout { background: var(--accent-soft); border-color: #99F6E4; }
+  .card.danger { background: var(--red-soft); border-color: #FECACA; }
+  .card.ok { background: var(--green-soft); border-color: #BBF7D0; }
+  .card.warn { background: var(--amber-soft); border-color: #FDE68A; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+  th { text-align: left; padding: 9px 12px; background: var(--gray-soft); font-weight: 600; border: 1px solid var(--border); white-space: nowrap; }
+  td { padding: 9px 12px; border: 1px solid var(--border); vertical-align: top; }
+  code { font-family: "SF Mono", Consolas, "Cascadia Code", monospace; background: var(--code-bg); padding: 2px 6px; border-radius: 4px; font-size: 12.5px; color: #B91C1C; }
+  pre { background: #1E1E2E; color: #CDD6F4; padding: 16px 20px; border-radius: 8px; overflow-x: auto; font-family: "SF Mono", Consolas, monospace; font-size: 12.5px; line-height: 1.7; margin: 14px 0; }
+  pre code { background: none; padding: 0; color: inherit; }
+  .cm { color: #6C7086; } .kw { color: #CBA6F7; } .st { color: #A6E3A1; } .fn { color: #89B4FA; }
+  ul, ol { padding-left: 22px; margin-bottom: 12px; }
+  li { margin-bottom: 6px; color: #333; }
+  .tag { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .tag.ok { background: var(--green-soft); color: var(--green); }
+  .tag.no { background: var(--red-soft); color: var(--red); }
+  .tag.warn { background: var(--amber-soft); color: var(--amber); }
+  .tag.gray { background: var(--gray-soft); color: var(--muted); }
+  .tag.m { background: var(--blue-soft); color: var(--blue); }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 14px 0; }
+  @media (max-width: 720px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .stat .num { font-size: 26px; font-weight: 700; color: var(--accent); }
+  .stat .label { font-size: 13px; color: var(--muted); }
+  .phase-head { display: flex; align-items: center; gap: 12px; margin: 32px 0 14px; }
+  .phase-head .pnum { background: var(--accent); color: #fff; width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 15px; flex-shrink: 0; }
+  .phase-head .ptitle { font-size: 18px; font-weight: 700; }
+  .phase-head .pest { margin-left: auto; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 24px; margin-bottom: 8px; }
+  .toc-title { font-weight: 700; font-size: 14px; margin-bottom: 10px; color: var(--muted); }
+  .toc ol { margin: 0; columns: 2; column-gap: 32px; }
+  .toc li { break-inside: avoid; margin-bottom: 5px; font-size: 14px; color: var(--accent); }
+  .toc a { color: inherit; text-decoration: none; } .toc a:hover { text-decoration: underline; }
+  .footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+  .dep { font-size: 12.5px; color: var(--muted); background: var(--gray-soft); border-radius: 6px; padding: 8px 14px; margin: 10px 0; }
+  .tree { background: #1E1E2E; color: #A6ADC8; padding: 16px 20px; border-radius: 8px; font-family: "SF Mono", Consolas, monospace; font-size: 12.5px; line-height: 1.8; margin: 14px 0; }
+  .tree .hl { color: #94E2D5; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <div class="ver">RUST ENGINEERING · 工程实施</div>
+  <h1>QQ音乐 / 酷狗音乐 Rust 工程实施计划</h1>
+  <p class="subtitle">独立 crate <code>qqkg-api</code> 的代码级实施方案 — 对齐 ncm-api-rs 架构先例，纯 Rust、零 Node 运行时、零上游冲突</p>
+  <div class="meta">
+    <span>仓库 SPlayer-Next-Headless @ 192.168.31.47</span>
+    <span>编写日期 2026-08-30</span>
+    <span>预计核心链路 4 ~ 5 天（含 QQ 3DES）</span>
+    <span>代码量约 2000 行 Rust</span>
+  </div>
+  <div class="card callout" style="margin-top:16px">
+    <p><strong>三份文档的分工</strong>：<code>headless-fix-plan.html</code>（HIFI 总纲）→ <code>qq-kg-integration-plan.html</code>（S1/S2/S3 功能与验收标准）→ <strong>本文档（Rust 工程落地：crate 结构 / 函数签名 / 数据结构 / 加密规格 / 测试向量）</strong>。里程碑沿用 S1/S2/S3，本文档给出 HOW。</p>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="stat"><div class="num">1</div><div class="label">新建 crate（native/qqkg-api，headless 独有）</div></div>
+  <div class="stat"><div class="num">≈2000</div><div class="label">行 Rust（含 QQ 3DES ≈400 行）</div></div>
+  <div class="stat"><div class="num">10</div><div class="label">个端点（9 新增 + lyric 保持现状）</div></div>
+  <div class="stat"><div class="num">2 处</div><div class="label">online_apis.rs 改动点（分派层最小 diff）</div></div>
+</div>
+
+<div class="toc">
+  <div class="toc-title">目录</div>
+  <ol>
+    <li><a href="#arch">架构决策与数据流</a></li>
+    <li><a href="#tree">crate 文件结构与职责</a></li>
+    <li><a href="#types">核心数据结构（serde 规格）</a></li>
+    <li><a href="#crypto">加密层实现规格</a></li>
+    <li><a href="#endpoints">端点实现规格（含代码骨架）</a></li>
+    <li><a href="#wiring">接线改造（online_apis.rs 最小 diff）</a></li>
+    <li><a href="#milestones">里程碑与工时</a></li>
+    <li><a href="#test">测试策略</a></li>
+    <li><a href="#deps">依赖清单与约束符合性</a></li>
+    <li><a href="#risk">风险与提交切分</a></li>
+  </ol>
+</div>
+
+<h2 id="arch">一、架构决策与数据流</h2>
+
+<h3>1.1 决策：独立 crate，对齐 ncm-api-rs 先例</h3>
+<table>
+  <tr><th>方案</th><th>说明</th><th>优点</th><th>缺点</th><th>结论</th></tr>
+  <tr>
+    <td><strong>A. 独立 crate</strong><br><code>native/qqkg-api/</code></td>
+    <td>新建 crate，headless-server 以 path 依赖引入</td>
+    <td>对齐 ncm-api-rs 先例（395 文件 / 12000 行的成熟结构）；加密层可独立 <code>cargo test</code>；不污染 headless-server；后续 M4 扩端点只加文件</td>
+    <td>比内嵌多约 0.5~1 天（骨架 + 单测搭建）</td>
+    <td><span class="tag ok">采用</span></td>
+  </tr>
+  <tr>
+    <td>B. 内嵌 headless-server</td>
+    <td>在 <code>api/</code> 下加 <code>kg_crypto.rs</code> 等文件</td>
+    <td>接线最简</td>
+    <td>online_apis.rs 预计膨胀 +2000 行；加密单测要拉整个 server 编译；与 ncm-api-rs 模式割裂</td>
+    <td><span class="tag no">弃</span></td>
+  </tr>
+</table>
+<div class="dep">与 ncm-api-rs 的关键差异：<strong>ncm-api-rs 是仓库外路径依赖（<code>/home/songlian/ncm-api-rs</code>，机器绑定、有丢失风险）</strong>；qqkg-api 放在 <code>native/</code> 仓库内，随 git 版本化——这是刻意改进而非照搬。</div>
+
+<h3>1.2 数据流（前端零改动）</h3>
+<pre><code><span class="cm">// 不改的既有链路（全部已验证）</span>
+Web UI (Vue, <span class="kw">不改</span>)
+  → httpClient.ts <span class="fn">call()</span> (<span class="kw">不改</span>)  POST /api/v1/proxy/apis/call
+    → routes.rs:1363 <span class="fn">dispatch_api_call</span>(payload, &state.db)  (<span class="kw">不改</span>)
+      → online_apis.rs <span class="fn">call_qqmusic / call_kugou</span>  (<span class="cm">仅改分派与签名，见第六章</span>)
+        → <span class="st">qqkg-api crate</span>: QqmusicClient / KugouClient
+          → crypto 层（3DES / MD5 签名 / RSA）
+            → reqwest 上游请求（Cookie / token 注入）
+              → normalize 层（原始格式 → {code:200, total, songs} 规范化）
+                → <span class="fn">ApiCallResponse::ok_data</span>(规范化 JSON)  <span class="cm">// data 字段，前端 res.data 直接读到</span></code></pre>
+
+<h2 id="tree">二、crate 文件结构与职责</h2>
+
+<div class="tree">
+native/qqkg-api/
+├── Cargo.toml                                      <span class="cm"># 见第九章依赖清单</span>
+└── src/
+    ├── lib.rs                <span class="hl">门面</span>              <span class="cm"># pub use 导出 Client/类型          ~25 行</span>
+    ├── error.rs              <span class="hl">QqkgError</span>         <span class="cm"># thiserror 错误枚举                ~55 行</span>
+    ├── types.rs              <span class="hl">公共类型</span>          <span class="cm"># SearchType/SearchParams/凭据结构  ~90 行</span>
+    ├── normalize.rs          <span class="hl">规范化层</span>          <span class="cm"># 信封+stripHighlight/secureUrl    ~110 行</span>
+    ├── crypto/
+    │   ├── mod.rs                                     <span class="cm">#   ~5 行</span>
+    │   ├── kg_sign.rs        <span class="hl">酷狗签名</span>          <span class="cm"># signature_web_params / sign_key   ~55 行</span>
+    │   ├── kg_mid.rs         <span class="hl">设备 MID</span>          <span class="cm"># 首版固定 mid                      ~25 行</span>
+    │   ├── kg_rsa.rs         <span class="hl">RSA no-padding</span>   <span class="cm"># 1024 位模幂 → hex 大写             ~75 行</span>
+    │   └── qq_des.rs         <span class="hl">QQ 3DES</span>          <span class="cm"># 3DES-CBC（M3-QQ）                ~200 行</span>
+    ├── qqmusic/
+    │   ├── mod.rs            <span class="hl">QqmusicClient</span>     <span class="cm"># fcg POST + Cookie 注入            ~130 行</span>
+    │   ├── search.rs         <span class="hl">四类型搜索</span>        <span class="cm"># Mobile 接口 + 映射                 ~260 行</span>
+    │   ├── user_detail.rs    <span class="hl">用户信息</span>          <span class="cm">#  ~85 行</span>
+    │   └── song_url.rs       <span class="hl">播放地址</span>          <span class="cm"># fcg_vkey + CDN 探测降级链        ~190 行</span>
+    └── kugou/
+        ├── mod.rs            <span class="hl">KugouClient</span>       <span class="cm"># mobilecdn/网关 + 签名注入          ~170 行</span>
+        ├── search.rs         <span class="hl">搜索</span>              <span class="cm"># 单曲 v3 + 三类型网关               ~230 行</span>
+        ├── login_qr.rs       <span class="hl">扫码登录</span>          <span class="cm"># key/check + status 契约           ~120 行</span>
+        ├── user_detail.rs    <span class="hl">用户信息</span>          <span class="cm">#  ~80 行</span>
+        └── song_url.rs       <span class="hl">播放地址</span>          <span class="cm"># signKey + 档位解析                ~110 行</span>
+</div>
+
+<div class="card ok">
+<p><strong>职责边界（刻意设计）</strong>：crate <strong>不碰 DB</strong>——凭据（QQ Cookie 串 / 酷狗 token+userid）由 online_apis.rs 从 <code>account_sessions</code> 表读出后，以构造参数传入 Client。crate 也不碰 <code>lyric</code>——两平台在线歌词<strong>现已可用</strong>（online_apis.rs 既有 lyric 分支），保持原样不平移，遵循"能用的代码不动"。</p>
+</div>
+
+<h2 id="types">三、核心数据结构（serde 规格）</h2>
+
+<h3>3.1 搜索类型路由（两平台统一入口）</h3>
+<pre><code><span class="cm">/// 前端 type 参数 → 内部枚举 → 各平台上游 search_type</span>
+<span class="kw">pub enum</span> <span class="fn">SearchType</span> { Song, Album, Artist, Playlist }
+
+<span class="kw">impl</span> SearchType {
+    <span class="cm">/// 兼容数字(0/2/8/9)与字符串两种入参形态</span>
+    <span class="kw">pub fn</span> <span class="fn">from_param</span>(v: &Value) -> Self {
+        <span class="kw">match</span> v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())) {
+            <span class="st">Some(8)</span>  => Album,
+            <span class="st">Some(9)</span>  => Artist,
+            <span class="st">Some(2) | Some(3)</span> => Playlist,
+            _ => Song,
+        }
+    }
+    <span class="cm">/// QQ 上游映射：单曲0 / 歌手1 / 专辑2 / 歌单3（桌面端同款）</span>
+    <span class="kw">pub fn</span> <span class="fn">qq_search_type</span>(&self) -> i64 { <span class="kw">match</span> self { Song => 0, Artist => 1, Album => 2, Playlist => 3 } }
+}</code></pre>
+
+<h3>3.2 规范化信封（前端 <code>body.songs ?? []</code> 的读取契约）</h3>
+<pre><code><span class="cm">/// 对齐桌面端 electron/main/apis/*/modules/search.ts 的返回格式</span>
+<span class="kw">pub struct</span> <span class="fn">SearchEnvelope</span> {
+    <span class="kw">pub</span> code: i32,            <span class="cm">// 恒 200</span>
+    <span class="kw">pub</span> total: u64,
+    <span class="kw">pub</span> songs:     Option<Vec<NormalizedSong>>,      <span class="cm">// skip_serializing_if None</span>
+    <span class="kw">pub</span> albums:    Option<Vec<NormalizedAlbum>>,
+    <span class="kw">pub</span> artists:   Option<Vec<NormalizedArtist>>,
+    <span class="kw">pub</span> playlists: Option<Vec<NormalizedPlaylist>>,
+}
+
+<span class="cm">/// QQ 单曲——字段 = 前端 qqSongToTrack 消费集 + S3 播放凭据</span>
+<span class="kw">pub struct</span> <span class="fn">NormalizedSong</span> {
+    <span class="kw">pub</span> id: i64,  <span class="kw">pub</span> mid: String,  <span class="kw">pub</span> media_mid: String,   <span class="cm">// S3 fcg_vkey 入参</span>
+    <span class="kw">pub</span> name: String,  <span class="kw">pub</span> artist: String,  <span class="kw">pub</span> artists: Vec<SingerRef>,
+    <span class="kw">pub</span> album: String,  <span class="kw">pub</span> album_mid: String,
+    <span class="kw">pub</span> duration: u64,                                     <span class="cm">// 毫秒（interval × 1000）</span>
+    <span class="kw">pub</span> pay: bool,
+    <span class="kw">pub</span> size_128: u64, size_320: u64, size_flac: u64, size_ape: u64,  <span class="cm">// song.file.size_*</span>
+    <span class="kw">pub</span> hi_res_sample_rate: Option<u32>, hi_res_bit_depth: Option<u32>,
+    <span class="kw">pub</span> cover: String, cover_original: String,               <span class="cm">// y.gtimg.cn T002R300x300M000{albumMid}.jpg</span>
+}
+
+<span class="cm">/// 酷狗单曲——hash 系字段是 S3 播放的档位凭据</span>
+<span class="kw">pub struct</span> <span class="fn">NormalizedKgSong</span> {
+    <span class="kw">pub</span> id: String,                    <span class="cm">// audio_id || hash</span>
+    <span class="kw">pub</span> hash: String,                 <span class="cm">// S3 song_url 入参（小写）</span>
+    <span class="kw">pub</span> hashes: QualityHashes,        <span class="cm">// {128k: FileHash, 320k: HQFileHash, flac: SQFileHash, flac24bit: ResFileHash}</span>
+    <span class="kw">pub</span> qualities: Vec<String>,       <span class="cm">// hashes 的 keys</span>
+    <span class="kw">pub</span> sizes: QualitySizes,
+    <span class="kw">pub</span> name: String,  <span class="kw">pub</span> artist: String,  <span class="kw">pub</span> artists: Vec<SingerRef>,
+    <span class="kw">pub</span> album: String,  <span class="kw">pub</span> album_id: String,
+    <span class="kw">pub</span> interval: u64,  <span class="kw">pub</span> duration: u64,  <span class="cm">// 秒 / 毫秒双字段对齐桌面</span>
+    <span class="kw">pub</span> pay: bool,
+    <span class="kw">pub</span> cover: String, cover_original: String,           <span class="cm">// trans_param.union_cover 模板 300/480</span>
+}</code></pre>
+
+<h3>3.3 登录态与播放地址</h3>
+<pre><code><span class="cm">/// 前端校验点：qqmusic.ts:33 读 code===200 && loggedIn && profile；kugou.ts:43 读 loggedIn && profile</span>
+<span class="kw">pub struct</span> <span class="fn">UserDetailEnvelope</span> {
+    <span class="kw">pub</span> code: i32,  <span class="kw">pub</span> logged_in: bool,  <span class="kw">pub</span> profile: Option<LoginProfile>,
+}
+<span class="kw">pub struct</span> <span class="fn">LoginProfile</span> { user_id, nickname, avatar_url: String, is_vip: bool, vip_level: i64 }
+
+<span class="cm">/// 酷狗扫码轮询契约（前端 kugou.ts:19-37 已就绪）</span>
+<span class="kw">pub struct</span> <span class="fn">QrKeyEnvelope</span>   { code: i32, key: String, content: String }        <span class="cm">// content = 二维码原文</span>
+<span class="kw">pub struct</span> <span class="fn">QrCheckEnvelope</span> { code: i32, status: i32, nickname: Option<String>, avatar: Option<String> }
+<span class="cm">// status 语义：0=过期 2=已扫码 4=成功（4 时凭据直接在响应 data 里，落库 token/userid/vip_token）</span>
+
+<span class="cm">/// 播放地址（audioSource.ts resolve 接线的返回契约）</span>
+<span class="kw">pub struct</span> <span class="fn">SongUrlEnvelope</span> {
+    code: i32, available: bool,
+    url: Option<String>,               <span class="cm">// CDN 签名地址（有时效）</span>
+    reason: Option<String>, quality: Option<String>,
+}</code></pre>
+
+<h2 id="crypto">四、加密层实现规格</h2>
+
+<h3>4.1 酷狗签名 kg_sign.rs（≈55 行，M0）</h3>
+<pre><code><span class="kw">const</span> KG_WEB_SALT: &str = <span class="st">"NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt"</span>;        <span class="cm">// 网关 signature 用</span>
+<span class="kw">const</span> KG_SIGN_KEY_SALT: &str = <span class="st">"57ae12eb6890223e355ccfcb74edf70d"</span>;   <span class="cm">// song_url 的 key 用</span>
+
+<span class="cm">/// 参数名 ASCII 升序拼 k=v，首尾加盐后 MD5（对齐 crypto.ts）</span>
+<span class="kw">pub fn</span> <span class="fn">signature_web_params</span>(params: &[(String, String)]) -> String {
+    <span class="kw">let</span> <span class="kw">mut</span> sorted = params.to_vec();
+    sorted.sort();
+    <span class="kw">let</span> <span class="kw">mut</span> s = String::from(KG_WEB_SALT);
+    <span class="kw">for</span> (k, v) <span class="kw">in</span> sorted { s.push_str(&k); s.push('='); s.push_str(&v); }
+    s.push_str(KG_WEB_SALT);
+    format!(<span class="st">"{:x}"</span>, md5::compute(s.as_bytes()))
+}</code></pre>
+<p><code>md5</code> crate(0.7)已在 headless-server 依赖中，crate 内再声明同版本。盐值常量从桌面端 <code>kugou/core/crypto.ts</code> / <code>config.ts</code> 原样复制。</p>
+
+<h3>4.2 酷狗 RSA no-padding kg_rsa.rs（≈75 行，M0）</h3>
+<pre><code><span class="kw">use</span> num_bigint_dig::BigUint;
+
+<span class="cm">/// RSA-1024 NO_PADDING：JSON 明文 → 128 字节零填充块 → 模幂 → hex 大写</span>
+<span class="kw">pub fn</span> <span class="fn">rsa_encrypt_kugou</span>(plaintext: &str) -> String {
+    <span class="kw">const</span> N_HEX: &str = <span class="st">"/* 从桌面端 crypto.ts 公钥常量区原样复制 */"</span>;
+    <span class="kw">let</span> n = BigUint::parse_bytes(N_HEX.as_bytes(), 16).unwrap();
+    <span class="kw">let</span> e = BigUint::from(65535u32 + 2u32);  <span class="cm">// 65537</span>
+
+    <span class="kw">let</span> bytes = plaintext.as_bytes();
+    <span class="kw">let mut</span> block = [0u8; 128];
+    <span class="cm">// 填充方向（左/右）以桌面 crypto.ts 实现为准，用 Node 对照测试锁定（见 4.5）</span>
+    block[128 - bytes.len()..].copy_from_slice(bytes);
+
+    <span class="kw">let</span> c = BigUint::from_bytes_be(&block).modpow(&e, &n);
+    c.to_str_radix(16).to_uppercase()
+}</code></pre>
+<p>用 <code>num-bigint-dig</code> 的 <code>modpow</code> 而非拉全 <code>rsa</code> crate——no-padding 场景只需要一次模幂，70 行内解决。用途：user_detail 的 <code>p</code> 参数、S3 song_url 的 <code>key</code>。</p>
+
+<h3>4.3 酷狗 MID kg_mid.rs（≈25 行，M0）</h3>
+<p>首版直接采用桌面端默认 GUID 对应的固定 <code>mid</code> 常量（模拟稳定设备指纹，降低风控概率）；后续若被风控再实现 GUID→MD5→大整数进制转换的完整算法。</p>
+
+<h3>4.4 QQ 3DES qq_des.rs（≈200 行，M3-QQ）</h3>
+<table>
+  <tr><th>项</th><th>规格</th></tr>
+  <tr><td>算法</td><td>3DES-CBC（EDE3），自定义填充——密钥/IV/填充常量从桌面端 <code>qqmusic/core/tripledes.ts</code>（421 行）常量区原样移植</td></tr>
+  <tr><td>Rust 实现</td><td><code>des</code> crate 的 <code>TdesEde3Cbc</code> + 手写填充/去填充</td></tr>
+  <tr><td>用途</td><td>QQ fcg 请求体加密（song_url 的 fcg_vkey 调用必需）</td></tr>
+  <tr><td>工作量</td><td>≈4h（移植 2h + 对照调试 2h）</td></tr>
+</table>
+
+<h3>4.5 加密对照测试方法（dev 期工具，非运行时依赖）</h3>
+<pre><code><span class="cm"># 1. 开发期在桌面端代码目录用 node 生成参照向量（一次性，向量硬编码进 Rust 单测）</span>
+node -e <span class="st">"const {rsaEncryptKugou} = require('./electron/main/apis/kugou/core/crypto');
+console.log(rsaEncryptKugou('{\"token\":\"test\",\"clienttime\":1740000000}'))"</span>
+
+<span class="cm"># 2. Rust 单测断言逐字节一致</span>
+#[test]
+<span class="kw">fn</span> <span class="fn">rsa_matches_desktop_vector</span>() {
+    <span class="kw">assert_eq!</span>(
+        rsa_encrypt_kugou(<span class="st">r#"{"token":"test","clienttime":1740000000}"#</span>),
+        <span class="st">"/* node 输出的 hex */"</span>
+    );
+}</code></pre>
+<div class="dep">注意：node 仅用于<strong>开发期生成测试向量</strong>，向量硬编码进 <code>cargo test</code> 后服务器运行时零 Node——符合纯 Rust 硬约束（约束限制的是运行时，不是开发工具链）。</div>
+
+<h2 id="endpoints">五、端点实现规格</h2>
+
+<h3>5.1 QQ 搜索（search.rs，M1）——换接口 + type 路由 + 映射</h3>
+<pre><code><span class="kw">impl</span> QqmusicClient {
+    <span class="kw">pub async fn</span> <span class="fn">search</span>(&self, p: &SearchParams) -> Result<SearchEnvelope, QqkgError> {
+        <span class="cm">// 关键改动 1：DoSearchForQQMusicDesktop → Mobile（桌面端同款，含 grp:1）</span>
+        <span class="cm">// 关键改动 2：search_type 从 p.ty 取（杀死现有 online_apis.rs:341 的硬编码 0）</span>
+        <span class="kw">let</span> payload = json!({
+            <span class="st">"comm"</span>: self.common_params(),
+            <span class="st">"request"</span>: {
+                <span class="st">"module"</span>: <span class="st">"music.search.SearchCgiService"</span>,
+                <span class="st">"method"</span>: <span class="st">"DoSearchForQQMusicMobile"</span>,
+                <span class="st">"param"</span>: { <span class="st">"query"</span>: p.keyword, <span class="st">"page_num"</span>: p.page,
+                               <span class="st">"num_per_page"</span>: p.limit,
+                               <span class="st">"search_type"</span>: p.ty.qq_search_type(), <span class="st">"grp"</span>: 1 }
+            }
+        });
+        <span class="kw">let</span> resp: Value = self.post_fcg(payload).await?;
+        <span class="kw">let</span> body = &resp[<span class="st">"request"</span>][<span class="st">"data"</span>][<span class="st">"body"</span>];  <span class="cm">// 现有代码已取到这层，直通是 bug 根源</span>
+
+        <span class="kw">Ok</span>(<span class="kw">match</span> p.ty {
+            Song     => envelope(body[<span class="st">"song"</span>][<span class="st">"list"</span>].as_array().map(normalize_qq_songs),
+                                body[<span class="st">"song"</span>][<span class="st">"curnum"</span>].as_u64().unwrap_or(0)),
+            Album    => envelope_albums(body[<span class="st">"item_album"</span>].as_array()),
+            Artist   => envelope_artists(body[<span class="st">"singer"</span>].as_array()),
+            Playlist => envelope_playlists(body[<span class="st">"item_songlist"</span>].as_array()),
+        })
+    }
+}</code></pre>
+
+<div class="card callout">
+<p><strong>现有代码可复用部分（已核实，online_apis.rs:317-361）</strong>：keyword/keywords、page、pageSize/limit 的参数解析逻辑，HTTP_CLIENT 带 Referer/UA 的 POST，<code>resp.request.data</code> 的提取——全部保留，只换 payload 方法名、加 type/grp、在返回前插入 normalize。这使 M1 的实际改动是"加法"而非"重写"。</p>
+</div>
+
+<h4>QQ 四类型字段映射（照桌面端 search.ts:78-180 移植）</h4>
+<table>
+  <tr><th>类型</th><th>原始数组</th><th>映射要点</th></tr>
+  <tr><td>单曲 songs</td><td><code>body.item_song[]</code></td><td>mid / mediaMid=file.media_mid / size_*=file.size_* / duration=interval×1000 / pay=pay.pay_play / 封面 y.gtimg.cn 模板</td></tr>
+  <tr><td>专辑 albums</td><td><code>body.item_album[]</code></td><td>{id: albummid, name, cover: secureUrl(pic), artist, artistMid, trackCount: song_num}</td></tr>
+  <tr><td>歌手 artists</td><td><code>body.singer[]</code></td><td>{id: singerMID, name: singerName, cover, albumCount, songCount}</td></tr>
+  <tr><td>歌单 playlists</td><td><code>body.item_songlist[]</code></td><td>{id: dissid, name: stripHighlight(dissname), cover, creator: nickname, trackCount, playCount: listennum}</td></tr>
+</table>
+<p><code>normalize.rs</code> 提供三个纯函数：<code>strip_highlight</code>（去 <code>&lt;em&gt;</code> 标签，搜索命中词会带）、<code>secure_url</code>（http→https）、<code>join_artists</code>（singer[] 拼接）。</p>
+
+<h3>5.2 酷狗搜索（search.rs，M1）</h3>
+<table>
+  <tr><th>类型</th><th>上游</th><th>说明</th></tr>
+  <tr><td>单曲</td><td><code>mobilecdn.kugou.com/api/v3/search/song</code></td><td><strong>headless 现用端点即桌面端 searchSongsMobile 同款</strong>——只需在返回前插入 normalizeFromMobile 映射（含 <code>group[]</code> 展开去重、hashes 四档位提取）</td></tr>
+  <tr><td>专辑/歌手/歌单</td><td>酷狗网关（<code>x-router</code> 头路由，complexsearch 等）</td><td>依赖 M0 的 signature_web_params；每类一个网关调用 + 映射</td></tr>
+</table>
+
+<h3>5.3 登录链路（M2）</h3>
+<pre><code><span class="cm">// 酷狗 login_qr_key：GET login-user.kugou.com/v2/qrcode</span>
+<span class="cm">//   公共参数 dfid=-, mid={mid}, uuid=-, appid=1001, clientver, clienttime={unix秒},
+<span class="cm">//   signature={signature_web_params(全部参数)}；业务参数 type=1, plat=4, srcappid=2919,
+<span class="cm">//   qrcode_txt="https://h5.kugou.com/apps/loginQRCode/html/index.html?appid=1005&"
+<span class="cm">//   → {code:200, key: data.qrcode, content: "...index.html?qrcode={key}"}</span>
+
+<span class="cm">// 酷狗 login_qr_check：GET /v2/get_userinfo_qrcode?plat=4&appid=1005&srcappid=2919&qrcode={key}</span>
+<span class="cm">//   → {code:200, status, nickname, avatarUrl}；status==4 时同响应 data 含 token/userid/vip_token
+<span class="cm">//     ——凭据直接落库（online_apis.rs 侧调 save_account_cookies("kugou", ...)），无需二次换取</span>
+
+<span class="cm">// 酷狗 user_detail：POST 网关 /v3/get_my_info，x-router: usercenter.kugou.com</span>
+<span class="cm">//   p = rsa_encrypt_kugou({token, clienttime}).toUpperCase()，userid 参数
+<span class="cm">//   → data.nickname/username/user_name + userpic/avatar + vip_type</span>
+
+<span class="cm">// QQ user_detail：GET c.y.qq.com/rsc/fcgi-bin/fcg_get_profile_homepage.fcg
+<span class="cm">//   ?cid=205360838&userid={uin}&reqfrom=1&format=json&platform=yqq.json，Cookie + Referer y.qq.com
+<span class="cm">//   → data.creator.{nick,headpic,is_vip,is_super_vip,vip_level}；失败降级 QQ用户_{uin后4位}</span>
+<span class="cm">//   头像兜底 q.qlogo.cn/headimg_dl?dst_uin={uin}&spec=100</span></code></pre>
+
+<h3>5.4 播放地址（M3）</h3>
+<table>
+  <tr><th></th><th>酷狗（优先）</th><th>QQ</th></tr>
+  <tr><td>核心算法</td><td><code>key = sign_key(hash, mid, userid, appid)</code>（4.1 的第二个盐）+ 网关请求，返回各档位 URL</td><td>3DES 加密请求体 → fcg_vkey(songmid+songtype+filename) → <code>purl</code>（CDN 签名地址，有时效）</td></tr>
+  <tr><td>鲁棒性</td><td>档位由 hashes（128k/320k/flac/flac24bit）决定</td><td>purl 可能 403 → Range 探测循环 + 档位降级链 128→320→flac</td></tr>
+  <tr><td>参考实现</td><td>桌面 song_url.ts 仅 55 行（crypto 基建 M0 已建）</td><td>桌面 song_url.ts 219 行 + tripledes.ts 421 行</td></tr>
+  <tr><td>工时</td><td>≈3h</td><td>≈8h（3DES 移植 4h + fcg 调用 2h + 探测 1h + 调试 1h）</td></tr>
+</table>
+
+<h2 id="wiring">六、接线改造（online_apis.rs 最小 diff）</h2>
+
+<div class="card warn">
+<p><strong>已核实的接线事实（2026-08-30）</strong>：routes.rs:1363 调用 <code>dispatch_api_call(payload, &state.db)</code>——DB 在分派层就可用；现有 <code>call_qqmusic(name, params)</code> / <code>call_kugou(name, params)</code> 签名无 db（netease 有）；响应统一走 <code>ApiCallResponse::ok_data / err</code> 辅助方法。因此接线改动收敛为<strong>两个函数的签名 + 分派体</strong>，其余全在 crate 内。</p>
+</div>
+
+<pre><code><span class="cm">// online_apis.rs 改动 1：签名加 db（对齐 call_netease 的既有模式）</span>
+<span class="kw">async fn</span> <span class="fn">call_qqmusic</span>(db: &Arc<Mutex<Connection>>, name: &str, params: HashMap<String, Value>) -> ApiCallResponse {
+    <span class="kw">let</span> cookie = get_account_cookies(db, <span class="st">"qqmusic"</span>);      <span class="cm">// 复用既有 DB 函数（netease 同款）</span>
+    <span class="kw">let</span> client = QqmusicClient::new(cookie);              <span class="cm">// crate 构造，凭据注入</span>
+    <span class="kw">match</span> name {
+        <span class="st">"search"</span>      => to_resp(client.search(&SearchParams::from(&params)).await),
+        <span class="st">"user_detail"</span> => to_resp(client.user_detail().await),
+        <span class="st">"song_url"</span>    => to_resp(client.song_url(&SongUrlParams::from(&params)).await),
+        <span class="st">"lyric"</span>       => { <span class="cm">/* 保持现状：既有实现已可用，原样保留 */</span> }
+        _ => ApiCallResponse::err(<span class="st">"Unsupported QQ Music API"</span>),
+    }
+}
+<span class="cm">// call_kugou 同构：login_qr_key / login_qr_check / search / user_detail / song_url / lyric(现状)</span>
+
+<span class="cm">// 通用转换辅助（serde 一次）</span>
+<span class="kw">fn</span> <span class="fn">to_resp</span>&ltT: Serialize&gt;(r: Result&ltT, QqkgError&gt;) -> ApiCallResponse {
+    <span class="kw">match</span> r {
+        <span class="kw">Ok</span>(v)  => ApiCallResponse::ok_data(serde_json::to_value(v).unwrap_or_default()),
+        <span class="kw">Err</span>(e) => ApiCallResponse::err(e.to_string()),
+    }
+}
+
+<span class="cm">// online_apis.rs 改动 2：dispatch 内调用点加 db 实参（2 行）</span>
+<span class="cm">// "qqmusic" => call_qqmusic(db, name, params).await,
+<span class="cm">// "kugou"   => call_kugou(db, name, params).await,</span>
+
+<span class="cm">// headless-server/Cargo.toml 追加一行：</span>
+qqkg-api = { path = <span class="st">"../qqkg-api"</span> }</code></pre>
+
+<div class="card ok">
+<p><strong>零上游冲突复核</strong>：<code>native/qqkg-api/</code>（新建目录）与 <code>native/headless-server/</code> 均为 headless 独有（git 实证上游无此路径）；routes.rs 不动（proxy/apis/call 路由已存在）；前端零改动。纯 Rust 复核：crate 依赖全为 Rust crate（reqwest/serde/md5/num-bigint-dig/des），无任何进程调用。</p>
+</div>
+
+<h2 id="milestones">七、里程碑与工时</h2>
+
+<div class="phase-head"><div class="pnum" style="background:var(--green)">M0</div><div class="ptitle">crate 骨架 + 加密基建 <span class="tag ok">已完成 · 2026-08-30</span></div><div class="pest">实际用时 ≈1h</div></div>
+<ul>
+  <li>骨架 + 加密层全部落地，<strong>15/15 测试全绿</strong>，签名/MID/RSA 输出与桌面端逐字节一致（提交 <code>14054d3</code> + <code>29791e6</code>）</li>
+  <li>落地决策：crate 以<strong>空 <code>[workspace]</code> 表脱离根工作区</strong>，根 Cargo.toml 的 members 零改动（比改 members 列表更彻底的隔离）；测试命令为 <code>cargo test --manifest-path native/qqkg-api/Cargo.toml</code></li>
+  <li>实施中锁定的三个桌面端行为细节（已写入代码注释与单测）：
+    <br>① <code>rsaEncryptKugou</code> 返回<strong>小写</strong> hex（大写是调用方行为），明文<strong>左对齐</strong>零填充，超 128 字节<strong>静默截断</strong>（node <code>Buffer.copy</code> 语义）
+    <br>② <code>signatureWebParams</code> 是<strong>先拼 <code>k=v</code> 字符串再整体排序</strong>，与按键名排序在 <code>dfid/dfid2</code> 类前缀键上顺序不同（单测锁定）
+    <br>③ <code>calculateMid</code> 的 MD5 hex 视作 128 位无符号大整数转十进制，<code>u128::from_str_radix</code> 即可（无需 bigint）；设备指纹 <code>DEVICE_MID = 313977252576711075203126132950927082200</code></li>
+  <li>依赖：md5/num-bigint-dig/<strong>num-traits</strong>（<code>Num::from_str_radix</code> 所需，未 re-export）/serde/thiserror；M0 未引入 reqwest（M1 随客户端模块再加）</li>
+  <li><code>Cargo.lock</code> 已入库（独立 crate 的可复现构建）</li>
+</ul>
+
+<div class="phase-head"><div class="pnum">M1</div><div class="ptitle">搜索打通（S1）</div><div class="pest">1 ~ 1.5 天</div></div>
+<ul>
+  <li>QQ：QqmusicClient + search（四类型路由 + Mobile 接口 + 映射）</li>
+  <li>酷狗：KugouClient + 单曲 normalizeFromMobile；网关三类型（依赖 M0 签名）</li>
+  <li>online_apis.rs 接线（第六章 diff）</li>
+  <li>验收：Web UI 四 tab 出结果、翻页正确、封面/时长/VIP 标记正确（对应 S1 验收标准）</li>
+</ul>
+
+<div class="phase-head"><div class="pnum">M2</div><div class="ptitle">登录打通（S2）</div><div class="pest">1 天</div></div>
+<ul>
+  <li>酷狗 login_qr_key / login_qr_check + 凭据落库 + user_detail</li>
+  <li>QQ user_detail（Cookie 注入已在 Client 构造时完成）</li>
+  <li>验收：扫码全流程 / QQ 手动 Cookie 闭环 / 重启持久化（对应 S2 验收标准）</li>
+</ul>
+
+<div class="phase-head"><div class="pnum">M3</div><div class="ptitle">播放打通（S3）</div><div class="pest">酷狗 0.5 天 · QQ 1.5 天</div></div>
+<ul>
+  <li>酷狗 song_url（signKey + 档位）→ 点击播放出声</li>
+  <li>QQ qq_des 移植（对照单测）→ fcg_vkey → CDN 探测降级链</li>
+  <li>验收：两平台播放出声、音质档位正确（对应 S3 验收标准）</li>
+</ul>
+
+<div class="phase-head"><div class="pnum">M4</div><div class="ptitle">对齐 ncm-api-rs 覆盖度（可选，按需追加）</div><div class="pest">每平台 1~2 周</div></div>
+<ul>
+  <li>歌单详情 / 专辑详情 / 歌手热门歌曲 / 评论 / 排行榜 / 搜索建议等浏览类接口</li>
+  <li>架构已就位（api/ 每端点一文件的扩展模式），M4 只是"继续加文件"</li>
+</ul>
+
+<div class="dep">工时对照说明：integration plan 估 2.5~3.5 天（内嵌方案）；crate 化增加约 1 天（骨架/独立单测/接线），换来 ncm-api-rs 级的可维护与可扩展——M4 若有需求，这笔投入直接摊薄。</div>
+
+<h2 id="test">八、测试策略</h2>
+<table>
+  <tr><th>层级</th><th>手段</th><th>覆盖</th><th>时机</th></tr>
+  <tr><td>加密单测</td><td><code>cargo test -p qqkg-api</code>（Node 对照向量硬编码）</td><td>kg_sign / kg_rsa / qq_des 输出逐字节一致</td><td>M0 起，每次提交</td></tr>
+  <tr><td>映射单测</td><td>normalize 层用录制的原始 JSON fixture 测试</td><td>字段映射/stripHighlight/时长换算/hashes 提取</td><td>M1 起</td></tr>
+  <tr><td>接口集成</td><td>curl 直测（integration plan 7.1 节脚本原样复用）</td><td>四 tab / 登录 / song_url 各端点</td><td>每个里程碑</td></tr>
+  <tr><td>UI 冒烟</td><td>浏览器操作（integration plan 7.2 节场景）</td><td>搜索/扫码/手动 Cookie/播放全链路</td><td>M1/M2/M3 验收</td></tr>
+  <tr><td>回归</td><td><code>cargo check --workspace</code> + <code>pnpm typecheck:web</code></td><td>编译完整性与上游同步哨兵</td><td>每次提交</td></tr>
+</table>
+<div class="dep">音频信号链零接触（decoder/equalizer/tempo/bit-perfect 主线不受影响），无需 bit-compare 回归。</div>
+
+<h2 id="deps">九、依赖清单与约束符合性</h2>
+
+<pre><code><span class="cm"># native/qqkg-api/Cargo.toml（全部纯 Rust crate，无 C 绑定、无进程依赖）</span>
+[dependencies]
+reqwest        = { version = <span class="st">"0.12"</span>, features = [<span class="st">"json"</span>] }   <span class="cm"># 与 headless-server 同主版本</span>
+serde          = { version = <span class="st">"1"</span>, features = [<span class="st">"derive"</span>] }
+serde_json     = <span class="st">"1"</span>
+md5            = <span class="st">"0.7"</span>        <span class="cm"># 与 headless-server 同版本（已验证在用）</span>
+num-bigint-dig = <span class="st">"0.8"</span>    <span class="cm"># RSA no-padding 模幂（M0）</span>
+des            = <span class="st">"0.8"</span>        <span class="cm"># 3DES（M3-QQ 才用，可随 M3 再加）</span>
+thiserror      = <span class="st">"2"</span>
+tracing        = <span class="st">"0.1"</span>
+urlencoding    = <span class="st">"2"</span>        <span class="cm"># 同 headless-server</span>
+
+[dev-dependencies]
+tokio = { version = <span class="st">"1"</span>, features = [<span class="st">"rt"</span>, <span class="st">"macros"</span>] }</code></pre>
+
+<table>
+  <tr><th>硬约束</th><th>符合性</th></tr>
+  <tr><td>纯 Rust、零 Node 运行时</td><td><span class="tag ok">符合</span> 依赖全 Rust crate；Node 仅 dev 期生成对照向量；运行形态不变（单一二进制）</td></tr>
+  <tr><td>上游零冲突</td><td><span class="tag ok">符合</span> 新目录 native/qqkg-api/ 上游不存在（git 实证）；online_apis.rs 为 headless 独有；routes.rs 不动</td></tr>
+  <tr><td>前端零改动</td><td><span class="tag ok">符合</span> 翻译层在 Rust 侧输出桌面端规范化格式</td></tr>
+  <tr><td>不碰音频信号链</td><td><span class="tag ok">符合</span> 全部改动在在线音源 API 层，与 bit-perfect 主线正交</td></tr>
+</table>
+
+<h2 id="risk">十、风险与提交切分</h2>
+
+<table>
+  <tr><th>风险</th><th>缓解</th></tr>
+  <tr><td>酷狗网关签名被风控</td><td>固定 mid 模拟稳定设备；签名参数逐字段与桌面端 diff（抓桌面实际请求对照）；M0 单测锁定向量</td></tr>
+  <tr><td>RSA no-padding 填充方向移植错</td><td>Node 对照单测逐字节断言（4.5 节）</td></tr>
+  <tr><td>3DES 常量/填充移植错</td><td>同上；QQ 3DES 有开源参考实现可交叉验证</td></tr>
+  <tr><td>QQ Mobile 接口字段漂移</td><td>映射全用 <code>.unwrap_or_default()</code> 容错，缺字段出空值不出错</td></tr>
+  <tr><td>Cookie/token 过期</td><td>user_detail 失败返回 loggedIn:false，前端既有逻辑自动清 profile（与桌面行为一致）</td></tr>
+</table>
+
+<h3>提交切分（10 个独立提交，全部 <code>native/</code> 范围）</h3>
+<ol>
+  <li><code>feat(qqkg-api): crate 骨架与错误/类型/规范化基建</code></li>
+  <li><code>feat(qqkg-api): 酷狗加密层（网关签名/MID/RSA no-padding）与对照单测</code></li>
+  <li><code>feat(qqkg-api): QQ 四类型搜索与规范化映射</code></li>
+  <li><code>feat(qqkg-api): 酷狗搜索单曲与三类型网关映射</code></li>
+  <li><code>feat(headless): online_apis 接入 qqkg-api 搜索链路</code></li>
+  <li><code>feat(qqkg-api): 酷狗扫码登录与状态轮询契约</code></li>
+  <li><code>feat(qqkg-api): 双平台 user_detail 与凭据注入</code></li>
+  <li><code>feat(headless): online_apis 接入登录链路（db 参数透传）</code></li>
+  <li><code>feat(qqkg-api): 酷狗 song_url 在线播放解析</code></li>
+  <li><code>feat(qqkg-api): QQ 3DES 移植与 song_url（fcg_vkey + CDN 探测）</code></li>
+</ol>
+
+<div class="footer">
+  <p>依据（2026-08-30 全部源码实证）：接线层——routes.rs:1363 dispatch 签名（payload, &state.db）、online_apis.rs:317/439 call_qqmusic/call_kugou 现签名、:33-52 ApiCallRequest/ApiCallResponse 结构与 ok_data/ok_body/err 辅助方法、:345-361 search 分支参数解析与 request.data 提取、:341 search_type 硬编码；桌面参考——qqmusic/modules/search.ts:78-180（DoSearchForQQMusicMobile + 四类型映射）、user_detail.ts、song_url.ts(219 行)+core/tripledes.ts(421 行)、kugou/modules/search.ts:200-318（normalizeFromMobile/Legacy）、login_qr.ts、user_detail.ts、song_url.ts(55 行)、core/crypto.ts(177 行)；架构先例——/home/songlian/ncm-api-rs（395 文件/12035 行，api/ 每端点一文件 + crypto.rs + server feature）；约束符合性——git cat-file 上游文件集验证、Cargo.toml 依赖全览、ps/systemctl 部署形态验证。</p>
+</div>
+
+</div>
+</body>
+</html>

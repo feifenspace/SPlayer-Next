@@ -8,6 +8,8 @@ import { useUserStore } from "@/stores/user";
 import { resolveNeteaseUrl } from "@/apis/song/netease";
 import { resolveQQMusicUrl } from "@/apis/song/qqmusic";
 import { resolveKugouUrl } from "@/apis/song/kugou";
+import { resolveQobuzUrl } from "@/apis/song/qobuz";
+import { resolveTidalUrl } from "@/apis/song/tidal";
 import { ErrorCode } from "@shared/types/errors";
 import { handleError } from "@/utils/errors";
 
@@ -16,6 +18,8 @@ const PLATFORM_TO_PLUGIN_SOURCE: Record<Platform, string> = {
   netease: "wy",
   qqmusic: "tx",
   kugou: "kg",
+  qobuz: "qobuz",
+  tidal: "tidal",
 };
 
 /** 解析选项 */
@@ -35,7 +39,11 @@ export interface ResolveTrackSourceOptions {
  * @param source - 要检查的 source
  */
 const isOnlinePlatform = (source: TrackSource): source is Platform =>
-  source === "netease" || source === "qqmusic" || source === "kugou";
+  source === "netease" ||
+  source === "qqmusic" ||
+  source === "kugou" ||
+  source === "qobuz" ||
+  source === "tidal";
 
 /**
  * 派生缓存键
@@ -203,6 +211,30 @@ const resolveOnlineUrl = async (
       officialErrorCode = resolved.errorCode;
     } catch (err) {
       console.warn("[audio-source] official Kugou URL resolve failed:", err);
+      officialErrorCode = ErrorCode.URL_RESOLVE_FAILED;
+    }
+  }
+  if (track.source === "qobuz" && !options.skipOfficialOnline) {
+    try {
+      const resolved = await resolveQobuzUrl(track, songLevel);
+      if (resolved.available) {
+        return { ok: true, url: resolved.url, isTrial: false, provider: "official" };
+      }
+      officialErrorCode = resolved.errorCode;
+    } catch (err) {
+      console.warn("[audio-source] official Qobuz URL resolve failed:", err);
+      officialErrorCode = ErrorCode.URL_RESOLVE_FAILED;
+    }
+  }
+  if (track.source === "tidal" && !options.skipOfficialOnline) {
+    try {
+      const resolved = await resolveTidalUrl(track, songLevel);
+      if (resolved.available) {
+        return { ok: true, url: resolved.url, isTrial: false, provider: "official" };
+      }
+      officialErrorCode = resolved.errorCode;
+    } catch (err) {
+      console.warn("[audio-source] official TIDAL URL resolve failed:", err);
       officialErrorCode = ErrorCode.URL_RESOLVE_FAILED;
     }
   }

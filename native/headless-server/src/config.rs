@@ -20,6 +20,8 @@ pub struct Config {
     pub web_root: Option<PathBuf>,
     /// 默认连接的 Diretta Target 目标地址（如 fe80::5241:b9ff:fe70:f9d2%2）
     pub diretta_target: Option<String>,
+    /// 流媒体出网代理（如 http://127.0.0.1:7890 或 http://192.168.31.46:7890）
+    pub proxy: Option<String>,
 }
 
 impl Default for Config {
@@ -32,6 +34,7 @@ impl Default for Config {
             database_path: None,
             web_root: None,
             diretta_target: None,
+            proxy: None,
         }
     }
 }
@@ -39,7 +42,21 @@ impl Default for Config {
 impl Config {
     /// 从 YAML 文件加载配置并合并环境变量
     pub fn load() -> anyhow::Result<Self> {
-        let paths = ["config.yaml", "config.yml", "/etc/splayer/config.yaml"];
+        let mut paths = vec![
+            "config/config.yaml",
+            "config/config.yml",
+            "/opt/splayer-headless/config/config.yaml",
+            "/opt/splayer-headless/config/config.yml",
+            "config.yaml",
+            "config.yml",
+            "/etc/splayer-headless/config.yaml",
+            "/etc/splayer/config.yaml",
+        ];
+
+        let custom_path = std::env::var("SPLAYER_CONFIG_PATH").ok();
+        if let Some(ref p) = custom_path {
+            paths.insert(0, p.as_str());
+        }
 
         let mut config = Self::default();
 
@@ -71,6 +88,21 @@ impl Config {
         }
         if let Ok(diretta) = std::env::var("SPLAYER_DIRETTA_TARGET") {
             config.diretta_target = Some(diretta);
+        }
+        if let Ok(proxy) = std::env::var("SPLAYER_PROXY")
+            .or_else(|_| std::env::var("QOBUZ_PROXY"))
+            .or_else(|_| std::env::var("HTTPS_PROXY"))
+            .or_else(|_| std::env::var("https_proxy"))
+            .or_else(|_| std::env::var("ALL_PROXY"))
+            .or_else(|_| std::env::var("all_proxy"))
+        {
+            config.proxy = Some(proxy);
+        }
+
+        if let Some(ref p) = config.proxy {
+            if !p.is_empty() {
+                std::env::set_var("QOBUZ_PROXY", p);
+            }
         }
 
         Ok(config)

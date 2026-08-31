@@ -1068,31 +1068,53 @@ export const initPlayer = async (): Promise<void> => {
   } catch (error) {
     console.error("[player] requestSnapshot failed", error);
   }
+  // 检查服务端当前是否已经在播放或暂停状态（如 Headless 后台守护进程持续播放中）
+  let isServerActive = false;
+  try {
+    const serverStatus = await window.api.player.getStatus();
+    if (serverStatus.success && serverStatus.data) {
+      if (serverStatus.data.state === "playing" || serverStatus.data.state === "paused") {
+        isServerActive = true;
+        status.state = serverStatus.data.state;
+        status.position = serverStatus.data.position;
+        status.duration = serverStatus.data.duration;
+        playback.setDuration(serverStatus.data.duration);
+        playback.setCurrentTime(serverStatus.data.position, { force: true });
+        playback.setPlaying(serverStatus.data.state === "playing");
+      }
+    }
+  } catch (error) {
+    console.error("[player] getStatus failed", error);
+  }
+
   const lastTrack = status.currentTrack;
   if (lastTrack) {
     const lastPosition = status.position;
     media.setTrack(lastTrack);
     media.setPlaybackContext(status.currentPlaybackContext);
     lyricLoader.beginLoad();
-    const loaded = await loadTrackSourceWithFallback(
-      lastTrack,
-      status.currentPlaybackContext,
-      settings.system.player.autoPlay,
-      () => true,
-    );
-    if (loaded.status === "loaded" && loaded.result.ok) {
-      if (settings.system.player.rememberLastTrack && lastPosition > 0) {
-        await seek(lastPosition);
+    if (!isServerActive) {
+      const loaded = await loadTrackSourceWithFallback(
+        lastTrack,
+        status.currentPlaybackContext,
+        settings.system.player.autoPlay,
+        () => true,
+      );
+      if (loaded.status === "loaded" && loaded.result.ok) {
+        if (settings.system.player.rememberLastTrack && lastPosition > 0) {
+          await seek(lastPosition);
+        }
+        if (loaded.resolved.cacheRequest) {
+          cacheScheduler.schedule(lastTrack.id, loaded.resolved.cacheRequest);
+        }
+      } else {
+        status.state = "idle";
       }
-      if (loaded.resolved.cacheRequest) {
-        cacheScheduler.schedule(lastTrack.id, loaded.resolved.cacheRequest);
-      }
-    } else {
-      status.state = "idle";
     }
-  } else {
+  } else if (!isServerActive) {
     status.state = "idle";
   }
+
   // 下一首预载的监听器
   installNextTrackPreloadWatchers();
   scheduleNextTrackPreload();

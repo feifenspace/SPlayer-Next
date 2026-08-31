@@ -18,8 +18,11 @@ num-traits = "0.2"
 thiserror = "2"
 reqwest = { version = "0.12", features = ["json"] }
 urlencoding = "2"
-# 仅用 tokio::time::sleep（QM 重试退避）；reqwest 本身已依赖 tokio，无新增编译成本
 tokio = { version = "1", features = ["time"] }
+flate2 = "1"
+base64 = "0.22"
+regex = "1"
+
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread"] }

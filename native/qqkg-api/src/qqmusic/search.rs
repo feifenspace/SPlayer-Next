@@ -88,10 +88,11 @@ fn qq_singer_names(singers: &Value) -> String {
         .unwrap_or_default()
 }
 
-fn normalize_song(song: &Value) -> Value {
+pub(crate) fn normalize_song(song: &Value) -> Value {
     let album = song.get("album").cloned().unwrap_or(Value::Null);
     let file = song.get("file").cloned().unwrap_or(Value::Null);
     let pay = song.get("pay").cloned().unwrap_or(Value::Null);
+
 
     let album_mid = album.get("mid").and_then(Value::as_str).unwrap_or_default();
     let album_pmid = album.get("pmid").and_then(Value::as_str).unwrap_or_default();

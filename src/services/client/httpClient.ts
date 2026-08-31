@@ -510,6 +510,40 @@ export class HttpPlayerClient implements IPlayerClient {
   // --- IPlayerClient 接口实现 ---
 
   async load(source: string, options?: LoadOptions): Promise<IpcResponse<LoadResult>> {
+    // 若为冷启动恢复（autoPlay: false，如 initPlayer），且服务端当前已处于播放/暂停状态，直接复用状态，不重载打断
+    if (options?.autoPlay === false) {
+      try {
+        const statusRes = await this.getStatus();
+        if (
+          statusRes.success &&
+          statusRes.data &&
+          (statusRes.data.state === "playing" || statusRes.data.state === "paused")
+        ) {
+          return {
+            success: true,
+            data: {
+              detail: {
+                quality: {
+                  sampleRate: 44100,
+                  channels: 2,
+                  bitsPerSample: 16,
+                  bitRate: 1411200,
+                  codec: "flac",
+                },
+                externalLyrics: [],
+              },
+              mediaInfo: {
+                duration: statusRes.data.duration,
+                cover: options?.meta?.cover,
+              },
+            },
+          };
+        }
+      } catch {
+        // 忽略状态探测错误
+      }
+    }
+
     const res = await this.request<{
       status: string;
       source: string;
@@ -558,7 +592,7 @@ export class HttpPlayerClient implements IPlayerClient {
         externalLyrics: [],
       },
       mediaInfo: {
-        duration: payload?.duration ?? options?.meta?.duration ?? 0,
+        duration: payload?.duration != null ? Math.round(payload.duration * 1000) : (options?.meta?.duration ?? 0),
         cover: payload?.cover ?? options?.meta?.cover,
       },
     };
