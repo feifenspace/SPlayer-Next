@@ -565,6 +565,25 @@ export class HttpPlayerClient implements IPlayerClient {
         body: JSON.stringify({
           source,
           auto_play: options?.autoPlay ?? true,
+          meta: options?.meta
+            ? {
+                id: options.meta.id,
+                title: options.meta.title,
+                artist: Array.isArray(options.meta.artists)
+                  ? options.meta.artists.map((a: any) => (typeof a === "string" ? a : a.name)).join(", ")
+                  : (options.meta as any).artist,
+                album:
+                  typeof options.meta.album === "string"
+                    ? options.meta.album
+                    : options.meta.album?.name,
+                duration: options.meta.duration,
+                track: options.meta.track,
+                cue_path: options.meta.cuePath,
+                cue_audio_path: options.meta.cueAudioPath,
+                cue_start_ms: options.meta.cueStartMs,
+                cue_end_ms: options.meta.cueEndMs,
+              }
+            : undefined,
         }),
       },
     );

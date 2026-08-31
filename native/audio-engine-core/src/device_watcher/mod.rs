@@ -1,19 +1,27 @@
 use anyhow::Result;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "windows",
+    all(target_os = "linux", feature = "pipewire"),
+    target_os = "macos"
+)))]
 mod unsupported;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "pipewire"))]
 use linux::Backend as SelectedBackend;
 #[cfg(target_os = "macos")]
 use macos::Backend as SelectedBackend;
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "windows",
+    all(target_os = "linux", feature = "pipewire"),
+    target_os = "macos"
+)))]
 use unsupported::Backend as SelectedBackend;
 #[cfg(target_os = "windows")]
 use windows::Backend as SelectedBackend;
@@ -63,7 +71,7 @@ mod tests {
             is_supported(),
             cfg!(any(
                 target_os = "windows",
-                target_os = "linux",
+                all(target_os = "linux", feature = "pipewire"),
                 target_os = "macos"
             ))
         );

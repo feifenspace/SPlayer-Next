@@ -106,9 +106,26 @@ pub struct SeekRequest {
 #[derive(Debug, Deserialize)]
 pub struct LoadRequest {
     /// 音轨源路径或 URL
-    source: String,
+    pub source: String,
     /// 是否自动播放（默认 true）
-    auto_play: Option<bool>,
+    pub auto_play: Option<bool>,
+    /// 伴随元数据（用于前端传递 CUE 分轨信息）
+    pub meta: Option<LoadMeta>,
+}
+
+/// 前端传递的音轨元数据
+#[derive(Debug, Deserialize)]
+pub struct LoadMeta {
+    pub id: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration: Option<u64>,
+    pub track: Option<u16>,
+    pub cue_path: Option<String>,
+    pub cue_audio_path: Option<String>,
+    pub cue_start_ms: Option<u64>,
+    pub cue_end_ms: Option<u64>,
 }
 
 // -------------------------------------------------------------------
@@ -494,7 +511,28 @@ async fn load_handler(
         )
     };
 
-    let source_for_decoder = source.clone();
+    let mut source_for_decoder = source.clone();
+    if source.starts_with("cue://") {
+        let conn = state.db.lock();
+        if let Ok(Some(track)) = crate::db::get_track_by_path(&conn, &source) {
+            if let Some(audio_path) = track.cue_audio_path {
+                let start_sec = track.cue_start_ms.unwrap_or(0) as f64 / 1000.0;
+                let dur_sec = track.duration as f64 / 1000.0;
+                let track_num = track.track.unwrap_or(1);
+                source_for_decoder = format!("{}|{:.3}|{:.3}|{}", audio_path, start_sec, dur_sec, track_num);
+                tracing::info!("CUE virtual track resolved to physical source: {}", source_for_decoder);
+            }
+        }
+    } else if let Some(ref meta) = payload.meta {
+        if let Some(start_ms) = meta.cue_start_ms {
+            let audio_path = meta.cue_audio_path.as_deref().unwrap_or(&source);
+            let start_sec = start_ms as f64 / 1000.0;
+            let dur_sec = meta.duration.unwrap_or(0) as f64 / 1000.0;
+            let track_num = meta.track.unwrap_or(1);
+            source_for_decoder = format!("{}|{:.3}|{:.3}|{}", audio_path, start_sec, dur_sec, track_num);
+            tracing::info!("CUE metadata resolved to physical source: {}", source_for_decoder);
+        }
+    }
     let result = spawn_isolated_blocking("player-load-worker", move || {
         if let Some(h) = old_threads.join_aux() {
             let _ = h.join();
@@ -694,6 +732,7 @@ async fn seek_handler(
                 let load_req = LoadRequest {
                     source,
                     auto_play: Some(was_playing),
+                    meta: None,
                 };
                 let load_query = LoadQuery {
                     cancel_handle_id: None,
@@ -919,11 +958,18 @@ async fn library_scan_handler(
                     scanned,
                     total,
                     removed_paths,
+                    cue_files,
                     ..
                 } => {
-                    if !removed_paths.is_empty() {
+                    {
                         let mut conn = state_for_cb.db.lock();
-                        let _ = crate::db::delete_tracks_by_paths(&mut conn, &removed_paths);
+                        if !removed_paths.is_empty() {
+                            let _ = crate::db::delete_tracks_by_paths(&mut conn, &removed_paths);
+                        }
+                        if !cue_files.is_empty() {
+                            let cover_cache_dir = state_for_cb.config.resolved_cover_cache_dir();
+                            let _ = crate::db::sync_cue_tracks(&mut conn, &cue_files, Some(&cover_cache_dir));
+                        }
                     }
                     let _ = state_for_cb
                         .scan_tx

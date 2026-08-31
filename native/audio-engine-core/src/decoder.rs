@@ -82,6 +82,8 @@ pub struct DecoderData {
     fft_resampler: Resampler,
     /// 网络中断句柄仅由远端源持有，stop() 取消后可在 seek 前重置
     cancel_handle: Option<HttpCancelHandle>,
+    /// CUE 虚拟分轨参数（起始偏移与截断时长）
+    pub cue_info: Option<crate::cue::CueVirtualInfo>,
 }
 
 /// 已打开且完成元数据读取的音源，等待按实际输出流采样率创建重采样器
@@ -90,6 +92,8 @@ pub struct PreparedDecoder {
     metadata: AudioMetadata,
     replay_gain_db: Option<f32>,
     cancel_handle: Option<HttpCancelHandle>,
+    /// CUE 虚拟分轨参数
+    pub cue_info: Option<crate::cue::CueVirtualInfo>,
 }
 
 impl PreparedDecoder {
@@ -120,7 +124,12 @@ impl DecoderData {
         if let Some(handle) = &self.cancel_handle {
             handle.reset();
         }
-        let target = Duration::from_secs_f64(position_secs);
+        let actual_pos = if let Some(cue) = &self.cue_info {
+            cue.start_time + position_secs
+        } else {
+            position_secs
+        };
+        let target = Duration::from_secs_f64(actual_pos);
         if self.reader.seek(target, SeekMode::Accurate).is_err()
             && self.reader.seek(target, SeekMode::Coarse).is_err()
         {
@@ -155,12 +164,13 @@ pub fn prepare_decode(
     let (reader, cancel_handle) = open_source(source, cancel_handle)?;
 
     let info = reader.source_info();
+    let cue_info = crate::cue::parse_cue_virtual_path(source);
     let mut duration_secs = reader.duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
-    if let Some(cue_info) = crate::cue::parse_cue_virtual_path(source) {
-        if cue_info.duration > 0.0 {
-            duration_secs = cue_info.duration;
-        } else if duration_secs > cue_info.start_time {
-            duration_secs -= cue_info.start_time;
+    if let Some(ref cue) = cue_info {
+        if cue.duration > 0.0 {
+            duration_secs = cue.duration;
+        } else if duration_secs > cue.start_time {
+            duration_secs -= cue.start_time;
         }
     }
     let stream_info = metadata::extract_stream_info(info);
@@ -200,6 +210,7 @@ pub fn prepare_decode(
         metadata,
         replay_gain_db,
         cancel_handle,
+        cue_info,
     })
 }
 
@@ -219,6 +230,7 @@ pub fn start_prepared_decode(
         mut metadata,
         replay_gain_db,
         cancel_handle,
+        cue_info,
     } = prepared;
     let target_rate = shared.sample_rate();
     let (player_resampler, fft_resampler) =
@@ -237,6 +249,7 @@ pub fn start_prepared_decode(
         player_resampler,
         fft_resampler,
         cancel_handle: cancel_handle.clone(),
+        cue_info,
     };
 
     let handle = thread::Builder::new()
@@ -437,6 +450,16 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
     let mut loudness = LoudnessAnalyzer::new(shared.sample_rate(), shared.channels());
     loudness.set_has_replay_gain(has_replay_gain);
 
+    // CUE 边界限制（最大解码播放样本总数）
+    let max_player_samples = data.cue_info.as_ref().and_then(|cue| {
+        if cue.duration > 0.0 {
+            Some((cue.duration * shared.sample_rate() as f64 * shared.channels() as f64).round() as u64)
+        } else {
+            None
+        }
+    });
+    let mut total_player_samples: u64 = 0;
+
     // 用于日志诊断：记录是否曾成功解码过帧
     let mut had_success = false;
 
@@ -444,6 +467,13 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
         // 背压：缓冲区满时阻塞等待消费
         if !shared.wait_for_space() {
             return;
+        }
+
+        if let Some(max) = max_player_samples {
+            if total_player_samples >= max {
+                debug!("CUE 分轨播放已达指定时长上限 ({} samples)，结束当前音轨解码", max);
+                break;
+            }
         }
 
         match data.reader.receive_frame() {
@@ -474,6 +504,18 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
                 }
                 had_success = true;
 
+                let mut reached_cue_limit = false;
+                if let Some(max) = max_player_samples {
+                    if total_player_samples + player_samples.len() as u64 >= max {
+                        let keep = (max.saturating_sub(total_player_samples)) as usize;
+                        player_samples.truncate(keep);
+                        total_player_samples = max;
+                        reached_cue_limit = true;
+                    } else {
+                        total_player_samples += player_samples.len() as u64;
+                    }
+                }
+
                 if shared.is_normalization_enabled() && !player_samples.is_empty() {
                     let gain = if has_replay_gain {
                         shared.normalization_gain()
@@ -492,6 +534,11 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
                     player_samples,
                     fft_samples,
                 });
+
+                if reached_cue_limit {
+                    debug!("CUE 分轨播放达到精确边界，退出解码循环");
+                    break;
+                }
             }
             Ok(None) | Err(AudioError::Eof) => {
                 // EOF flush：把两个重采样器内部残留挤出来，否则最后几十毫秒丢

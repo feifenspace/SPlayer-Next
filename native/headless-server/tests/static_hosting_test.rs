@@ -61,6 +61,7 @@ fn create_app_with_web_root(web_root: std::path::PathBuf) -> (axum::Router, AppS
         database_path: None,
         web_root: Some(web_root),
         diretta_target: None,
+        proxy: None,
     };
     let state = AppState::new(&config).expect("Failed to create AppState");
     let router = build_router(state.clone());

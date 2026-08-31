@@ -22,6 +22,7 @@ async fn create_test_app_state() -> (AppState, tempfile::TempDir) {
         database_path: Some(db_path),
         web_root: None,
         diretta_target: None,
+        proxy: None,
     };
 
     let state = AppState::new(&config).expect("Failed to create AppState");

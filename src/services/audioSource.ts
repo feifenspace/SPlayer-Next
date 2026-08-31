@@ -280,7 +280,7 @@ export const resolveTrackSource = async (
 ): Promise<ResolvedTrackSource | null> => {
   // 本地文件
   if (track.source === "local") {
-    const localPath = track.cueAudioPath ?? track.path;
+    const localPath = (track.cuePath || track.path?.startsWith("cue://")) ? track.path : (track.cueAudioPath ?? track.path);
     return localPath ? { source: localPath, fromCache: false, provider: "local" } : null;
   }
   const settings = useSettingsStore();

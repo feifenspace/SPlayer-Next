@@ -337,13 +337,11 @@ install_packages() {
         command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
     done
 
-    # 音频输出编译依赖：上游 rodio→cpal 重构后，Linux 需要
-    # ALSA / PipeWire / PulseAudio 三套头文件（见 audio-engine-core/Cargo.toml）。
+    # 音频输出编译依赖：headless-server 采用纯 ALSA / Diretta 输出，
+    # 仅需 ALSA 开发头文件（见 audio-engine-core/Cargo.toml）。
     # 不能只在缺命令时才安装：命令齐全但缺系统库时同样无法编译。
     local missing_libs=()
     pkg-config --exists alsa || missing_libs+=("alsa")
-    pkg-config --exists libpipewire-0.3 || missing_libs+=("libpipewire-0.3")
-    pkg-config --exists libpulse || missing_libs+=("libpulse")
 
     if [[ ${#missing[@]} -eq 0 && ${#missing_libs[@]} -eq 0 ]]; then
         return 0
@@ -355,15 +353,13 @@ install_packages() {
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y \
             build-essential pkg-config curl git ca-certificates \
-            libasound2-dev libdbus-1-dev \
-            libpipewire-0.3-dev libpulse-dev
+            libasound2-dev libdbus-1-dev
     elif command -v dnf >/dev/null 2>&1; then
         dnf install -y gcc-c++ make pkg-config curl git ca-certificates \
-            alsa-lib-devel dbus-devel \
-            pipewire-devel pulseaudio-libs-devel
+            alsa-lib-devel dbus-devel
     elif command -v pacman >/dev/null 2>&1; then
         pacman -Sy --needed --noconfirm base-devel pkgconf curl git ca-certificates \
-            alsa-lib dbus pipewire libpulse
+            alsa-lib dbus
     else
         fatal "无法自动安装依赖，请手动安装：${missing[*]} ${missing_libs[*]}"
     fi

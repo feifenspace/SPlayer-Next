@@ -9,7 +9,7 @@ name = "headless-server"
 path = "src/main.rs"
 
 [dependencies]
-# 音频核心（headless 模式：关闭 FFT 频谱分析和 MIDI 合成器）
+# 音频核心（headless 模式：纯 ALSA / Diretta 输出，免去桌面级 PipeWire 动态库依赖；关闭 FFT 频谱和 MIDI）
 audio-engine-core = { path = "../audio-engine-core", default-features = false }
 
 # HTTP 框架

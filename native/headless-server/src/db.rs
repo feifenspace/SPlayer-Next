@@ -17,6 +17,10 @@ pub struct DbTrack {
     pub id: String,
     pub source: String,
     pub path: String,
+    pub cue_path: Option<String>,
+    pub cue_audio_path: Option<String>,
+    pub cue_start_ms: Option<u64>,
+    pub cue_end_ms: Option<u64>,
     pub title: String,
     pub track: Option<u16>,
     pub artist: Option<String>,
@@ -99,7 +103,11 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             file_size INTEGER NOT NULL,
             file_mtime INTEGER,
             file_ctime INTEGER,
-            scanned_at INTEGER NOT NULL
+            scanned_at INTEGER NOT NULL,
+            cue_path TEXT,
+            cue_audio_path TEXT,
+            cue_start_ms INTEGER,
+            cue_end_ms INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(title);
         CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album);
@@ -153,6 +161,13 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
         );
         "#,
     )?;
+
+    // 自动为已有数据库升级添加 CUE 字段
+    let _ = conn.execute("ALTER TABLE tracks ADD COLUMN cue_path TEXT", []);
+    let _ = conn.execute("ALTER TABLE tracks ADD COLUMN cue_audio_path TEXT", []);
+    let _ = conn.execute("ALTER TABLE tracks ADD COLUMN cue_start_ms INTEGER", []);
+    let _ = conn.execute("ALTER TABLE tracks ADD COLUMN cue_end_ms INTEGER", []);
+    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_cue_audio ON tracks(cue_audio_path)", []);
 
     Ok(conn)
 }
@@ -349,16 +364,249 @@ pub fn delete_tracks_by_paths(conn: &mut Connection, paths: &[String]) -> Result
     Ok(())
 }
 
-/// 获取全部曲目
+/// 格式化封面 URL 为 Web 规范路径 (/api/v1/covers/xxx)
+pub fn normalize_cover_url(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let raw_trimmed = raw.trim();
+    if raw_trimmed.is_empty() {
+        return None;
+    }
+    if raw_trimmed.starts_with("http://") || raw_trimmed.starts_with("https://") || raw_trimmed.starts_with("/api/v1/covers/") {
+        return Some(raw_trimmed.to_string());
+    }
+    if let Some(stripped) = raw_trimmed.strip_prefix("cache://covers/") {
+        return Some(format!("/api/v1/covers/{}", stripped));
+    }
+    if let Some(stripped) = raw_trimmed.strip_prefix("cache://") {
+        return Some(format!("/api/v1/covers/{}", stripped));
+    }
+    let p = std::path::Path::new(raw_trimmed);
+    if let Some(fname) = p.file_name().and_then(|f| f.to_str()) {
+        return Some(format!("/api/v1/covers/{}", fname));
+    }
+    Some(format!("/api/v1/covers/{}", raw_trimmed))
+}
+
+/// 同步解析 CUE 文件并向 tracks 写入虚拟分轨记录
+pub fn sync_cue_tracks(conn: &mut Connection, cue_files: &[String], cover_cache_dir: Option<&Path>) -> Result<usize> {
+    if cue_files.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.transaction()?;
+    let mut total_synced = 0;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let cache_dir_str = cover_cache_dir
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "data/covers".to_string());
+
+    {
+        let mut insert_stmt = tx.prepare_cached(
+            r#"
+            INSERT INTO tracks (
+                id, path, title, track, artist, album, duration,
+                cover, codec, sample_rate, bit_rate, channels,
+                bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+                cue_path, cue_audio_path, cue_start_ms, cue_end_ms
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17,
+                ?18, ?19, ?20, ?21
+            )
+            ON CONFLICT(path) DO UPDATE SET
+                title = excluded.title,
+                track = excluded.track,
+                artist = excluded.artist,
+                album = excluded.album,
+                duration = excluded.duration,
+                cover = excluded.cover,
+                codec = excluded.codec,
+                sample_rate = excluded.sample_rate,
+                bit_rate = excluded.bit_rate,
+                channels = excluded.channels,
+                bits_per_sample = excluded.bits_per_sample,
+                file_size = excluded.file_size,
+                file_mtime = excluded.file_mtime,
+                file_ctime = excluded.file_ctime,
+                scanned_at = excluded.scanned_at,
+                cue_path = excluded.cue_path,
+                cue_audio_path = excluded.cue_audio_path,
+                cue_start_ms = excluded.cue_start_ms,
+                cue_end_ms = excluded.cue_end_ms
+            "#,
+        )?;
+
+        for cue_file in cue_files {
+            let cue_path_obj = Path::new(cue_file);
+            if !cue_path_obj.is_file() {
+                continue;
+            }
+
+            let cue_sheet = match audio_engine_core::cue::CueSheet::parse_file(cue_file) {
+                Ok(sheet) => sheet,
+                Err(err) => {
+                    tracing::warn!("解析 CUE 文件失败 [{}]: {}", cue_file, err);
+                    continue;
+                }
+            };
+
+            let (cue_mtime, cue_ctime) = audio_engine_core::scanner::file_stat(cue_path_obj)
+                .map(|(m, c, _)| (m, c))
+                .unwrap_or((now, now));
+
+            // 从 CUE 文件所在目录智能提取封面
+            let folder_cover_from_cue = audio_engine_core::metadata::extract_folder_cover_thumbnail(
+                cue_file,
+                &cache_dir_str,
+            );
+
+            if cue_sheet.tracks.is_empty() {
+                continue;
+            }
+
+            for cue_track in &cue_sheet.tracks {
+                let physical_str = cue_track.physical_path.to_string_lossy().to_string();
+
+                // 查库获取母版音频参数
+                let parent_meta: Option<(u64, Option<String>, Option<String>, Option<u32>, Option<i64>, Option<u32>, Option<u32>, u64)> = tx
+                    .query_row(
+                        "SELECT duration, cover, codec, sample_rate, bit_rate, channels, bits_per_sample, file_size FROM tracks WHERE path = ?1",
+                        [&physical_str],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+                    )
+                    .optional()
+                    .unwrap_or(None);
+
+                let (parent_dur_ms, cover, codec, sample_rate, bit_rate, channels, bits_per_sample, file_size) = match parent_meta {
+                    Some(m) => m,
+                    None => {
+                        if let Some(scanned) = audio_engine_core::scanner::probe_fast(&physical_str, Some(&cache_dir_str)) {
+                            (
+                                (scanned.duration * 1000.0) as u64,
+                                scanned.cover,
+                                Some(scanned.codec),
+                                Some(scanned.sample_rate),
+                                Some(scanned.bit_rate),
+                                Some(scanned.channels),
+                                Some(scanned.bits_per_sample),
+                                scanned.file_size,
+                            )
+                        } else {
+                            (0, None, Some("wav".to_string()), Some(44100), Some(1411200), Some(2), Some(16), 0)
+                        }
+                    }
+                };
+
+                let effective_cover = cover
+                    .or_else(|| folder_cover_from_cue.clone())
+                    .or_else(|| audio_engine_core::metadata::extract_folder_cover_thumbnail(&physical_str, &cache_dir_str));
+                let cover_url = normalize_cover_url(effective_cover);
+
+                let cue_start_ms = (cue_track.start_time * 1000.0) as u64;
+                let duration_ms = if let Some(dur_sec) = cue_track.duration {
+                    (dur_sec * 1000.0) as u64
+                } else if parent_dur_ms > cue_start_ms {
+                    parent_dur_ms - cue_start_ms
+                } else {
+                    0
+                };
+                let cue_end_ms = cue_start_ms + duration_ms;
+
+                let track_virtual_path = format!("cue://{}#track={:02}", cue_file, cue_track.track_num);
+                let id = format!("local:{:x}", md5_hash(&track_virtual_path));
+
+                let title = cue_track
+                    .title
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| format!("Track {:02}", cue_track.track_num));
+
+                let artist = cue_track
+                    .artist
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| cue_sheet.global_performer.clone());
+
+                let album = cue_sheet
+                    .global_title
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        cue_path_obj
+                            .parent()
+                            .and_then(|p| p.file_name())
+                            .and_then(|s| s.to_str())
+                            .map(String::from)
+                    });
+
+                let _ = insert_stmt.execute(params![
+                    id,
+                    track_virtual_path,
+                    title,
+                    Some(cue_track.track_num),
+                    artist,
+                    album,
+                    duration_ms,
+                    cover_url,
+                    codec,
+                    sample_rate,
+                    bit_rate,
+                    channels,
+                    bits_per_sample,
+                    file_size,
+                    cue_mtime,
+                    cue_ctime,
+                    now,
+                    Some(cue_file.clone()),
+                    Some(physical_str),
+                    Some(cue_start_ms),
+                    Some(cue_end_ms),
+                ]);
+
+                total_synced += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    tracing::info!("成功同步 CUE 分轨数: {}", total_synced);
+    Ok(total_synced)
+}
+
+/// 根据 path 获取单首曲目详情
+pub fn get_track_by_path(conn: &Connection, path: &str) -> Result<Option<DbTrack>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            id, path, title, track, artist, album, duration,
+            cover, codec, sample_rate, bit_rate, channels,
+            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+            cue_path, cue_audio_path, cue_start_ms, cue_end_ms
+        FROM tracks
+        WHERE path = ?1
+        "#,
+    )?;
+
+    let track = stmt.query_row(params![path], row_to_track).optional()?;
+    Ok(track)
+}
+
+/// 获取全部曲目（自动排除被 CUE 分轨引用的容器整轨）
 pub fn get_all_tracks(conn: &Connection) -> Result<Vec<DbTrack>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
             id, path, title, track, artist, album, duration,
             cover, codec, sample_rate, bit_rate, channels,
-            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at
+            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+            cue_path, cue_audio_path, cue_start_ms, cue_end_ms
         FROM tracks
-        ORDER BY scanned_at DESC, id ASC
+        WHERE path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+        ORDER BY album ASC, CAST(track AS INTEGER) ASC, cue_start_ms ASC, path ASC
         "#,
     )?;
 
@@ -370,17 +618,19 @@ pub fn get_all_tracks(conn: &Connection) -> Result<Vec<DbTrack>> {
     Ok(list)
 }
 
-/// 按专辑获取曲目
+/// 按专辑获取曲目（自动排除容器整轨）
 pub fn get_tracks_by_album(conn: &Connection, album_name: &str) -> Result<Vec<DbTrack>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
             id, path, title, track, artist, album, duration,
             cover, codec, sample_rate, bit_rate, channels,
-            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at
+            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+            cue_path, cue_audio_path, cue_start_ms, cue_end_ms
         FROM tracks
         WHERE album = ?1
-        ORDER BY track ASC, title ASC
+          AND path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+        ORDER BY CAST(track AS INTEGER) ASC, cue_start_ms ASC, path ASC
         "#,
     )?;
 
@@ -392,21 +642,24 @@ pub fn get_tracks_by_album(conn: &Connection, album_name: &str) -> Result<Vec<Db
     Ok(list)
 }
 
-/// 按歌手获取曲目
+/// 按歌手获取曲目（自动排除容器整轨）
 pub fn get_tracks_by_artist(conn: &Connection, artist_name: &str) -> Result<Vec<DbTrack>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT
             id, path, title, track, artist, album, duration,
             cover, codec, sample_rate, bit_rate, channels,
-            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at
+            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+            cue_path, cue_audio_path, cue_start_ms, cue_end_ms
         FROM tracks
-        WHERE artist = ?1
-        ORDER BY album ASC, track ASC, title ASC
+        WHERE (artist = ?1 OR artist LIKE ?2)
+          AND path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+        ORDER BY album ASC, CAST(track AS INTEGER) ASC, cue_start_ms ASC, title ASC
         "#,
     )?;
 
-    let rows = stmt.query_map(params![artist_name], row_to_track)?;
+    let pattern = format!("%{}%", artist_name);
+    let rows = stmt.query_map(params![artist_name, pattern], row_to_track)?;
     let mut list = Vec::new();
     for row in rows {
         list.push(row?);
@@ -414,7 +667,7 @@ pub fn get_tracks_by_artist(conn: &Connection, artist_name: &str) -> Result<Vec<
     Ok(list)
 }
 
-/// 聚合获取专辑列表
+/// 聚合获取专辑列表（自动排除容器整轨）
 pub fn get_album_list(conn: &Connection) -> Result<Vec<AlbumSummary>> {
     let mut stmt = conn.prepare(
         r#"
@@ -425,15 +678,17 @@ pub fn get_album_list(conn: &Connection) -> Result<Vec<AlbumSummary>> {
             COUNT(*) as track_count
         FROM tracks
         WHERE album IS NOT NULL AND TRIM(album) != ''
+          AND path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
         GROUP BY album
         ORDER BY album ASC
         "#,
     )?;
 
     let rows = stmt.query_map([], |row| {
+        let raw_cover: Option<String> = row.get(1)?;
         Ok(AlbumSummary {
             name: row.get(0)?,
-            cover: row.get(1)?,
+            cover: normalize_cover_url(raw_cover),
             artist: row.get(2)?,
             track_count: row.get(3)?,
         })
@@ -446,7 +701,7 @@ pub fn get_album_list(conn: &Connection) -> Result<Vec<AlbumSummary>> {
     Ok(list)
 }
 
-/// 聚合获取歌手列表
+/// 聚合获取歌手列表（自动排除容器整轨）
 pub fn get_artist_list(conn: &Connection) -> Result<Vec<ArtistSummary>> {
     let mut stmt = conn.prepare(
         r#"
@@ -455,6 +710,7 @@ pub fn get_artist_list(conn: &Connection) -> Result<Vec<ArtistSummary>> {
             COUNT(*) as track_count
         FROM tracks
         WHERE artist IS NOT NULL AND TRIM(artist) != ''
+          AND path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
         GROUP BY artist
         ORDER BY artist ASC
         "#,
@@ -580,7 +836,8 @@ pub fn get_playlist_detail(conn: &Connection, id: &str) -> Result<Option<DbPlayl
         SELECT
             t.id, t.path, t.title, t.track, t.artist, t.album, t.duration,
             t.cover, t.codec, t.sample_rate, t.bit_rate, t.channels,
-            t.bits_per_sample, t.file_size, t.file_mtime, t.file_ctime, t.scanned_at
+            t.bits_per_sample, t.file_size, t.file_mtime, t.file_ctime, t.scanned_at,
+            t.cue_path, t.cue_audio_path, t.cue_start_ms, t.cue_end_ms
         FROM playlist_tracks pt
         JOIN tracks t ON pt.track_id = t.id
         WHERE pt.playlist_id = ?1
@@ -908,26 +1165,32 @@ pub fn get_play_history(conn: &Connection, limit: u32) -> Result<Vec<serde_json:
     Ok(list)
 }
 
-/// 获取媒体库统计
+/// 获取媒体库统计（自动排除容器整轨）
 pub fn get_library_stats(conn: &Connection) -> Result<DbLibraryStats> {
     let total_tracks: u32 = conn
-        .query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM tracks WHERE path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let total_duration_ms: u64 = conn
-        .query_row("SELECT COALESCE(SUM(duration), 0) FROM tracks", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT COALESCE(SUM(duration), 0) FROM tracks WHERE path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
     let total_artists: u32 = conn
         .query_row(
-            "SELECT COUNT(DISTINCT artist) FROM tracks WHERE artist IS NOT NULL AND TRIM(artist) != ''",
+            "SELECT COUNT(DISTINCT artist) FROM tracks WHERE artist IS NOT NULL AND TRIM(artist) != '' AND path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
     let total_albums: u32 = conn
         .query_row(
-            "SELECT COUNT(DISTINCT album) FROM tracks WHERE album IS NOT NULL AND TRIM(album) != ''",
+            "SELECT COUNT(DISTINCT album) FROM tracks WHERE album IS NOT NULL AND TRIM(album) != '' AND path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)",
             [],
             |r| r.get(0),
         )
@@ -945,7 +1208,8 @@ pub fn get_library_stats(conn: &Connection) -> Result<DbLibraryStats> {
 fn row_to_track(row: &rusqlite::Row) -> rusqlite::Result<DbTrack> {
     let artist_str: Option<String> = row.get(4)?;
     let album_str: Option<String> = row.get(5)?;
-    let cover_str: Option<String> = row.get(7)?;
+    let raw_cover: Option<String> = row.get(7)?;
+    let cover_str = normalize_cover_url(raw_cover);
 
     let artists = if let Some(ref name) = artist_str {
         vec![DbArtist { name: name.clone() }]
@@ -963,6 +1227,10 @@ fn row_to_track(row: &rusqlite::Row) -> rusqlite::Result<DbTrack> {
         id: row.get(0)?,
         source: "local".to_string(),
         path: row.get(1)?,
+        cue_path: row.get(17)?,
+        cue_audio_path: row.get(18)?,
+        cue_start_ms: row.get(19)?,
+        cue_end_ms: row.get(20)?,
         title: row.get(2)?,
         track: row.get(3)?,
         artist: artist_str,

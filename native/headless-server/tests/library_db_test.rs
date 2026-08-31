@@ -23,6 +23,7 @@ async fn create_test_library_app_state() -> (AppState, tempfile::TempDir) {
         database_path: Some(db_path),
         web_root: None,
         diretta_target: None,
+        proxy: None,
     };
 
     let state = AppState::new(&config).expect("Failed to create AppState");
@@ -259,4 +260,87 @@ async fn test_library_rest_endpoints() {
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_cue_sheet_sync_and_virtual_tracks() {
+    let (state, temp) = create_test_library_app_state().await;
+    let cue_dir = temp.path().join("cue_album");
+    std::fs::create_dir_all(&cue_dir).unwrap();
+
+    let wav_path = cue_dir.join("CDImage.wav");
+    std::fs::write(&wav_path, b"RIFF dummy wav file").unwrap();
+
+    let cue_content = r#"
+TITLE "Test CUE Album"
+PERFORMER "Various Artists"
+FILE "CDImage.wav" WAVE
+  TRACK 01 AUDIO
+    TITLE "Track 1 Title"
+    PERFORMER "Artist One"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Track 2 Title"
+    PERFORMER "Artist Two"
+    INDEX 01 03:20:00
+"#;
+    let cue_path = cue_dir.join("CDImage.cue");
+    std::fs::write(&cue_path, cue_content).unwrap();
+
+    // 1. 先模拟 scanner 扫描出母版音频并插入 tracks
+    {
+        let mut conn = state.db.lock();
+        let scanned = vec![audio_engine_core::scanner::ScannedTrack {
+            path: wav_path.to_string_lossy().to_string(),
+            title: Some("CDImage".to_string()),
+            artist: None,
+            album: None,
+            track: None,
+            duration: 420.0, // 7 分钟
+            codec: "wav".to_string(),
+            sample_rate: 44100,
+            bit_rate: 1411200,
+            channels: 2,
+            bits_per_sample: 16,
+            cover: None,
+            file_size: 10000000,
+            mtime: 1000,
+            ctime: 1000,
+        }];
+        db::upsert_scanned_tracks(&mut conn, &scanned).unwrap();
+    }
+
+    // 2. 执行 CUE 同步
+    {
+        let mut conn = state.db.lock();
+        let count = db::sync_cue_tracks(&mut conn, &[cue_path.to_string_lossy().to_string()], None).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // 3. 验证查询：母版 CDImage.wav 被自动隐藏，展示 2 首虚拟分轨
+    {
+        let conn = state.db.lock();
+        let all_tracks = db::get_all_tracks(&conn).unwrap();
+        assert_eq!(all_tracks.len(), 2);
+        assert_eq!(all_tracks[0].title, "Track 1 Title");
+        assert_eq!(all_tracks[0].artist.as_deref(), Some("Artist One"));
+        assert_eq!(all_tracks[0].album.as_ref().map(|a| a.name.as_str()), Some("Test CUE Album"));
+        assert_eq!(all_tracks[0].duration, 200000); // 3分20秒 = 200s = 200000ms
+
+        assert_eq!(all_tracks[1].title, "Track 2 Title");
+        assert_eq!(all_tracks[1].artist.as_deref(), Some("Artist Two"));
+        assert_eq!(all_tracks[1].duration, 220000); // 420s - 200s = 220s = 220000ms
+
+        // 专辑聚合
+        let albums = db::get_album_list(&conn).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].name, "Test CUE Album");
+        assert_eq!(albums[0].track_count, 2);
+
+        // 单轨获取
+        let t1 = db::get_track_by_path(&conn, &format!("cue://{}#track=01", cue_path.to_string_lossy())).unwrap().unwrap();
+        assert_eq!(t1.cue_audio_path.as_deref(), Some(wav_path.to_str().unwrap()));
+        assert_eq!(t1.cue_start_ms, Some(0));
+        assert_eq!(t1.cue_end_ms, Some(200000));
+    }
 }

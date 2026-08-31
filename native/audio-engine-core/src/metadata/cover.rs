@@ -46,6 +46,19 @@ pub fn extract_cover_thumbnail(
     Some(thumb_file.to_string_lossy().into_owned())
 }
 
+/// 从指定文件（音频或 CUE）所在目录提取外部封面图片并生成缩略图
+pub fn extract_folder_cover_thumbnail(source: &str, cache_dir: &str) -> Option<String> {
+    let thumb_file = cover_thumb_path(source, cache_dir);
+    if thumb_file.exists() {
+        return Some(thumb_file.to_string_lossy().into_owned());
+    }
+    let cover_path = find_folder_cover(source)?;
+    let data = std::fs::read(cover_path).ok()?;
+    std::fs::create_dir_all(cache_dir).ok()?;
+    generate_cover_thumbnail(&data, &thumb_file).ok()?;
+    Some(thumb_file.to_string_lossy().into_owned())
+}
+
 /// 拿原始封面字节（供 SMTC / 全屏播放器使用，不缓存）
 pub fn read_attached_pic(reader: &AudioReader) -> Option<Vec<u8>> {
     reader.cover().map(|cover| cover.data)

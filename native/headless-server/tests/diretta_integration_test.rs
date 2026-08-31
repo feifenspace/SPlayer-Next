@@ -18,6 +18,7 @@ async fn create_test_app_state() -> AppState {
         database_path: Some(db_path),
         web_root: None,
         diretta_target: None,
+        proxy: None,
     };
 
     AppState::new(&config).expect("Failed to create test AppState")

@@ -62,6 +62,7 @@ fn shared_normalization_state_is_updated_atomically() {
 }
 
 #[test]
+#[cfg(feature = "fft")]
 fn fft_analyzer_returns_fixed_sized_silent_spectrum() {
     let analyzer = FftAnalyzer::new();
     analyzer.set_enabled(true);

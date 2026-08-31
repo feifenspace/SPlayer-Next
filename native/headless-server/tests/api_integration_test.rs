@@ -22,6 +22,7 @@ async fn create_test_app_state() -> AppState {
         database_path: None,
         web_root: None,
         diretta_target: None,
+        proxy: None,
     };
     AppState::new(&config).expect("Failed to create AppState")
 }
@@ -204,6 +205,7 @@ async fn test_token_middleware() {
         database_path: None,
         web_root: None,
         diretta_target: None,
+        proxy: None,
     };
     let state = AppState::new(&config).expect("Failed to create AppState");
     let app = build_router(state);

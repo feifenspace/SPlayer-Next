@@ -91,9 +91,10 @@ pub fn resolve_audio_path<P: AsRef<Path>>(cue_dir: P, audio_filename: &str) -> P
             p.extension()
                 .and_then(|ext| ext.to_str())
                 .map(|ext| {
-                    KNOWN_AUDIO_EXTENSIONS
-                        .iter()
-                        .any(|&e| e.eq_ignore_ascii_case(ext))
+                    !ext.eq_ignore_ascii_case("cue")
+                        && KNOWN_AUDIO_EXTENSIONS
+                            .iter()
+                            .any(|&e| e.eq_ignore_ascii_case(ext))
                 })
                 .unwrap_or(false)
         })
