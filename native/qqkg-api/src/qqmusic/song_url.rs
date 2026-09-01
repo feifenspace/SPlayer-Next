@@ -332,8 +332,17 @@ impl QqmusicClient {
                 } else {
                     format!("{sip}{purl}")
                 };
-                matched = Some((cand, full_url));
-                break;
+
+                // 轻量级 HEAD 校验：腾讯部分母带(RS01)会下发虚拟 vkey 但 CDN 实际 404，通过 HEAD 验证确保 100% 可播
+                let is_available = match self.http.head(&full_url).send().await {
+                    Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 206,
+                    Err(_) => false,
+                };
+
+                if is_available {
+                    matched = Some((cand, full_url));
+                    break;
+                }
             }
         }
 
