@@ -547,12 +547,64 @@ async fn load_handler(
         }
     }
 
-/// 将远端 HTTP(S) 音频流下载并固化到本地临时 seekable 文件中，以便 Diretta Source Direct 模式进行精确解码与传输
+/// 获取安全的流媒体音频持久化缓存目录（避免挂载在小容量 /tmp tmpfs 上导致 No space left on device）
+fn get_stream_cache_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    let candidate_dirs = [
+        PathBuf::from("/opt/splayer-headless/data/cache/streams"),
+        PathBuf::from("data/cache/streams"),
+        PathBuf::from("/var/cache/splayer-headless/streams"),
+        std::env::temp_dir().join("splayer-stream-cache"),
+    ];
+
+    for dir in &candidate_dirs {
+        if std::fs::create_dir_all(dir).is_ok() {
+            let test_file = dir.join(".write_test");
+            if std::fs::write(&test_file, b"ok").is_ok() {
+                let _ = std::fs::remove_file(test_file);
+                return dir.clone();
+            }
+        }
+    }
+
+    std::env::temp_dir().join("splayer-stream-cache")
+}
+
+/// 自动清理过期的流媒体缓存，保持目录在合理大小（如最多保留最近 20 首曲目）
+fn clean_old_stream_cache(cache_dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if path.to_string_lossy().ends_with(".part") {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    files.push((path, mtime));
+                }
+            }
+        }
+        if files.len() > 20 {
+            files.sort_by_key(|(_, mtime)| *mtime);
+            let to_remove = files.len() - 20;
+            for (p, _) in files.into_iter().take(to_remove) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+}
+
+/// 将远端 HTTP(S) 音频流下载并固化到本地缓存文件中，以便 Diretta Source Direct 模式进行精确解码与传输
 fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     use std::fs::{self, File};
 
-    let temp_dir = std::env::temp_dir().join("splayer-direct-input");
-    let _ = fs::create_dir_all(&temp_dir);
+    let cache_dir = get_stream_cache_dir();
+    let _ = fs::create_dir_all(&cache_dir);
+    clean_old_stream_cache(&cache_dir);
 
     let hash = format!("{:x}", md5::compute(url.as_bytes()));
     let mut ext = if url.contains(".flac") {
@@ -572,7 +624,7 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     };
 
     if !ext.is_empty() {
-        let target_file = temp_dir.join(format!("{}.{}", hash, ext));
+        let target_file = cache_dir.join(format!("{}.{}", hash, ext));
         if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
             return Ok(target_file.to_string_lossy().to_string());
         }
@@ -613,12 +665,12 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
         ext = "audio";
     }
 
-    let target_file = temp_dir.join(format!("{}.{}", hash, ext));
+    let target_file = cache_dir.join(format!("{}.{}", hash, ext));
     if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(target_file.to_string_lossy().to_string());
     }
 
-    let part_file = temp_dir.join(format!("{}.{}.part", hash, ext));
+    let part_file = cache_dir.join(format!("{}.{}.part", hash, ext));
     let mut file = File::create(&part_file)?;
     std::io::copy(&mut response, &mut file)?;
     file.sync_all()?;
