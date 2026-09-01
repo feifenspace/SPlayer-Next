@@ -47,7 +47,7 @@ enum DirectDsdLayout {
         remaining: usize,
     },
     Sacd {
-        reader: crate::sacd::SacdTrackReader,
+        source: crate::sacd::SacdNativeSource,
     },
 }
 
@@ -63,11 +63,12 @@ impl DirectDsdReader {
     pub fn open_local(path: &Path) -> Result<Self> {
         let path_str = path.to_string_lossy();
         if let Some(sacd_info) = crate::sacd::parse_sacd_virtual_path(&path_str) {
-            return Self::open_sacd(&sacd_info.iso_path, sacd_info.track_num);
+            return Self::open_sacd(&sacd_info.iso_path, &path_str);
         }
         let lower = path_str.to_lowercase();
         if lower.ends_with(".iso") {
-            return Self::open_sacd(&path_str, 1);
+            let virtual_path = format!("{}|Track01|0.0|0|0|0|0", path_str);
+            return Self::open_sacd(&path_str, &virtual_path);
         }
 
         let mut file = File::open(path).context("打开 Source Direct DSD 文件失败")?;
@@ -83,23 +84,24 @@ impl DirectDsdReader {
         }
     }
 
-    fn open_sacd(iso_path: &str, track_num: u16) -> Result<Self> {
+    fn open_sacd(iso_path: &str, virtual_path: &str) -> Result<Self> {
         let dummy_file = File::open(iso_path).context("打开 SACD ISO 文件失败")?;
-        let reader = crate::sacd::SacdTrackReader::open_track(iso_path, track_num)?;
+        let source = crate::sacd::SacdNativeSource::open(iso_path, virtual_path)?;
         let format = DirectDsdFormat {
-            bit_rate: reader.sample_rate,
-            channels: reader.channels,
+            bit_rate: source.sample_rate,
+            channels: source.channels,
             bit_order: DirectDsdBitOrder::MsbFirst,
             container: DirectDsdContainer::Dsf,
         };
         Ok(Self {
             file: dummy_file,
             format,
-            layout: DirectDsdLayout::Sacd { reader },
+            layout: DirectDsdLayout::Sacd { source },
             input: Vec::new(),
             max_output_len: 65536,
         })
     }
+
 
     pub fn format(&self) -> DirectDsdFormat {
         self.format
@@ -126,9 +128,10 @@ impl DirectDsdReader {
                     / channels;
                 bits_per_channel as f64 / f64::from(self.format.bit_rate)
             }
-            DirectDsdLayout::Sacd { reader } => reader.duration_seconds,
+            DirectDsdLayout::Sacd { source } => source.duration_secs,
         }
     }
+
 
     pub fn seek_seconds(&mut self, position_secs: f64) -> Result<f64> {
         ensure!(
@@ -195,11 +198,12 @@ impl DirectDsdReader {
                 *remaining = *data_size - byte_offset;
                 u64::try_from(groups)?.saturating_mul(32)
             }
-            DirectDsdLayout::Sacd { reader } => {
-                reader.seek_seconds(position_secs)?;
+            DirectDsdLayout::Sacd { source } => {
+                source.seek_secs(position_secs)?;
                 return Ok(position_secs);
             }
         };
+
 
         Ok(actual_bits as f64 / bit_rate as f64)
     }
@@ -276,16 +280,20 @@ impl DirectDsdReader {
                 *remaining -= read_len;
                 Ok(Some(read_len))
             }
-            DirectDsdLayout::Sacd { reader } => {
-                let read = reader.read_interleaved_dsd(output)?;
-                if read == 0 {
-                    Ok(None)
+            DirectDsdLayout::Sacd { source } => {
+                let block = source.next_block()?;
+                if let Some(buf) = block {
+                    let len = buf.len();
+                    ensure!(output.len() >= len, "SACD output buffer 太小");
+                    output[..len].copy_from_slice(&buf);
+                    Ok(Some(len))
                 } else {
-                    Ok(Some(read))
+                    Ok(None)
                 }
             }
         }
     }
+
 
     fn open_dsf(mut file: File, file_len: usize) -> Result<Self> {
         let mut header = [0_u8; 28];

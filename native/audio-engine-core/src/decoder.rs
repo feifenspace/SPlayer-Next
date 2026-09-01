@@ -166,7 +166,7 @@ pub fn probe_metadata(
             crate::metadata::extract_folder_cover_thumbnail(&sacd.iso_path, dir)
         });
         return Ok(AudioMetadata {
-            duration_secs: sacd.duration,
+            duration_secs: sacd.duration_secs,
             sample_rate: 2_822_400,
             original_sample_rate: 2_822_400,
             channels: 2,
@@ -183,6 +183,7 @@ pub fn probe_metadata(
             external_lyrics: Vec::new(),
         });
     }
+
 
     Ok(prepare_decode(source, cover_cache_dir, cancel_handle)?.into_metadata())
 }
@@ -430,6 +431,15 @@ fn open_source(
         }
         return Ok((reader, None));
     }
+
+    if let Some(_sacd_info) = crate::sacd::parse_sacd_virtual_path(source) {
+        let (tmp_file, _disc) = crate::sacd::extract_track_to_dsdiff_file(source)
+            .with_context(|| format!("提取 SACD 轨道失败: {source}"))?;
+        let reader = AudioReader::new(tmp_file)
+            .with_context(|| format!("打开 SACD 虚拟 DSDIFF 失败: {source}"))?;
+        return Ok((reader, None));
+    }
+
 
     let (reader, cancel) = if source.starts_with("http://") || source.starts_with("https://") {
         let http = HttpAudioSource::new_with_cancel_handle(source, &cancel_handle)?;

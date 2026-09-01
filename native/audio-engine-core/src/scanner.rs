@@ -117,44 +117,35 @@ fn collect_removed_paths(
 /// 新 API 下 AudioReader 不再要求重采样参数，扫库每文件省一次 SwrContext 分配
 pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTrack> {
     if crate::sacd::is_sacd_iso_path(path) {
-        if let Ok(mut reader) = crate::sacd::IsoReader::open(path) {
-            if let Ok(disc) = crate::sacd::SacdDisc::parse(&mut reader) {
-                let area = disc
-                    .stereo_area_idx
-                    .and_then(|idx| disc.areas.get(idx))
-                    .or_else(|| {
-                        disc.multichannel_area_idx
-                            .and_then(|idx| disc.areas.get(idx))
-                    })
-                    .or_else(|| disc.areas.first());
-                if let Some(area) = area {
-                    if let Some(t) = area.tracks.first() {
-                        return Some(ScannedTrack {
-                            path: path.to_string(),
-                            title: disc.album_title.clone().or_else(|| t.title.clone()),
-                            artist: disc.album_artist.clone().or_else(|| t.artist.clone()),
-                            album: disc.album_title.clone(),
-                            track: Some(1),
-                            duration: area.tracks.iter().map(|tr| tr.duration).sum(),
-                            codec: if t.is_dst {
-                                "sacd_dst".to_string()
-                            } else {
-                                "sacd_dsd".to_string()
-                            },
-                            sample_rate: t.sample_rate,
-                            bit_rate: t.bit_rate as i64,
-                            channels: t.channels as u32,
-                            bits_per_sample: 1,
-                            cover: None,
-                            file_size: reader.total_sectors as u64 * 2048,
-                            mtime: 0,
-                            ctime: 0,
-                        });
-                    }
-                }
-            }
+        if let Ok(disc) = crate::sacd::probe_sacd_iso(path) {
+            let total_dur: f64 = disc.tracks.iter().map(|tr| tr.duration_secs).sum();
+            let first_track = disc.tracks.first();
+            let cover = cover_cache_dir
+                .and_then(|dir| crate::metadata::extract_folder_cover_thumbnail(path, dir));
+            return Some(ScannedTrack {
+                path: path.to_string(),
+                title: disc.album_title.clone().or_else(|| first_track.and_then(|t| t.title.clone())),
+                artist: disc.album_artist.clone().or_else(|| first_track.and_then(|t| t.artist.clone())),
+                album: disc.album_title.clone(),
+                track: Some(1),
+                duration: total_dur,
+                codec: match disc.frame_format {
+                    crate::sacd::FrameFormat::Dst => "sacd_dst".to_string(),
+                    _ => "sacd_dsd".to_string(),
+                },
+                sample_rate: disc.sample_rate,
+                bit_rate: (disc.sample_rate as i64) * (disc.channel_count as i64),
+                channels: disc.channel_count as u32,
+                bits_per_sample: 1,
+                cover,
+                file_size: file_stat(Path::new(path)).map(|(_, _, s)| s).unwrap_or(0),
+                mtime: file_stat(Path::new(path)).map(|(m, _, _)| m).unwrap_or(0),
+                ctime: file_stat(Path::new(path)).map(|(_, c, _)| c).unwrap_or(0),
+            });
         }
+        return None;
     }
+
 
     if crate::cue::is_cue_path(path) {
         if let Ok(cue) = crate::cue::CueSheet::parse_file(path) {
@@ -527,22 +518,7 @@ pub fn probe_cue_tracks(cue_path: &str, cover_cache_dir: Option<&str>) -> Vec<Sc
 /// 解析单个 SACD ISO 镜像文件并展开为全部音轨列表
 pub fn probe_sacd_tracks(iso_path: &str, cover_cache_dir: Option<&str>) -> Vec<ScannedTrack> {
     let (mtime, ctime, file_size) = file_stat(Path::new(iso_path)).unwrap_or((0, 0, 0));
-    let Ok(mut reader) = crate::sacd::IsoReader::open(iso_path) else {
-        return Vec::new();
-    };
-    let Ok(disc) = crate::sacd::SacdDisc::parse(&mut reader) else {
-        return Vec::new();
-    };
-
-    let area = if let Some(idx) = disc.stereo_area_idx {
-        disc.areas.get(idx)
-    } else if let Some(idx) = disc.multichannel_area_idx {
-        disc.areas.get(idx)
-    } else {
-        disc.areas.first()
-    };
-
-    let Some(area) = area else {
+    let Ok(disc) = crate::sacd::probe_sacd_iso(iso_path) else {
         return Vec::new();
     };
 
@@ -550,22 +526,32 @@ pub fn probe_sacd_tracks(iso_path: &str, cover_cache_dir: Option<&str>) -> Vec<S
         .and_then(|dir| crate::metadata::extract_folder_cover_thumbnail(iso_path, dir));
 
     let mut tracks = Vec::new();
-    for t in &area.tracks {
+    for t in &disc.tracks {
+        let virtual_path = format!(
+            "{}|Track{:02}|{:.3}|{}|{}|{}|{}",
+            iso_path,
+            t.track_num,
+            t.duration_secs,
+            t.start_frames,
+            t.duration_frames,
+            t.start_lsn,
+            t.length_lsn
+        );
+
         tracks.push(ScannedTrack {
-            path: t.virtual_path.clone(),
-            title: t.title.clone(),
+            path: virtual_path,
+            title: t.title.clone().or_else(|| Some(format!("Track {:02}", t.track_num))),
             artist: t.artist.clone().or_else(|| disc.album_artist.clone()),
-            album: t.album.clone().or_else(|| disc.album_title.clone()),
-            track: Some(t.track_num),
-            duration: t.duration,
-            codec: if t.is_dst {
-                "sacd_dst".to_string()
-            } else {
-                "sacd_dsd".to_string()
+            album: disc.album_title.clone(),
+            track: Some(t.track_num as u16),
+            duration: t.duration_secs,
+            codec: match disc.frame_format {
+                crate::sacd::FrameFormat::Dst => "sacd_dst".to_string(),
+                _ => "sacd_dsd".to_string(),
             },
-            sample_rate: t.sample_rate,
-            bit_rate: t.bit_rate as i64,
-            channels: t.channels as u32,
+            sample_rate: disc.sample_rate,
+            bit_rate: (disc.sample_rate as i64) * (disc.channel_count as i64),
+            channels: disc.channel_count as u32,
             bits_per_sample: 1,
             cover: cover.clone(),
             file_size,

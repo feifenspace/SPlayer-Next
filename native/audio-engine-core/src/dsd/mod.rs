@@ -89,3 +89,26 @@ pub const BIT_REVERSE_LUT: [u8; 256] = [
 pub fn reverse_byte(b: u8) -> u8 {
     BIT_REVERSE_LUT[b as usize]
 }
+
+/// 原地重排 1-byte 交错 DSD 流为 Diretta 要求的 InterleavedBlock32（L4R4）。
+/// 输入: [L0 R0 L1 R1 L2 R2 L3 R3]
+/// 输出: [L0 L1 L2 L3 R0 R1 R2 R3]
+pub fn interleaved_1byte_to_block32_in_place(data: &mut [u8], channels: u16) -> anyhow::Result<()> {
+    anyhow::ensure!(channels == 2, "DSD Block32 转换仅支持立体声 2 声道");
+    let group_size = 8;
+    anyhow::ensure!(data.len() % group_size == 0, "DSD 数据未对齐到 8 字节边界");
+    for chunk in data.chunks_exact_mut(group_size) {
+        let mut buf = [0u8; 8];
+        buf[0] = chunk[0];
+        buf[1] = chunk[2];
+        buf[2] = chunk[4];
+        buf[3] = chunk[6];
+        buf[4] = chunk[1];
+        buf[5] = chunk[3];
+        buf[6] = chunk[5];
+        buf[7] = chunk[7];
+        chunk.copy_from_slice(&buf);
+    }
+    Ok(())
+}
+

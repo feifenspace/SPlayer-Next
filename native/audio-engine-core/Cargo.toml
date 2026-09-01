@@ -42,6 +42,8 @@ encoding_rs = "0.8"
 chardetng = "0.1"
 rustysynth = { version = "1.3", optional = true }
 
+tempfile = "3"
+
 # 日志（纯 Rust，无 NAPI）
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -71,6 +73,9 @@ features = [
   "Win32_System_Threading",
 ]
 
+[build-dependencies]
+cc = "1.0"
+
 [features]
 default = ["fft", "midi", "pipewire", "pulseaudio", "diretta"]
 fft = ["dep:rustfft"]
@@ -85,7 +90,7 @@ diretta = []
 [dev-dependencies]
 base64 = "0.22"
 httpmock = "0.8.3"
-tempfile = "3"
 
 [lints]
 workspace = true
+

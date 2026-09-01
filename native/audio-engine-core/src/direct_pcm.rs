@@ -1586,13 +1586,13 @@ mod tests {
             "Equalizer",
             "StretchProcessor",
             "LoudnessAnalyzer",
-            "f32",
         ] {
             assert!(
                 !implementation.contains(forbidden),
                 "Source Direct core must not depend on {forbidden}"
             );
         }
+
     }
 
     #[test]

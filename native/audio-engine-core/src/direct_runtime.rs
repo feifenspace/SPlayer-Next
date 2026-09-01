@@ -117,12 +117,13 @@ impl DirectStageHandle {
                 (
                     source.to_owned(),
                     0.0,
-                    if sacd.duration > 0.0 {
-                        sacd.duration
+                    if sacd.duration_secs > 0.0 {
+                        sacd.duration_secs
                     } else {
                         duration_secs
                     },
                 )
+
             } else {
                 (source.to_owned(), 0.0, duration_secs)
             };
@@ -245,12 +246,13 @@ impl DirectPlayback {
                 (
                     source.to_owned(),
                     0.0,
-                    if sacd.duration > 0.0 {
-                        sacd.duration
+                    if sacd.duration_secs > 0.0 {
+                        sacd.duration_secs
                     } else {
                         duration
                     },
                 )
+
             } else {
                 (source.to_owned(), 0.0, duration)
             };
@@ -327,12 +329,13 @@ impl DirectPlayback {
                 (
                     source.to_owned(),
                     0.0,
-                    if sacd.duration > 0.0 {
-                        sacd.duration
+                    if sacd.duration_secs > 0.0 {
+                        sacd.duration_secs
                     } else {
                         duration
                     },
                 )
+
             } else {
                 (source.to_owned(), 0.0, duration)
             };
