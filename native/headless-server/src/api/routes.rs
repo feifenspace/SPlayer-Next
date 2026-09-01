@@ -960,7 +960,9 @@ async fn seek_handler(
         token,
         equalizer,
         tempo,
+        original_sample_rate: _,
     } = take;
+
 
     let outcome: SeekOutcome = spawn_isolated_blocking("player-seek-worker", move || {
         let decoder_data = old_threads.join_aux().and_then(|h| h.join().ok());
