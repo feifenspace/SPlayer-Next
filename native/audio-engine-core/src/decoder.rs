@@ -101,6 +101,10 @@ impl PreparedDecoder {
     pub fn original_sample_rate(&self) -> u32 {
         self.metadata.original_sample_rate
     }
+
+    pub fn into_metadata(self) -> AudioMetadata {
+        self.metadata
+    }
 }
 
 /// 统一结束解码线程；panic 属于源错误，但仍需结束 source 迭代
@@ -150,6 +154,37 @@ impl DecoderData {
         self.player_resampler = build_player_resampler(&self.reader, sample_rate, channels)?;
         Ok(())
     }
+}
+
+pub fn probe_metadata(
+    source: &str,
+    cover_cache_dir: Option<&str>,
+    cancel_handle: HttpCancelHandle,
+) -> Result<AudioMetadata> {
+    if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
+        let cover = cover_cache_dir.and_then(|dir| {
+            crate::metadata::extract_folder_cover_thumbnail(&sacd.iso_path, dir)
+        });
+        return Ok(AudioMetadata {
+            duration_secs: sacd.duration,
+            sample_rate: 2_822_400,
+            original_sample_rate: 2_822_400,
+            channels: 2,
+            bits_per_sample: 1,
+            bit_rate: 2_822_400 * 2,
+            codec: "sacd_dsd".to_string(),
+            title: Some(format!("Track {:02}", sacd.track_num)),
+            artist: None,
+            album: None,
+            comment: None,
+            cover,
+            cover_raw: None,
+            embedded_lyric: None,
+            external_lyrics: Vec::new(),
+        });
+    }
+
+    Ok(prepare_decode(source, cover_cache_dir, cancel_handle)?.into_metadata())
 }
 
 /// 启动解码线程，返回音频元数据和线程句柄

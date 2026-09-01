@@ -1,4 +1,4 @@
-//! FFmpeg 音频解码 + CPAL 播放。
+//! FFmpeg 音频解码 + CPAL 播放 + Diretta Source Direct (Pull 模式)。
 //!
 //! 在 Headless 环境下直接使用，或通过 NAPI 包装供 Node.js 绑定。
 //! FFT 频谱分析（fft feature）和 MIDI 合成器（midi feature）为可选，
@@ -10,8 +10,10 @@ pub mod audio_output;
 pub mod cue;
 pub mod decoder;
 pub mod device_watcher;
+pub mod direct_dsd;
+pub mod direct_pcm;
+pub mod direct_runtime;
 pub mod diretta;
-pub mod diretta_output;
 pub mod dsd;
 pub mod dts;
 pub mod equalizer;

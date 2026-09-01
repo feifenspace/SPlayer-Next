@@ -577,6 +577,115 @@ pub fn sync_cue_tracks(conn: &mut Connection, cue_files: &[String], cover_cache_
     Ok(total_synced)
 }
 
+/// 同步解析 SACD ISO 文件并向 tracks 写入虚拟分轨记录
+pub fn sync_sacd_tracks(
+    conn: &mut Connection,
+    iso_files: &[String],
+    cover_cache_dir: Option<&Path>,
+) -> Result<usize> {
+    if iso_files.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.transaction()?;
+    let mut total_synced = 0;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let cache_dir_str = cover_cache_dir
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "data/covers".to_string());
+
+    {
+        let mut insert_stmt = tx.prepare_cached(
+            r#"
+            INSERT INTO tracks (
+                id, path, title, track, artist, album, duration,
+                cover, codec, sample_rate, bit_rate, channels,
+                bits_per_sample, file_size, file_mtime, file_ctime, scanned_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17
+            )
+            ON CONFLICT(path) DO UPDATE SET
+                title = excluded.title,
+                track = excluded.track,
+                artist = excluded.artist,
+                album = excluded.album,
+                duration = excluded.duration,
+                cover = excluded.cover,
+                codec = excluded.codec,
+                sample_rate = excluded.sample_rate,
+                bit_rate = excluded.bit_rate,
+                channels = excluded.channels,
+                bits_per_sample = excluded.bits_per_sample,
+                file_size = excluded.file_size,
+                file_mtime = excluded.file_mtime,
+                file_ctime = excluded.file_ctime,
+                scanned_at = excluded.scanned_at
+            "#,
+        )?;
+
+        for iso_file in iso_files {
+            let iso_path_obj = Path::new(iso_file);
+            if !iso_path_obj.is_file() {
+                continue;
+            }
+
+            // 1. 先清理该 ISO 可能残留的物理整轨记录或旧虚拟分轨
+            let prefix_pattern = format!("{}|%", iso_file);
+            let _ = tx.execute(
+                "DELETE FROM tracks WHERE path LIKE ?1 OR path = ?2",
+                params![prefix_pattern, iso_file],
+            );
+
+            // 2. 解析 SACD ISO 展开分轨并自动提取同目录封面
+            let tracks = audio_engine_core::scanner::probe_sacd_tracks(
+                iso_file,
+                Some(&cache_dir_str),
+            );
+
+            if tracks.is_empty() {
+                continue;
+            }
+
+            for t in tracks {
+                let id = format!("local:{:x}", md5_hash(&t.path));
+                let duration_ms = (t.duration * 1000.0) as u64;
+                let cover_url = normalize_cover_url(t.cover);
+
+                let _ = insert_stmt.execute(params![
+                    id,
+                    t.path,
+                    t.title.unwrap_or_else(|| "Unknown Track".to_string()),
+                    t.track,
+                    t.artist,
+                    t.album,
+                    duration_ms,
+                    cover_url,
+                    t.codec,
+                    t.sample_rate,
+                    t.bit_rate,
+                    t.channels,
+                    t.bits_per_sample,
+                    t.file_size,
+                    t.mtime,
+                    t.ctime,
+                    now,
+                ]);
+
+                total_synced += 1;
+            }
+        }
+    }
+    tx.commit()?;
+    tracing::info!("成功同步 SACD ISO 分轨数: {}", total_synced);
+    Ok(total_synced)
+}
+
 /// 根据 path 获取单首曲目详情
 pub fn get_track_by_path(conn: &Connection, path: &str) -> Result<Option<DbTrack>> {
     let mut stmt = conn.prepare(

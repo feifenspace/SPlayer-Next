@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 #
-# SPlayer Linux Headless 独立免编译发布包一键打包脚本
+# SPlayer Linux Headless 独立免编译发布包一键打包脚本（支持智能增量编译与多架构秒级复用）
 #
 # 特性：
-#   1. 支持交互式菜单选择 Diretta SDK 版本与 CPU 微架构变体；
-#   2. 支持命令行参数直接指定（--arch, --sdk-version, --sdk-dir, --output-dir 等）；
-#   3. 自动生成包含 CPU 变体名称与打包日期的标准化发布包及 .tar.gz；
+#   1. 支持智能增量编译：前端 Web UI 与 Rust 服务端在源码未变动时自动跳过，秒级完成打包；
+#   2. 多架构产物缓存隔离：各 CPU 变体独立缓存 (v2, v3, v4, zen4)，重复打包无需重编；
+#   3. 支持交互式菜单与命令行参数指定；
 #   4. 自动校验动态链接库依赖 (ldd)，确保无缺失依赖；
-#   5. 支持 --arch all 一键全架构批量打包。
+#   5. 支持 --force 强制全量重新编译。
 #
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,6 +20,7 @@ BUILD_DATE="$(date +%Y%m%d)"
 SKIP_BUILD=0
 SKIP_WEB=0
 CREATE_TAR=1
+FORCE_REBUILD=0
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,6 +45,7 @@ usage() {
     echo "  --sdk-version <ver>    指定 Diretta SDK 版本（如 150/149/148）"
     echo "  --output-dir <path>    发布包输出根目录（默认 /home/songlian）"
     echo "  --date <YYYYMMDD>      指定打包日期标识（默认今天：${BUILD_DATE}）"
+    echo "  --force, -f            强制全量重新构建（跳过前端与 Rust 增量缓存）"
     echo "  --skip-build           跳过 Rust 编译，直接使用现有构建产物"
     echo "  --skip-web             跳过前端 Web UI 构建"
     echo "  --no-tar               仅生成发布目录，不生成 .tar.gz 压缩包"
@@ -183,6 +185,10 @@ while [[ $# -gt 0 ]]; do
             BUILD_DATE="$2"
             shift 2
             ;;
+        --force|-f)
+            FORCE_REBUILD=1
+            shift
+            ;;
         --skip-build)
             SKIP_BUILD=1
             shift
@@ -236,6 +242,54 @@ case "$ARCH" in
     *) ARCH_NAME="$ARCH" ;;
 esac
 
+# 检查前端 Web UI 是否需要重新构建
+check_web_needs_build() {
+    if [[ $FORCE_REBUILD -eq 1 ]]; then
+        return 0
+    fi
+    if [[ ! -f "$WEB_DIST/index.html" ]]; then
+        return 0
+    fi
+    # 查找是否有比现有构建产物更新的前端源码文件
+    local newer_src
+    newer_src=$(find "$PROJECT_ROOT/src" "$PROJECT_ROOT/package.json" "$PROJECT_ROOT/electron.vite.config.ts" "$PROJECT_ROOT/index.html" -type f -newer "$WEB_DIST/index.html" 2>/dev/null | head -n 1 || true)
+    if [[ -n "$newer_src" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# 检查指定架构的 Rust 产物是否需要重新编译
+check_rust_needs_build() {
+    local arch_var="$1"
+    local cached_bin="$PROJECT_ROOT/target/release/headless-server-${arch_var}"
+    local stamp_file="$PROJECT_ROOT/target/release/.stamp-${arch_var}"
+
+    if [[ $FORCE_REBUILD -eq 1 ]]; then
+        return 0
+    fi
+    if [[ ! -x "$cached_bin" || ! -f "$stamp_file" ]]; then
+        return 0
+    fi
+
+    # 检查 SDK 路径与版本是否改变
+    local current_sdk_sig="${SDK_DIR:-default}_${SDK_VERSION}"
+    local cached_sdk_sig
+    cached_sdk_sig=$(cat "$stamp_file" 2>/dev/null || echo "")
+    if [[ "$current_sdk_sig" != "$cached_sdk_sig" ]]; then
+        return 0
+    fi
+
+    # 检查 native/ 目录、Cargo.toml、Cargo.lock 是否有更新
+    local newer_rust_file
+    newer_rust_file=$(find "$PROJECT_ROOT/native" "$PROJECT_ROOT/Cargo.toml" "$PROJECT_ROOT/Cargo.lock" -type f -newer "$cached_bin" 2>/dev/null | head -n 1 || true)
+    if [[ -n "$newer_rust_file" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
 # 单架构打包函数
 package_single_arch() {
     local arch_var="$1"
@@ -272,6 +326,8 @@ package_single_arch() {
     local pkg_name="splayer-headless-linux-${ARCH_NAME}-${arch_var}-diretta-sdk${SDK_VERSION}-${BUILD_DATE}"
     local pkg_dir="${OUTPUT_BASE_DIR}/${pkg_name}"
     local tar_file="${OUTPUT_BASE_DIR}/${pkg_name}.tar.gz"
+    local cached_bin="$PROJECT_ROOT/target/release/headless-server-${arch_var}"
+    local stamp_file="$PROJECT_ROOT/target/release/.stamp-${arch_var}"
 
     echo
     echo -e "${CYAN}======================================================${NC}"
@@ -281,20 +337,34 @@ package_single_arch() {
     log "压缩包路径       : ${tar_file}"
     echo -e "${CYAN}======================================================${NC}"
 
-    # 1. 编译 Rust 服务端
+    # 1. 增量编译 Rust 服务端
     if [[ $SKIP_BUILD -eq 0 ]]; then
-        log "开始编译 Rust release 产物 (CPU: ${arch_var}, target-cpu: ${rust_target_cpu})..."
-        cd "$PROJECT_ROOT"
-        if [[ -n "$SDK_DIR" ]]; then
-            export DIRETTA_SDK_DIR="$SDK_DIR"
+        if check_rust_needs_build "$arch_var"; then
+            log "增量编译 Rust release 产物 (CPU: ${arch_var}, target-cpu: ${rust_target_cpu})..."
+            cd "$PROJECT_ROOT"
+            if [[ -n "$SDK_DIR" ]]; then
+                export DIRETTA_SDK_DIR="$SDK_DIR"
+            fi
+            export DIRETTA_ARCH="${arch_var}"
+            export CARGO_INCREMENTAL=1
+
+            cargo build --release --package headless-server
+
+            mkdir -p "$PROJECT_ROOT/target/release"
+            cp -f "$PROJECT_ROOT/target/release/headless-server" "$cached_bin"
+            echo "${SDK_DIR:-default}_${SDK_VERSION}" > "$stamp_file"
+            log "架构 ${arch_var} 编译成功并已缓存产物"
+        else
+            log "⚡ 检测到架构 ${arch_var} 现有编译产物已是最新，跳过重新编译 (耗时 0s)"
         fi
-        export DIRETTA_ARCH="${arch_var}"
-        cargo build --release --package headless-server
     else
         log "跳过 Rust 编译，使用现有产物"
     fi
 
-    local server_bin="$PROJECT_ROOT/target/release/headless-server"
+    local server_bin="$cached_bin"
+    if [[ ! -x "$server_bin" ]]; then
+        server_bin="$PROJECT_ROOT/target/release/headless-server"
+    fi
     [[ -x "$server_bin" ]] || fatal "未找到编译产物：$server_bin"
 
     # 2. 检查动态链接库依赖
@@ -528,17 +598,38 @@ EOF
     log "发布目录就绪: ${pkg_dir}"
 }
 
-# 先统一构建一次前端 Web UI（如未跳过）
+# 自动清理调试/测试时产生的 debug 调试符号与中间依赖缓存，释放磁盘空间
+clean_debug_cache() {
+    local debug_dir="$PROJECT_ROOT/target/debug"
+    if [[ -d "$debug_dir" ]]; then
+        local debug_size
+        debug_size=$(du -sh "$debug_dir" 2>/dev/null | awk '{print $1}' || echo "")
+        if [[ -n "$debug_size" && "$debug_size" != "0" ]]; then
+            log "🧹 检测到调试中间产物 target/debug (${debug_size})，正在自动清理以释放磁盘空间..."
+            rm -rf "$debug_dir"
+            log "✨ 调试缓存清理完成！"
+        fi
+    fi
+}
+
+# 0. 自动检查并清理调试产生的庞大中间依赖缓存
+clean_debug_cache
+
+# 1. 增量构建前端 Web UI
+WEB_DIST="$PROJECT_ROOT/out/renderer"
 if [[ $SKIP_BUILD -eq 0 && $SKIP_WEB -eq 0 ]]; then
-    log "构建 Web 控制台前端静态资源..."
-    cd "$PROJECT_ROOT"
-    pnpm exec electron-vite build
+    if check_web_needs_build; then
+        log "构建 Web 控制台前端静态资源..."
+        cd "$PROJECT_ROOT"
+        pnpm exec electron-vite build
+    else
+        log "⚡ 检测到前端 Web UI 产物已是最新，跳过 Vite 构建 (耗时 0s)"
+    fi
 fi
 
-WEB_DIST="$PROJECT_ROOT/out/renderer"
 [[ -f "$WEB_DIST/index.html" ]] || fatal "未找到 Web 前端构建产物：$WEB_DIST/index.html"
 
-# 根据架构选项执行打包
+# 2. 根据架构选项执行打包
 if [[ "$TARGET_CPU_ARCH" == "all" ]]; then
     log "开始全架构批量打包模式 (v2, v3, v4, zen4)..."
     for a in v2 v3 v4 zen4; do

@@ -9,12 +9,13 @@ pub enum PlayerEvent {
     StateChanged { state: PlayerState },
     /// 播放结束
     Ended,
+    /// Source Direct 已在同一 Diretta connection 上无缝切入 staged 下一首
+    DirectTrackBoundary { duration: f64, generation: u64 },
     /// 音源失效（网络中断 / URL 过期）
     SourceError,
     /// 位置更新（秒）—— 由内部定时器推送
     Position { position: f64, duration: f64 },
-    /// FFT 频谱数据推送（仅在 fft feature 启用时可用）
-    #[cfg(feature = "fft")]
+    /// FFT 频谱数据推送
     FftData { ldata: Vec<f32>, rdata: Vec<f32> },
     /// 输出流停滞（输出回调长时间未消费样本，需要外部重建输出）
     OutputStalled,

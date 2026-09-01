@@ -47,8 +47,10 @@ const options = computed(() => {
   // 加入扫描到的 Diretta 网络 DAC 设备
   if (direttaTargets.value.length > 0) {
     for (const target of direttaTargets.value) {
-      const displayName = target.target_name || target.model_name || target.output_name || "Target";
-      const targetVal = `diretta:${target.full_addr || target.ipv6_addr}`;
+      const displayName = target.target_name || target.output_name || target.model_name || (target as any).name || "Target";
+      const targetVal = typeof target.id === "string" && target.id.startsWith("diretta:")
+        ? target.id
+        : `diretta:${target.full_addr || target.ipv6_addr || (target as any).id}`;
       opts.push({
         value: targetVal,
         label: `Diretta: ${displayName}`,

@@ -87,6 +87,8 @@ pub struct JsScanEvent {
     pub removed_paths: Option<Vec<String>>,
     /// 遍历时收集到的 CUE 文件路径（仅 done 事件）
     pub cue_files: Option<Vec<String>>,
+    /// 遍历时收集到的 SACD ISO 镜像路径（仅 done 事件）
+    pub iso_files: Option<Vec<String>>,
     /// 不可达的扫描目录
     pub unavailable_dirs: Option<Vec<String>>,
 }
@@ -142,6 +144,7 @@ pub fn scan_dirs(
                     total,
                     removed_paths,
                     cue_files,
+                    iso_files,
                     unavailable_dirs,
                 } => JsScanEvent {
                     event_type: "done".into(),
@@ -149,6 +152,7 @@ pub fn scan_dirs(
                     total,
                     removed_paths: Some(removed_paths),
                     cue_files: Some(cue_files),
+                    iso_files: Some(iso_files),
                     unavailable_dirs: Some(unavailable_dirs),
                     ..Default::default()
                 },

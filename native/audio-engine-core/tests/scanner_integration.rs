@@ -55,12 +55,14 @@ fn scan_empty_directory_produces_done_event() {
             total,
             removed_paths,
             cue_files,
+            iso_files,
             unavailable_dirs,
         } => {
             assert_eq!(*scanned, 0);
             assert_eq!(*total, 0);
             assert!(removed_paths.is_empty());
             assert!(cue_files.is_empty());
+            assert!(iso_files.is_empty());
             assert!(unavailable_dirs.is_empty());
         }
         ScanEvent::Progress { .. } => panic!("unexpected Progress event"),

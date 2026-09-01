@@ -40,10 +40,10 @@ fn test_synthetic_sacd_iso_parsing() {
     // 1. Sector 510: Master TOC
     let master_toc_off = 510 * SACD_SECTOR_SIZE;
     iso_bytes[master_toc_off..master_toc_off + 8].copy_from_slice(b"SACDMTOC");
-    // area_1_toc_1_start at byte offset 32 (Big Endian)
-    iso_bytes[master_toc_off + 32..master_toc_off + 36].copy_from_slice(&520u32.to_be_bytes());
-    // area_1_toc_size at byte offset 46 (Big Endian)
-    iso_bytes[master_toc_off + 46..master_toc_off + 48].copy_from_slice(&10u16.to_be_bytes());
+    // area_1_toc_1_start at byte offset 64 (Big Endian)
+    iso_bytes[master_toc_off + 64..master_toc_off + 68].copy_from_slice(&520u32.to_be_bytes());
+    // area_1_toc_size at byte offset 84 (Big Endian)
+    iso_bytes[master_toc_off + 84..master_toc_off + 86].copy_from_slice(&10u16.to_be_bytes());
 
     // 2. Sector 511: Master Text
     let master_text_off = 511 * SACD_SECTOR_SIZE;
@@ -61,19 +61,20 @@ fn test_synthetic_sacd_iso_parsing() {
     // 3. Sector 520: Area 1 TOC (TWOCHTOC)
     let area_toc_off = 520 * SACD_SECTOR_SIZE;
     iso_bytes[area_toc_off..area_toc_off + 8].copy_from_slice(b"TWOCHTOC");
-    iso_bytes[area_toc_off + 13] = 0x00; // frame_format = DST
-    iso_bytes[area_toc_off + 24] = 2; // channel_count = 2
-    iso_bytes[area_toc_off + 61] = 2; // track_count = 2
+    iso_bytes[area_toc_off + 21] = 0x00; // frame_format = DST
+    iso_bytes[area_toc_off + 32] = 2; // channel_count = 2
+    iso_bytes[area_toc_off + 69] = 2; // track_count = 2
 
     // 4. Sector 521: SACDTRL1 (Track start & length LSN)
     let trl1_off = 521 * SACD_SECTOR_SIZE;
     iso_bytes[trl1_off..trl1_off + 8].copy_from_slice(b"SACDTRL1");
     // Track 1: start LSN 550, length 20
     iso_bytes[trl1_off + 8..trl1_off + 12].copy_from_slice(&550u32.to_be_bytes());
-    iso_bytes[trl1_off + 12..trl1_off + 16].copy_from_slice(&20u32.to_be_bytes());
-    // Track 2: start LSN 570, length 25
-    iso_bytes[trl1_off + 16..trl1_off + 20].copy_from_slice(&570u32.to_be_bytes());
-    iso_bytes[trl1_off + 20..trl1_off + 24].copy_from_slice(&25u32.to_be_bytes());
+    iso_bytes[trl1_off + 12..trl1_off + 16].copy_from_slice(&570u32.to_be_bytes());
+    // Track length (offset 8 + 255 * 4 = 1028)
+    let len_base = trl1_off + 8 + 255 * 4;
+    iso_bytes[len_base..len_base + 4].copy_from_slice(&20u32.to_be_bytes());
+    iso_bytes[len_base + 4..len_base + 8].copy_from_slice(&25u32.to_be_bytes());
 
     // 5. Sector 522: SACDTRL2 (Track timestamps)
     let trl2_off = 522 * SACD_SECTOR_SIZE;

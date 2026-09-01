@@ -52,6 +52,21 @@ const scanTargets = async () => {
   }
 };
 
+const getTargetValue = (target: any): string => {
+  if (!target) return "";
+  if (typeof target.id === "string" && target.id.startsWith("diretta:")) {
+    return target.id;
+  }
+  const addr = target.full_addr || target.ipv6_addr || target.id || "";
+  return addr ? `diretta:${addr}` : "";
+};
+
+const getTargetAddr = (target: any): string => {
+  if (!target) return "";
+  const raw = target.full_addr || target.ipv6_addr || target.id || "";
+  return String(raw).replace(/^diretta:/, "");
+};
+
 const handleSelect = async (devValue: string) => {
   const target = devValue === SYSTEM_DEFAULT ? null : devValue;
   await switchDevice(target);
@@ -61,7 +76,7 @@ const showTargetCaps = async (target: DirettaTarget) => {
   loadingCaps.value = true;
   capsModalOpen.value = true;
   try {
-    const targetAddr = target.full_addr || target.ipv6_addr;
+    const targetAddr = getTargetAddr(target);
     const res = await playerClient.getDirettaTargetInfo(targetAddr);
     if (res.success && res.data) {
       currentCaps.value = res.data;
@@ -206,25 +221,25 @@ onMounted(() => {
           <div class="mt-1 space-y-1">
             <div
               v-for="target in targets"
-              :key="target.full_addr || target.ipv6_addr"
+              :key="getTargetValue(target)"
               class="flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer transition-colors"
               :class="[
-                currentDevice === `diretta:${target.full_addr || target.ipv6_addr}`
+                currentDevice === getTargetValue(target)
                   ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium'
                   : cover
                     ? 'hover:bg-white/8 text-cover/80'
                     : 'hover:bg-on-surface/6 text-on-surface',
               ]"
-              @click="handleSelect(`diretta:${target.full_addr || target.ipv6_addr}`)"
+              @click="handleSelect(getTargetValue(target))"
             >
               <div class="flex items-center gap-2 truncate flex-1 min-w-0 pr-2">
                 <span class="size-2 rounded-full bg-emerald-500 shrink-0" />
                 <div class="flex flex-col truncate">
                   <span class="truncate text-xs">
-                    {{ target.target_name || target.model_name || "Diretta Target" }}
+                    {{ target.target_name || target.output_name || target.model_name || (target as any).name || "Diretta Target" }}
                   </span>
                   <span class="text-[10px] opacity-60 font-mono truncate">
-                    {{ target.ipv6_addr }}
+                    {{ target.ipv6_addr || target.full_addr || getTargetAddr(target) }}
                   </span>
                 </div>
               </div>
@@ -240,7 +255,7 @@ onMounted(() => {
                   <template #icon><IconInfo class="text-xs" /></template>
                 </SButton>
                 <IconCheck
-                  v-if="currentDevice === `diretta:${target.full_addr || target.ipv6_addr}`"
+                  v-if="currentDevice === getTargetValue(target)"
                   class="text-sm text-emerald-500 shrink-0"
                 />
               </div>

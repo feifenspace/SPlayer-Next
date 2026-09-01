@@ -8,8 +8,10 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
+#[cfg(feature = "diretta")]
+use crate::direct_runtime::{DirectFormat, DirectPlayback};
 use crate::player::{self, InnerPlayer, PlayerEvent, PlayerState, SeekTake};
-use crate::{audio_output, decoder, device_watcher};
+use crate::{audio_output, decoder, device_watcher, diretta};
 
 use super::IntoNapiResult;
 
@@ -115,15 +117,17 @@ pub struct JsFftData {
 #[napi(object)]
 #[derive(Default)]
 pub struct JsPlayerEvent {
-    /// 事件类型："stateChanged" | "ended" | "sourceError" | "position" | "fftData" | "outputStalled" | "outputFailed"
+    /// 事件类型："stateChanged" | "ended" | "directTrackBoundary" | "sourceError" | "position" | "fftData" | "outputStalled" | "outputFailed"
     #[napi(js_name = "type")]
     pub event_type: String,
     /// 状态（仅 stateChanged 时有值）
     pub state: Option<String>,
     /// 位置（秒，仅 position 时有值）
     pub position: Option<f64>,
-    /// 时长（秒，仅 position 时有值）
+    /// 时长（秒，仅 position/directTrackBoundary 时有值）
     pub duration: Option<f64>,
+    /// renderer 提供的 Direct staged generation（仅 directTrackBoundary 时有值）
+    pub generation: Option<u32>,
     /// FFT 频谱数据（仅 fftData 时有值，128 个频段，值域 0.0 ~ 1.0）
     pub fft_data: Option<JsFftData>,
 }
@@ -379,7 +383,10 @@ impl AudioPlayer {
     /// 注册事件回调，Rust 侧会在状态变化、位置更新、播放结束时主动调用
     #[napi(ts_args_type = "callback: (event: JsPlayerEvent) => void")]
     pub fn on_event(&self, callback: Function<JsPlayerEvent, ()>) -> Result<()> {
-        let tsfn = callback.build_threadsafe_function().build()?;
+        let tsfn = callback
+            .build_threadsafe_function()
+            .weak::<true>()
+            .build()?;
 
         // 用闭包包裹 tsfn，在内部做 PlayerEvent → JsPlayerEvent 转换
         let emitter: player::EventEmitter = Arc::new(move |event: PlayerEvent| {
@@ -391,6 +398,15 @@ impl AudioPlayer {
                 },
                 PlayerEvent::Ended => JsPlayerEvent {
                     event_type: "ended".into(),
+                    ..Default::default()
+                },
+                PlayerEvent::DirectTrackBoundary {
+                    duration,
+                    generation,
+                } => JsPlayerEvent {
+                    event_type: "directTrackBoundary".into(),
+                    duration: Some(duration),
+                    generation: Some(u32::try_from(generation).unwrap_or(u32::MAX)),
                     ..Default::default()
                 },
                 PlayerEvent::SourceError => JsPlayerEvent {
@@ -482,12 +498,25 @@ impl AudioPlayer {
             cover_dir,
             normalization_enabled,
             device_id,
+            direct_selector,
             output_generation,
             failure_callback,
             equalizer,
             tempo,
         ) = {
             let mut player = self.inner.lock();
+            let device_id = player.selected_device().map(String::from);
+            let direct_selector = device_id
+                .as_deref()
+                .filter(|value| diretta::selector_target(value).is_some())
+                .map(String::from);
+            if direct_selector.is_some() {
+                player.validate_direct_entry().into_napi()?;
+                #[cfg(not(feature = "diretta"))]
+                return Err(Error::from_reason(
+                    "[Direct] 当前 audio-engine 未编译 Diretta Host SDK 支持".to_string(),
+                ));
+            }
             let (old_threads, token) = player.take_for_async_load(handle.clone());
             let output_generation = player.reserve_output_generation();
             let failure_callback = player.make_failure_callback(output_generation);
@@ -497,13 +526,91 @@ impl AudioPlayer {
                 player.load_token_handle(),
                 player.cover_cache_dir().map(String::from),
                 player.is_normalization_enabled(),
-                player.selected_device().map(String::from),
+                device_id,
+                direct_selector,
                 output_generation,
                 failure_callback,
                 player.equalizer_handle(),
                 player.tempo_handle(),
             )
         };
+
+        #[cfg(not(feature = "diretta"))]
+        let _ = &direct_selector;
+
+        #[cfg(feature = "diretta")]
+        if let Some(selector) = direct_selector {
+            let source_for_direct = source.clone();
+            let load_token_for_direct = Arc::clone(&load_token);
+            let result = tokio::task::spawn_blocking(move || {
+                if let Some(h) = old_threads.join_aux() {
+                    let _ = h.join();
+                }
+                if source_for_direct.starts_with("http://")
+                    || source_for_direct.starts_with("https://")
+                {
+                    anyhow::bail!(
+                        "[Direct] 当前 Direct Lifecycle Gate 仅支持本地 seekable 音源"
+                    );
+                }
+                let mut metadata =
+                    decoder::probe_metadata(&source_for_direct, cover_dir.as_deref(), handle)?;
+                if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
+                    anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                }
+                let playback = DirectPlayback::open_local(
+                    &selector,
+                    &source_for_direct,
+                    metadata.duration_secs,
+                    0.0,
+                    auto_play,
+                )?;
+                match playback.format() {
+                    DirectFormat::Pcm(format) => {
+                        metadata.sample_rate = format.sample_rate;
+                        metadata.original_sample_rate = format.sample_rate;
+                        metadata.channels = format.channels;
+                        metadata.bits_per_sample = u32::from(format.valid_bits);
+                    }
+                    DirectFormat::Dsd(format) => {
+                        metadata.sample_rate = format.bit_rate;
+                        metadata.original_sample_rate = format.bit_rate;
+                        metadata.channels = format.channels;
+                        metadata.bits_per_sample = 1;
+                    }
+                }
+                metadata.duration_secs = playback.duration();
+                if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
+                    anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                }
+                Ok::<_, anyhow::Error>((metadata, playback))
+            })
+            .await
+            .map_err(|e| Error::from_reason(format!("direct load task join error: {e}")))?;
+
+            let (metadata, playback) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    let mut player = self.inner.lock();
+                    if !player.is_load_token_current(token) {
+                        return Err(Error::from_reason(LOAD_SUPERSEDED_REASON));
+                    }
+                    player.clear_pending_load(token);
+                    return Err(error).into_napi();
+                }
+            };
+
+            let returned_meta = {
+                let mut player = self.inner.lock();
+                player
+                    .commit_direct_loaded(token, &source, auto_play, metadata, playback)
+                    .into_napi()?
+            };
+            return match returned_meta {
+                Some(meta) => Ok(Self::meta_to_js(meta)),
+                None => Err(Error::from_reason(LOAD_SUPERSEDED_REASON)),
+            };
+        }
 
         let source_for_decoder = source.clone();
 
@@ -635,14 +742,14 @@ impl AudioPlayer {
 
     /// 暂停播放
     #[napi]
-    pub fn pause(&self) {
-        self.inner.lock().pause();
+    pub fn pause(&self) -> Result<()> {
+        self.inner.lock().pause().into_napi()
     }
 
     /// 立即暂停播放，用于输出设备切换前阻止短暂串音
     #[napi]
-    pub fn pause_immediately(&self) {
-        self.inner.lock().pause_immediately();
+    pub fn pause_immediately(&self) -> Result<()> {
+        self.inner.lock().pause_immediately().into_napi()
     }
 
     /// 停止播放并释放资源
@@ -661,6 +768,43 @@ impl AudioPlayer {
     #[napi]
     pub async fn seek(&self, position: f64) -> Result<()> {
         use crate::shared::Shared;
+
+        #[cfg(feature = "diretta")]
+        {
+            let direct_take = {
+                let mut player = self.inner.lock();
+                player.take_for_async_direct_seek().into_napi()?
+            };
+            if let Some(take) = direct_take {
+                let token = take.token;
+                let (playback, seek_result) = tokio::task::spawn_blocking(move || {
+                    let mut playback = take.playback;
+                    let result = playback.seek_while_paused(position);
+                    (playback, result)
+                })
+                .await
+                .map_err(|e| Error::from_reason(format!("direct seek task join error: {e}")))?;
+
+                let mut player = self.inner.lock();
+                if !player.is_load_token_current(token) {
+                    return Ok(());
+                }
+                if let Err(error) = seek_result {
+                    player.enter_paused_for_recovery();
+                    let _ = player
+                        .commit_direct_seeked(token, playback)
+                        .into_napi()?;
+                    return Err(error).into_napi();
+                }
+                let committed = player
+                    .commit_direct_seeked(token, playback)
+                    .into_napi()?;
+                if !committed {
+                    info!(position, "Direct seek 已被更新的 load/seek/stop 取代，丢弃结果");
+                }
+                return Ok(());
+            }
+        }
 
         let take = {
             let mut player = self.inner.lock();
@@ -758,10 +902,83 @@ impl AudioPlayer {
         }
     }
 
+    /// 只读取音源 metadata，不启动 normal playback/resampler/DSP。
+    /// Direct gapless staging 用它提前保留本地歌词/封面 detail。
+    #[napi]
+    pub async fn probe_metadata(&self, source: String) -> Result<JsMusicMetadata> {
+        let cover_dir = self.inner.lock().cover_cache_dir().map(String::from);
+        let metadata = tokio::task::spawn_blocking(move || {
+            decoder::probe_metadata(&source, cover_dir.as_deref(), HttpCancelHandle::new())
+        })
+        .await
+        .map_err(|error| Error::from_reason(format!("metadata probe task join error: {error}")))?
+        .into_napi()?;
+        Ok(Self::meta_to_js(metadata))
+    }
+
+    /// 为当前 Diretta Source Direct 播放预备一个同 wire-format 的本地下一音源。
+    /// 返回 false 表示当前不是 Direct runtime；格式不兼容等 staging 错误会明确返回。
+    #[napi]
+    pub async fn stage_direct_next(
+        &self,
+        source: String,
+        duration_secs: f64,
+        generation: u32,
+    ) -> Result<bool> {
+        #[cfg(feature = "diretta")]
+        {
+            let Some(handle) = self.inner.lock().direct_stage_handle() else {
+                return Ok(false);
+            };
+            tokio::task::spawn_blocking(move || {
+                handle.stage_local(&source, duration_secs, u64::from(generation))
+            })
+                .await
+                .map_err(|error| {
+                    Error::from_reason(format!("direct gapless stage task join error: {error}"))
+                })?
+                .into_napi()?;
+            Ok(true)
+        }
+        #[cfg(not(feature = "diretta"))]
+        {
+            let _ = (source, duration_secs, generation);
+            Ok(false)
+        }
+    }
+
+    /// 作废尚未进入音频 ring 的 Direct staged 下一音源。
+    #[napi]
+    pub fn cancel_direct_next(&self) {
+        #[cfg(feature = "diretta")]
+        if let Some(handle) = self.inner.lock().direct_stage_handle() {
+            handle.cancel();
+        }
+    }
+
+    /// renderer 在 directTrackBoundary 后确认其 queue/media 已推进到实际正在播放的下一首。
+    #[napi]
+    pub fn commit_direct_gapless_boundary(&self, source: String, duration_secs: f64) -> Result<()> {
+        #[cfg(feature = "diretta")]
+        {
+            self.inner
+                .lock()
+                .commit_direct_gapless_boundary(&source, duration_secs)
+                .into_napi()
+        }
+        #[cfg(not(feature = "diretta"))]
+        {
+            let _ = (source, duration_secs);
+            Err(Error::from_reason(
+                "[Direct] 当前 audio-engine 未编译 Diretta Host SDK 支持".to_string(),
+            ))
+        }
+    }
+
     /// 设置音量（0.0 ~ 1.0）
     #[napi]
-    pub fn set_volume(&self, volume: f64) {
-        self.inner.lock().set_volume(volume as f32);
+    pub fn set_volume(&self, volume: f64) -> Result<()> {
+        self.inner.lock().set_volume(volume as f32).into_napi()
     }
 
     /// 获取当前音量（0.0 ~ 1.0）
@@ -772,8 +989,11 @@ impl AudioPlayer {
 
     /// 设置暂停/恢复时的渐变时长（毫秒），0 表示禁用渐变
     #[napi]
-    pub fn set_fade_duration(&self, duration_ms: f64) {
-        self.inner.lock().set_fade_duration(duration_ms as u64);
+    pub fn set_fade_duration(&self, duration_ms: f64) -> Result<()> {
+        self.inner
+            .lock()
+            .set_fade_duration(duration_ms as u64)
+            .into_napi()
     }
 
     /// 获取当前渐变时长（毫秒）
@@ -821,8 +1041,11 @@ impl AudioPlayer {
 
     /// 启用/禁用音量归一化（实时响度均衡）
     #[napi]
-    pub fn set_normalization_enabled(&self, enabled: bool) {
-        self.inner.lock().set_normalization_enabled(enabled);
+    pub fn set_normalization_enabled(&self, enabled: bool) -> Result<()> {
+        self.inner
+            .lock()
+            .set_normalization_enabled(enabled)
+            .into_napi()
     }
 
     /// 获取音量归一化开关状态
@@ -833,8 +1056,8 @@ impl AudioPlayer {
 
     /// 启用/禁用 10 频段均衡器
     #[napi]
-    pub fn set_equalizer_enabled(&self, enabled: bool) {
-        self.inner.lock().set_equalizer_enabled(enabled);
+    pub fn set_equalizer_enabled(&self, enabled: bool) -> Result<()> {
+        self.inner.lock().set_equalizer_enabled(enabled).into_napi()
     }
 
     /// 获取均衡器开关状态
@@ -845,9 +1068,9 @@ impl AudioPlayer {
 
     /// 更新均衡器各频段增益（dB），长度必须为 10，范围 [-15, 15]
     #[napi]
-    pub fn set_equalizer_bands(&self, gains_db: Vec<f64>) {
+    pub fn set_equalizer_bands(&self, gains_db: Vec<f64>) -> Result<()> {
         let bands: Vec<f32> = gains_db.into_iter().map(|v| v as f32).collect();
-        self.inner.lock().set_equalizer_bands(&bands);
+        self.inner.lock().set_equalizer_bands(&bands).into_napi()
     }
 
     /// 获取均衡器各频段当前增益（dB）
@@ -863,8 +1086,11 @@ impl AudioPlayer {
 
     /// 设置前级增益（dB），范围 [-12, 12]
     #[napi]
-    pub fn set_preamp_gain(&self, preamp_db: f64) {
-        self.inner.lock().set_preamp_gain(preamp_db as f32);
+    pub fn set_preamp_gain(&self, preamp_db: f64) -> Result<()> {
+        self.inner
+            .lock()
+            .set_preamp_gain(preamp_db as f32)
+            .into_napi()
     }
 
     /// 获取前级增益（dB）
@@ -904,6 +1130,25 @@ impl AudioPlayer {
             .collect()
     }
 
+    /// 异步扫描 Diretta Target，避免网络发现阻塞同步 CPAL 枚举或 Node 主线程。
+    #[napi]
+    pub async fn scan_diretta_devices(&self) -> Result<Vec<JsAudioDevice>> {
+        let devices = tokio::task::spawn_blocking(diretta::scan_devices)
+            .await
+            .map_err(|error| {
+                Error::from_reason(format!("Diretta device scan task join error: {error}"))
+            })?
+            .into_napi()?;
+        Ok(devices
+            .into_iter()
+            .map(|device| JsAudioDevice {
+                id: device.id,
+                name: device.name,
+                is_default: false,
+            })
+            .collect())
+    }
+
     /// 获取系统默认输出设备名称
     #[napi]
     pub fn get_default_device_name(&self) -> Option<String> {
@@ -913,8 +1158,64 @@ impl AudioPlayer {
     /// 切换输出设备（传设备 ID，None/undefined 使用系统默认）
     #[napi]
     pub async fn set_output_device(&self, device_id: Option<String>) -> Result<()> {
-        self.inner.lock().set_output_device(device_id);
-        self.reinit_output().await
+        let new_is_direct = device_id
+            .as_deref()
+            .and_then(diretta::selector_target)
+            .is_some();
+        #[cfg(not(feature = "diretta"))]
+        if new_is_direct {
+            return Err(Error::from_reason(
+                "[Direct] 当前 audio-engine 未编译 Diretta Host SDK 支持".to_string(),
+            ));
+        }
+
+        let (source, position, was_playing, requires_reload) = {
+            let mut player = self.inner.lock();
+            let old_device = player.selected_device().map(String::from);
+            if old_device == device_id {
+                return Ok(());
+            }
+            let old_is_direct = old_device
+                .as_deref()
+                .and_then(diretta::selector_target)
+                .is_some();
+            let source = player.current_source().map(String::from);
+            if new_is_direct {
+                player.validate_direct_entry().into_napi()?;
+                if source
+                    .as_deref()
+                    .is_some_and(|value| value.starts_with("http://") || value.starts_with("https://"))
+                {
+                    return Err(Error::from_reason(
+                        "[Direct] 当前 Direct Lifecycle Gate 仅支持本地 seekable 音源"
+                            .to_string(),
+                    ));
+                }
+            }
+            let position = player.position();
+            let was_playing = player.state() == PlayerState::Playing;
+            let requires_reload = old_is_direct || new_is_direct;
+            if requires_reload && was_playing {
+                player.pause_immediately().into_napi()?;
+            }
+            player.set_output_device(device_id);
+            (source, position, was_playing, requires_reload)
+        };
+
+        if !requires_reload {
+            return self.reinit_output().await;
+        }
+        let Some(source) = source else {
+            return Ok(());
+        };
+        self.load(source, Some(false)).await?;
+        if position > 0.0 {
+            self.seek(position).await?;
+        }
+        if was_playing {
+            self.play().await?;
+        }
+        Ok(())
     }
 
     /// 获取当前选择的输出设备 ID（None = 跟随系统默认）
@@ -927,20 +1228,23 @@ impl AudioPlayer {
 
     /// 设置播放速度（自动 clamp 到 [0.5, 2.0]）
     #[napi]
-    pub fn set_speed(&self, speed: f64) {
-        self.inner.lock().set_speed(speed as f32);
+    pub fn set_speed(&self, speed: f64) -> Result<()> {
+        self.inner.lock().set_speed(speed as f32).into_napi()
     }
 
     /// 设置音调偏移（半音，自动 clamp 到 [-12, 12]）
     #[napi]
-    pub fn set_pitch(&self, semitones: i32) {
-        self.inner.lock().set_pitch(semitones.clamp(-12, 12) as i8);
+    pub fn set_pitch(&self, semitones: i32) -> Result<()> {
+        self.inner
+            .lock()
+            .set_pitch(semitones.clamp(-12, 12) as i8)
+            .into_napi()
     }
 
     /// 设置"音调同步"开关（true = 变速保音调）
     #[napi]
-    pub fn set_pitch_sync(&self, sync: bool) {
-        self.inner.lock().set_pitch_sync(sync);
+    pub fn set_pitch_sync(&self, sync: bool) -> Result<()> {
+        self.inner.lock().set_pitch_sync(sync).into_napi()
     }
 
     /// 获取当前播放速度

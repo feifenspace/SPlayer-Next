@@ -55,75 +55,7 @@ impl DsdRate {
     }
 }
 
-/// 基于 DAC 硬件能力决策的 DSD 播放策略
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DsdPlaybackStrategy {
-    /// 目标 DAC 支持 Native DSD 直通
-    NativeDsd { sample_rate: u32, is_dsd_lsb: bool },
-    /// 目标 DAC 不支持 Native DSD，或采样率超出上限，降采样为 PCM 传输
-    DsdToPcm { pcm_sample_rate: u32, bit_depth: u8 },
-}
 
-impl DsdPlaybackStrategy {
-    /// 根据 Diretta 目标 DAC 的 SinkCaps 硬件能力自动决策 DSD 播放策略
-    pub fn resolve_diretta_strategy(
-        caps: Option<&diretta_sys::DirettaSinkInfo>,
-        requested_rate: DsdRate,
-    ) -> Self {
-        let Some(caps) = caps else {
-            // 默认无能力信息时安全降采样
-            return Self::DsdToPcm {
-                pcm_sample_rate: 176_400,
-                bit_depth: 32,
-            };
-        };
-
-        let req_hz = requested_rate.to_hz();
-
-        // 判定 1: DAC 明确支持 Native DSD，且采样率在 DAC 支持范围内
-        if caps.supports_dsd {
-            let in_rate_range = (caps.dsd_min_sample_rate == 0
-                || req_hz >= caps.dsd_min_sample_rate)
-                && (caps.dsd_max_sample_rate == 0 || req_hz <= caps.dsd_max_sample_rate);
-
-            if in_rate_range {
-                let is_lsb = caps.supports_dsd_lsb && !caps.supports_dsd_msb;
-                return Self::NativeDsd {
-                    sample_rate: req_hz,
-                    is_dsd_lsb: is_lsb,
-                };
-            }
-        }
-
-        // 判定 2: DAC 不支持 DSD 或采样率超出范围 -> 自动决策最高兼容 PCM 采样率
-        let max_pcm = if caps.supports_pcm && caps.pcm_max_sample_rate > 0 {
-            caps.pcm_max_sample_rate
-        } else {
-            192_000
-        };
-
-        let pcm_rate = if max_pcm >= 352_800 && req_hz >= 11_289_600 {
-            352_800
-        } else if max_pcm >= 176_400 {
-            176_400
-        } else if max_pcm >= 88_200 {
-            88_200
-        } else {
-            44_100
-        };
-
-        let bit_depth = if caps.supports_pcm && caps.pcm_max_bits > 0 {
-            caps.pcm_max_bits.min(32)
-        } else {
-            32
-        };
-
-        Self::DsdToPcm {
-            pcm_sample_rate: pcm_rate,
-            bit_depth: bit_depth as u8,
-        }
-    }
-}
 
 /// 检查路径是否为支持的 DSD 音频文件
 pub fn is_dsd_path(path: &str) -> bool {

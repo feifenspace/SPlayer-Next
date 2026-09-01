@@ -136,11 +136,15 @@ impl SacdDisc {
             anyhow::bail!("Not a valid ScarletBook SACD ISO: Master TOC magic missing");
         }
 
-        let area1_toc1_start = u32::from_be_bytes(master_data[32..36].try_into()?);
-        let area1_toc_size = u16::from_be_bytes(master_data[46..48].try_into()?);
+        let area1_toc1_start = u32::from_be_bytes(master_data[64..68].try_into()?);
+        let area1_toc2_start = u32::from_be_bytes(master_data[68..72].try_into()?);
+        let area2_toc1_start = u32::from_be_bytes(master_data[72..76].try_into()?);
+        let area2_toc2_start = u32::from_be_bytes(master_data[76..80].try_into()?);
 
-        let area2_toc1_start = u32::from_be_bytes(master_data[40..44].try_into()?);
-        let area2_toc_size = u16::from_be_bytes(master_data[48..50].try_into()?);
+        let area1_toc_size = u16::from_be_bytes(master_data[84..86].try_into()?);
+        let area2_toc_size = u16::from_be_bytes(master_data[86..88].try_into()?);
+
+        let master_charset = master_data.get(98).copied().unwrap_or(2);
 
         // 解析 Master Text (扇区 511 ~ 518)
         let mut album_title: Option<String> = None;
@@ -155,29 +159,29 @@ impl SacdDisc {
                 let text_chunk = &master_data[offset..offset + 2048];
                 let title_pos = u16::from_be_bytes(text_chunk[16..18].try_into()?) as usize;
                 let artist_pos = u16::from_be_bytes(text_chunk[18..20].try_into()?) as usize;
-                let disc_title_pos = u16::from_be_bytes(text_chunk[24..26].try_into()?) as usize;
-                let disc_artist_pos = u16::from_be_bytes(text_chunk[26..28].try_into()?) as usize;
+                let disc_title_pos = u16::from_be_bytes(text_chunk[32..34].try_into()?) as usize;
+                let disc_artist_pos = u16::from_be_bytes(text_chunk[34..36].try_into()?) as usize;
 
                 if title_pos > 0 && title_pos < 2048 && album_title.is_none() {
-                    let s = decode_scarletbook_charset(&text_chunk[title_pos..], 2);
+                    let s = decode_scarletbook_charset(&text_chunk[title_pos..], master_charset);
                     if !s.is_empty() {
                         album_title = Some(s);
                     }
                 }
                 if artist_pos > 0 && artist_pos < 2048 && album_artist.is_none() {
-                    let s = decode_scarletbook_charset(&text_chunk[artist_pos..], 2);
+                    let s = decode_scarletbook_charset(&text_chunk[artist_pos..], master_charset);
                     if !s.is_empty() {
                         album_artist = Some(s);
                     }
                 }
                 if disc_title_pos > 0 && disc_title_pos < 2048 && disc_title.is_none() {
-                    let s = decode_scarletbook_charset(&text_chunk[disc_title_pos..], 2);
+                    let s = decode_scarletbook_charset(&text_chunk[disc_title_pos..], master_charset);
                     if !s.is_empty() {
                         disc_title = Some(s);
                     }
                 }
                 if disc_artist_pos > 0 && disc_artist_pos < 2048 && disc_artist.is_none() {
-                    let s = decode_scarletbook_charset(&text_chunk[disc_artist_pos..], 2);
+                    let s = decode_scarletbook_charset(&text_chunk[disc_artist_pos..], master_charset);
                     if !s.is_empty() {
                         disc_artist = Some(s);
                     }
@@ -190,10 +194,15 @@ impl SacdDisc {
         let mut multichannel_area_idx: Option<usize> = None;
 
         // 2. 解析 Area 1 (TWOCHTOC 2-Channel Stereo)
-        if area1_toc1_start > 0 && area1_toc_size > 0 {
+        let area1_start = if area1_toc1_start > 0 {
+            area1_toc1_start
+        } else {
+            area1_toc2_start
+        };
+        if area1_start > 0 && area1_toc_size > 0 {
             if let Ok(area) = Self::parse_area(
                 iso_reader,
-                area1_toc1_start,
+                area1_start,
                 area1_toc_size as u32,
                 AreaType::Stereo,
                 album_title.as_deref(),
@@ -206,10 +215,15 @@ impl SacdDisc {
         }
 
         // 3. 解析 Area 2 (MULCHTOC Multi-channel 5.1)
-        if area2_toc1_start > 0 && area2_toc_size > 0 {
+        let area2_start = if area2_toc1_start > 0 {
+            area2_toc1_start
+        } else {
+            area2_toc2_start
+        };
+        if area2_start > 0 && area2_toc_size > 0 {
             if let Ok(area) = Self::parse_area(
                 iso_reader,
-                area2_toc1_start,
+                area2_start,
                 area2_toc_size as u32,
                 AreaType::MultiChannel,
                 album_title.as_deref(),
@@ -256,11 +270,11 @@ impl SacdDisc {
             anyhow::bail!("Invalid Area TOC magic");
         }
 
-        let channel_count = area_data[24];
-        let frame_format = area_data[13] & 0x0F;
+        let frame_format = area_data[21] & 0x0F;
         let is_dst = frame_format == 0; // 0 = DST compressed, 2/3 = uncompressed DSD
-
-        let track_count = area_data[61];
+        let channel_count = area_data[32];
+        let track_count = area_data[69];
+        let area_charset = area_data.get(80).copied().unwrap_or(2);
 
         // 遍历查找 SACDTRL1, SACDTRL2, SACDTTxt
         let mut track_start_lsn: Vec<u32> = Vec::new();
@@ -277,14 +291,16 @@ impl SacdDisc {
 
             if sec_magic == b"SACDTRL1" {
                 // 读取各分轨的 LSN 偏移与长度
+                let start_base = 8;
+                let len_base = 8 + 255 * 4;
                 for i in 0..track_count as usize {
-                    let entry_off = 8 + i * 8;
-                    if entry_off + 8 <= sector_chunk.len() {
+                    let s_off = start_base + i * 4;
+                    let l_off = len_base + i * 4;
+                    if l_off + 4 <= sector_chunk.len() {
                         let s_lsn =
-                            u32::from_be_bytes(sector_chunk[entry_off..entry_off + 4].try_into()?);
-                        let l_lsn = u32::from_be_bytes(
-                            sector_chunk[entry_off + 4..entry_off + 8].try_into()?,
-                        );
+                            u32::from_be_bytes(sector_chunk[s_off..s_off + 4].try_into()?);
+                        let l_lsn =
+                            u32::from_be_bytes(sector_chunk[l_off..l_off + 4].try_into()?);
                         track_start_lsn.push(s_lsn);
                         track_len_lsn.push(l_lsn);
                     }
@@ -333,7 +349,7 @@ impl SacdDisc {
                                 while p < text_ptr.len() && text_ptr[p] != 0 {
                                     p += 1;
                                 }
-                                let item_str = decode_scarletbook_charset(&text_ptr[start_p..p], 2);
+                                let item_str = decode_scarletbook_charset(&text_ptr[start_p..p], area_charset);
                                 if track_type == 0x01
                                     && track_titles[i].is_none()
                                     && !item_str.is_empty()

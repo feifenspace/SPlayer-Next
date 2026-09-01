@@ -1,5 +1,5 @@
 use audio_engine_core::dsd::{
-    is_dsd_path, reverse_byte, Dsd2PcmDecimator, DsdPlaybackStrategy, DsdRate, DsfReader,
+    is_dsd_path, reverse_byte, Dsd2PcmDecimator, DsdRate, DsfReader,
 };
 use std::io::Write;
 
@@ -120,76 +120,4 @@ fn test_dsd2pcm_decimator() {
     }
 }
 
-#[test]
-fn test_dsd_playback_strategy_resolution() {
-    use diretta_sys::DirettaSinkInfo;
 
-    // 场景 1: DAC 支持 Native DSD (DSD64 ~ DSD512)
-    let dac_with_dsd = DirettaSinkInfo {
-        supports_pcm: true,
-        supports_dsd: true,
-        supports_dsd_lsb: false,
-        supports_dsd_msb: true,
-        pcm_min_sample_rate: 44_100,
-        pcm_max_sample_rate: 768_000,
-        pcm_min_bits: 16,
-        pcm_max_bits: 32,
-        dsd_min_sample_rate: 2_822_400,
-        dsd_max_sample_rate: 22_579_200,
-        ..Default::default()
-    };
-
-    let strategy =
-        DsdPlaybackStrategy::resolve_diretta_strategy(Some(&dac_with_dsd), DsdRate::Dsd64);
-    assert_eq!(
-        strategy,
-        DsdPlaybackStrategy::NativeDsd {
-            sample_rate: 2_822_400,
-            is_dsd_lsb: false,
-        }
-    );
-
-    // 场景 2: DAC 不支持 Native DSD (纯 PCM DAC，最高 192kHz/24-bit)
-    let dac_pcm_only = DirettaSinkInfo {
-        supports_pcm: true,
-        supports_dsd: false,
-        pcm_min_sample_rate: 44_100,
-        pcm_max_sample_rate: 192_000,
-        pcm_min_bits: 16,
-        pcm_max_bits: 24,
-        ..Default::default()
-    };
-
-    let strategy =
-        DsdPlaybackStrategy::resolve_diretta_strategy(Some(&dac_pcm_only), DsdRate::Dsd64);
-    assert_eq!(
-        strategy,
-        DsdPlaybackStrategy::DsdToPcm {
-            pcm_sample_rate: 176_400,
-            bit_depth: 24,
-        }
-    );
-
-    // 场景 3: DAC 仅支持到 DSD128 (5.64MHz)，但请求播放 DSD256 (11.28MHz) -> 自动降采样至 PCM 352.8kHz
-    let dac_dsd128_max = DirettaSinkInfo {
-        supports_pcm: true,
-        supports_dsd: true,
-        pcm_min_sample_rate: 44_100,
-        pcm_max_sample_rate: 384_000,
-        pcm_min_bits: 16,
-        pcm_max_bits: 32,
-        dsd_min_sample_rate: 2_822_400,
-        dsd_max_sample_rate: 5_644_800,
-        ..Default::default()
-    };
-
-    let strategy =
-        DsdPlaybackStrategy::resolve_diretta_strategy(Some(&dac_dsd128_max), DsdRate::Dsd256);
-    assert_eq!(
-        strategy,
-        DsdPlaybackStrategy::DsdToPcm {
-            pcm_sample_rate: 352_800,
-            bit_depth: 32,
-        }
-    );
-}

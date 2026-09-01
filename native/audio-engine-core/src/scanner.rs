@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 use crate::metadata;
 
 const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "wav", "ogg", "aac", "m4a", "wma", "opus", "ape", "dsf", "dff", "iso", "cue",
+    "mp3", "flac", "wav", "ogg", "aac", "m4a", "wma", "opus", "ape", "dsf", "dff",
 ];
 
 /// 每批回调的文件数
@@ -65,6 +65,8 @@ pub enum ScanEvent {
         removed_paths: Vec<String>,
         /// 遍历时顺带收集到的 CUE 文件路径
         cue_files: Vec<String>,
+        /// 遍历时顺带收集到的 SACD ISO 镜像路径
+        iso_files: Vec<String>,
         /// 不可达的扫描目录
         unavailable_dirs: Vec<String>,
     },
@@ -82,6 +84,13 @@ fn is_cue_file(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("cue"))
+}
+
+/// 判断文件是否为 SACD ISO 镜像文件
+fn is_iso_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("iso"))
 }
 
 /// 根据本轮可见路径计算已删除文件；遍历不完整的目录必须整体排除
@@ -315,6 +324,7 @@ pub fn scan_directories(
     let mut audio_files: Vec<(String, u64, u64, u64)> = Vec::new();
     let mut scanned_paths: Vec<String> = Vec::new();
     let mut cue_files: Vec<String> = Vec::new();
+    let mut iso_files: Vec<String> = Vec::new();
     // 本轮不可达的目录（NAS 掉线 / 移动硬盘未挂载），其下已有记录不得报告为已删除
     let mut unavailable_dirs: Vec<String> = Vec::new();
 
@@ -345,6 +355,10 @@ pub fn scan_directories(
             }
             if is_cue_file(path) {
                 cue_files.push(path.to_string_lossy().into_owned());
+                continue;
+            }
+            if is_iso_file(path) {
+                iso_files.push(path.to_string_lossy().into_owned());
                 continue;
             }
             if !is_audio_file(path) {
@@ -392,6 +406,7 @@ pub fn scan_directories(
                 total,
                 removed_paths: Vec::new(),
                 cue_files: std::mem::take(&mut cue_files),
+                iso_files: std::mem::take(&mut iso_files),
                 unavailable_dirs,
             });
             return;
@@ -456,16 +471,20 @@ pub fn scan_directories(
         total,
         removed_paths,
         cue_files,
+        iso_files,
         unavailable_dirs,
     });
 }
 
 /// 解析单个 CUE 文件并展开为完整分轨列表
-pub fn probe_cue_tracks(cue_path: &str, _cover_cache_dir: Option<&str>) -> Vec<ScannedTrack> {
+pub fn probe_cue_tracks(cue_path: &str, cover_cache_dir: Option<&str>) -> Vec<ScannedTrack> {
     let (mtime, ctime, file_size) = file_stat(Path::new(cue_path)).unwrap_or((0, 0, 0));
     let Ok(cue) = crate::cue::CueSheet::parse_file(cue_path) else {
         return Vec::new();
     };
+
+    let cover = cover_cache_dir
+        .and_then(|dir| crate::metadata::extract_folder_cover_thumbnail(cue_path, dir));
 
     let mut tracks = Vec::new();
     for t in cue.tracks {
@@ -496,7 +515,7 @@ pub fn probe_cue_tracks(cue_path: &str, _cover_cache_dir: Option<&str>) -> Vec<S
             bit_rate,
             channels,
             bits_per_sample,
-            cover: None,
+            cover: cover.clone(),
             file_size,
             mtime,
             ctime,
@@ -506,7 +525,7 @@ pub fn probe_cue_tracks(cue_path: &str, _cover_cache_dir: Option<&str>) -> Vec<S
 }
 
 /// 解析单个 SACD ISO 镜像文件并展开为全部音轨列表
-pub fn probe_sacd_tracks(iso_path: &str) -> Vec<ScannedTrack> {
+pub fn probe_sacd_tracks(iso_path: &str, cover_cache_dir: Option<&str>) -> Vec<ScannedTrack> {
     let (mtime, ctime, file_size) = file_stat(Path::new(iso_path)).unwrap_or((0, 0, 0));
     let Ok(mut reader) = crate::sacd::IsoReader::open(iso_path) else {
         return Vec::new();
@@ -527,6 +546,9 @@ pub fn probe_sacd_tracks(iso_path: &str) -> Vec<ScannedTrack> {
         return Vec::new();
     };
 
+    let cover = cover_cache_dir
+        .and_then(|dir| crate::metadata::extract_folder_cover_thumbnail(iso_path, dir));
+
     let mut tracks = Vec::new();
     for t in &area.tracks {
         tracks.push(ScannedTrack {
@@ -545,7 +567,7 @@ pub fn probe_sacd_tracks(iso_path: &str) -> Vec<ScannedTrack> {
             bit_rate: t.bit_rate as i64,
             channels: t.channels as u32,
             bits_per_sample: 1,
-            cover: None,
+            cover: cover.clone(),
             file_size,
             mtime,
             ctime,

@@ -12,7 +12,6 @@ use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample, StreamConfig, SupportedStreamConfig};
 use tracing::{debug, info, warn};
 
-use crate::diretta_output::{acquire_diretta_output, DirettaShared};
 use crate::error::{AudioErrorKind, AudioResultExt};
 use crate::source::DecoderSource;
 
@@ -20,30 +19,13 @@ use crate::source::DecoderSource;
 /// 禁止获取 `InnerPlayer` 锁、join 线程、枚举设备、创建新流或调用 NAPI async 方法。
 pub type OutputFailureCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
-/// 单次播放使用的输出流：cpal 设备流，或 Diretta 常驻推流线程的句柄标记。
-///
-/// Diretta 分支的实际推流由 `DirettaShared` 的常驻线程承担，
-/// 此变体只是类型占位，play/pause 通过共享原子标志传达。
-pub enum PlaybackStream {
-    Cpal(cpal::Stream),
-    Diretta,
-}
-
-/// 输出后端：cpal 本地设备，或 Diretta 网络音频 Target
-enum OutputBackend {
-    Cpal {
-        device: cpal::Device,
-        config: SupportedStreamConfig,
-    },
-    Diretta(DirettaShared),
-}
-
 /// 输出设备与配置句柄。`Send`，可放进 `InnerPlayer` 而不需 `unsafe impl Send`。
 ///
 /// 不持有 `cpal::Stream`——输出流由每次加载音源时的 `PlaybackHandle::attach` 按此配置创建，
 /// 因此切歌时无需跨线程移交流，也天然避免新旧流重叠占用设备。
 pub struct AudioOutput {
-    backend: OutputBackend,
+    device: cpal::Device,
+    config: SupportedStreamConfig,
     /// 该输出流的单调代次，用于诊断和过滤销毁后迟到的流错误
     generation: u64,
     on_failure: OutputFailureCallback,
@@ -53,8 +35,7 @@ impl AudioOutput {
     /// 解析输出设备与配置
     ///
     /// # Arguments
-    /// * `device_id` - 输出设备 ID，`None` 走系统默认设备；
-    ///   `diretta:` / `diretta@` 前缀路由到 Diretta 网络音频后端
+    /// * `device_id` - 输出设备 ID，`None` 走系统默认设备
     /// * `requested_sample_rate` - 期望输出采样率；设备支持时按此速率打开（音源精确采样率），
     ///   否则回退到设备默认配置。`None` 表示直接用设备默认配置
     /// * `generation` - 输出流单调代次，见 [`AudioOutput`] 字段说明
@@ -63,31 +44,23 @@ impl AudioOutput {
     /// # Errors
     /// - 找不到指定设备
     /// - 无可用音频设备
-    /// - Diretta Target 连接失败
     pub fn new(
         device_id: Option<&str>,
         requested_sample_rate: Option<u32>,
         generation: u64,
         on_failure: OutputFailureCallback,
     ) -> Result<Self> {
-        let backend = open_backend(device_id, requested_sample_rate, &on_failure)
+        let (device, config) = open_device(device_id, requested_sample_rate)
             .with_audio_kind(AudioErrorKind::Device)?;
-        match &backend {
-            OutputBackend::Cpal { device, config } => info!(
-                id = device_id_string(device).as_deref().unwrap_or("-"),
-                name = %device,
-                sample_rate = config.sample_rate(),
-                "打开音频输出配置"
-            ),
-            OutputBackend::Diretta(shared) => info!(
-                generation,
-                sample_rate = shared.sample_rate(),
-                channels = shared.channels(),
-                "Diretta 输出后端就绪"
-            ),
-        }
+        info!(
+            id = device_id_string(&device).as_deref().unwrap_or("-"),
+            name = %device,
+            sample_rate = config.sample_rate(),
+            "打开音频输出配置"
+        );
         Ok(Self {
-            backend,
+            device,
+            config,
             generation,
             on_failure,
         })
@@ -95,52 +68,29 @@ impl AudioOutput {
 
     /// 实际输出流采样率（播放重采样目标）
     pub fn sample_rate(&self) -> u32 {
-        match &self.backend {
-            OutputBackend::Cpal { config, .. } => config.sample_rate(),
-            OutputBackend::Diretta(shared) => shared.sample_rate(),
-        }
+        self.config.sample_rate()
     }
 
     /// 实际输出流声道数
     pub fn channels(&self) -> u16 {
-        match &self.backend {
-            OutputBackend::Cpal { config, .. } => config.channels(),
-            OutputBackend::Diretta(shared) => shared.channels(),
-        }
+        self.config.channels()
     }
 
     /// 按本配置创建一次播放的输出流，实时回调从 `source` 拉取样本。
     /// 调用方持有返回的 `Stream`，直到本次播放结束。
-    ///
-    /// Diretta 分支不新建流：把播放资源交给常驻推流线程（连接保持不断开），
-    /// `paused` 初始状态也随资源下发，恢复播放由共享原子标志控制。
     pub(crate) fn build_stream(
         &self,
         source: DecoderSource,
         volume: Arc<AtomicU32>,
         stopped: Arc<AtomicBool>,
-        paused: Arc<AtomicBool>,
-    ) -> Result<PlaybackStream> {
-        match &self.backend {
-            OutputBackend::Cpal { device, config } => {
-                let device = device.clone();
-                let config = config.clone();
-                let on_failure = Arc::clone(&self.on_failure);
-                run_in_mta(move || {
-                    build_typed_stream_for_format(
-                        &device, &config, source, volume, stopped, on_failure,
-                    )
-                })
-                .with_audio_kind(AudioErrorKind::Device)
-                .map(PlaybackStream::Cpal)
-            }
-            OutputBackend::Diretta(shared) => {
-                shared
-                    .attach_source(source, volume, stopped, paused, Arc::clone(&self.on_failure))
-                    .with_audio_kind(AudioErrorKind::Device)?;
-                Ok(PlaybackStream::Diretta)
-            }
-        }
+    ) -> Result<cpal::Stream> {
+        let device = self.device.clone();
+        let config = self.config.clone();
+        let on_failure = Arc::clone(&self.on_failure);
+        run_in_clean_mta(move || {
+            build_typed_stream_for_format(&device, &config, source, volume, stopped, on_failure)
+        })
+        .with_audio_kind(AudioErrorKind::Device)
     }
 }
 
@@ -150,95 +100,27 @@ impl Drop for AudioOutput {
     }
 }
 
-/// 按设备选择器构建输出后端。
-///
-/// `diretta:` / `diretta@` 前缀路由到 [`crate::diretta_output`]（连接按目标缓存复用，
-/// 切歌不断开）；其余选择器走 cpal 设备查找。
-fn open_backend(
-    device_id: Option<&str>,
-    requested_sample_rate: Option<u32>,
-    on_failure: &OutputFailureCallback,
-) -> Result<OutputBackend> {
-    if let Some(selector) = device_id {
-        if let Some(target) = selector
-            .strip_prefix("diretta:")
-            .or_else(|| selector.strip_prefix("diretta@"))
-        {
-            let if_idx = crate::diretta_output::parse_interface_index(target);
-            let shared = acquire_diretta_output(
-                target,
-                if_idx,
-                requested_sample_rate,
-                Arc::clone(on_failure),
-            )?;
-            return Ok(OutputBackend::Diretta(shared));
-        }
-    }
-    let (device, config) = open_device(device_id, requested_sample_rate)?;
-    Ok(OutputBackend::Cpal { device, config })
-}
-
-/// 常驻 MTA 工作线程，所有 cpal 调用都派给它执行。
-///
-/// cpal 的 `com_initialized()` 会把首次触碰的线程初始化成 STA，而跟随系统默认设备时
-/// 用到的 `ActivateAudioInterfaceAsync` 只能在 MTA 调用，STA 上直接返回
-/// `RPC_E_CHANGED_MODE`；cpal 的 `IMMDeviceEnumerator` 又是进程级单例，创建时所处的
-/// apartment 决定它此后能否跨线程安全使用。一条永不退出、永不 `CoUninitialize` 的 MTA
-/// 线程同时收口这两点，并保证进程 MTA 不会在两次调用之间被拆掉——`AudioOutput` 持有的
-/// `cpal::Device` 里缓存着在该 apartment 里激活的 `IAudioClient`。
+/// 在干净的 COM MTA 线程环境中运行任务（Windows 特需，防止 Node.js STA 或线程池残留的 COM 冲突）
 #[cfg(target_os = "windows")]
-mod mta {
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::mpsc::{channel, sync_channel, SyncSender};
-    use std::sync::OnceLock;
-    use std::thread;
-
-    use anyhow::{anyhow, Result};
-    use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
-
-    type Job = Box<dyn FnOnce() + Send + 'static>;
-
-    static WORKER: OnceLock<Option<SyncSender<Job>>> = OnceLock::new();
-
-    fn worker() -> Result<&'static SyncSender<Job>> {
-        WORKER
-            .get_or_init(|| {
-                let (job_tx, job_rx) = sync_channel::<Job>(1);
-                thread::Builder::new()
-                    .name("audio-mta-worker".into())
-                    .spawn(move || {
-                        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-                        for job in job_rx {
-                            // cpal 的设备枚举路径上有 unwrap/expect，单个任务 panic 不能带走整条线程
-                            let _ = catch_unwind(AssertUnwindSafe(job));
-                        }
-                    })
-                    .ok()
-                    .map(|_| job_tx)
-            })
-            .as_ref()
-            .ok_or_else(|| anyhow!("启动 MTA 线程失败"))
-    }
-
-    /// 把 `f` 派给 MTA 线程执行并等待结果。调用按到达顺序串行执行
-    pub(super) fn run<T: Send + 'static>(
-        f: impl FnOnce() -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let (result_tx, result_rx) = channel();
-        worker()?
-            .send(Box::new(move || {
-                let _ = result_tx.send(f());
-            }))
-            .map_err(|_| anyhow!("MTA 线程已退出"))?;
-        result_rx.recv().map_err(|_| anyhow!("MTA 线程发生 panic"))?
-    }
+fn run_in_clean_mta<T: Send + 'static, F: FnOnce() -> Result<T> + Send + 'static>(
+    f: F,
+) -> Result<T> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    std::thread::Builder::new()
+        .name("audio-mta-worker".into())
+        .spawn(move || {
+            let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+            let result = f();
+            unsafe { CoUninitialize() };
+            result
+        })
+        .map_err(|e| anyhow!("启动 MTA 线程失败: {e}"))?
+        .join()
+        .map_err(|_| anyhow!("MTA 线程发生 panic"))?
 }
-
-#[cfg(target_os = "windows")]
-use mta::run as run_in_mta;
 
 #[cfg(not(target_os = "windows"))]
-fn run_in_mta<T, F: FnOnce() -> Result<T>>(f: F) -> Result<T> {
+fn run_in_clean_mta<T, F: FnOnce() -> Result<T>>(f: F) -> Result<T> {
     f()
 }
 
@@ -275,7 +157,7 @@ fn find_device(host: &cpal::Host, selector: &str) -> Option<cpal::Device> {
 /// 枚举所有输出设备，返回 `(id, name, is_default)` 列表
 /// 纯查询，不涉及流状态，调用方任意线程都能用
 pub fn list_output_devices() -> Vec<(String, String, bool)> {
-    run_in_mta(|| {
+    run_in_clean_mta(|| {
         let host = cpal::default_host();
         let default_id = host
             .default_output_device()
@@ -308,7 +190,7 @@ pub fn list_output_devices() -> Vec<(String, String, bool)> {
 
 /// 取系统默认输出设备名
 pub fn default_device_name() -> Option<String> {
-    run_in_mta(|| {
+    run_in_clean_mta(|| {
         let name = cpal::default_host()
             .default_output_device()
             .and_then(|device| persisted_device_name(&device));
@@ -390,7 +272,7 @@ fn open_device(
     requested_sample_rate: Option<u32>,
 ) -> Result<(cpal::Device, SupportedStreamConfig)> {
     let id_owned = device_id.map(String::from);
-    run_in_mta(move || open_device_internal(id_owned.as_deref(), requested_sample_rate))
+    run_in_clean_mta(move || open_device_internal(id_owned.as_deref(), requested_sample_rate))
 }
 
 /// 按样本格式分发到类型化构建
@@ -449,12 +331,7 @@ where
             }
         },
         move |error| {
-            let err_msg = error.to_string();
-            if err_msg.contains("no longer valid") {
-                info!("音频输出流因设备切换失效，准备重建");
-            } else {
-                warn!(%error, "音频输出流失败");
-            }
+            warn!(%error, "音频输出流失败");
             on_failure();
         },
         None,

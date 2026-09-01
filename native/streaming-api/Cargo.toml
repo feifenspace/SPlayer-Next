@@ -14,7 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 md5 = "0.7"
 thiserror = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }
 urlencoding = "2"
 tokio = { version = "1", features = ["time", "sync"] }
 base64 = "0.22"

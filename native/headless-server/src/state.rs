@@ -150,6 +150,20 @@ impl AppState {
                         *snapshot.write() = Some(ws_state);
                         let _ = ws_tx.send(serde_json::json!({ "type": "sourceError" }));
                     }
+                    PlayerEvent::DirectTrackBoundary { duration, generation } => {
+                        let ws_state = WsState {
+                            position: 0.0,
+                            duration,
+                            volume: current.as_ref().map(|s| s.volume).unwrap_or(1.0),
+                            state: PlayerState::Playing,
+                        };
+                        *snapshot.write() = Some(ws_state);
+                        let _ = ws_tx.send(serde_json::json!({
+                            "type": "directTrackBoundary",
+                            "duration": duration,
+                            "generation": generation,
+                        }));
+                    }
                     // 输出停滞/失败：InnerPlayer 已通过 failure 回调异步重建输出流，WS 侧无需动作
                     PlayerEvent::OutputStalled | PlayerEvent::OutputFailed => {}
                     #[allow(unreachable_patterns)]

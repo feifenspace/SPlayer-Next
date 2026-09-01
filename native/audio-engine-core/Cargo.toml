@@ -72,16 +72,18 @@ features = [
 ]
 
 [features]
-default = ["fft", "midi", "pipewire", "pulseaudio"]
+default = ["fft", "midi", "pipewire", "pulseaudio", "diretta"]
 fft = ["dep:rustfft"]
 midi = ["dep:rustysynth"]
 pipewire = ["dep:pipewire", "cpal/pipewire"]
 pulseaudio = ["cpal/pulseaudio"]
 napi = ["pipewire", "pulseaudio"]
-headless = []
+headless = ["diretta"]
 windows_device = []
+diretta = []
 
 [dev-dependencies]
+base64 = "0.22"
 httpmock = "0.8.3"
 tempfile = "3"
 

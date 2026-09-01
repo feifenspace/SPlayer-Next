@@ -16,12 +16,13 @@ md5 = "0.7"
 num-bigint-dig = "0.8"
 num-traits = "0.2"
 thiserror = "2"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "deflate"] }
 urlencoding = "2"
 tokio = { version = "1", features = ["time"] }
 flate2 = "1"
 base64 = "0.22"
 regex = "1"
+sha1 = "0.10"
 
 
 [dev-dependencies]

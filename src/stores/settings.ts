@@ -283,12 +283,21 @@ export const useSettingsStore = defineStore(
       storage: localStorage,
       omit: ["system"],
       afterHydrate: ({ store }) => {
-        const { lyric } = store as unknown as { lyric: LyricSettings };
-        if (typeof lyric.detectBackgroundLyrics !== "boolean") {
-          lyric.detectBackgroundLyrics = true;
+        const s = store as unknown as { lyric: LyricSettings; player: PlayerSettings };
+        if (typeof s.lyric?.detectBackgroundLyrics !== "boolean") {
+          s.lyric.detectBackgroundLyrics = true;
         }
-        lyric.lyricSourceOrder = reconcileOrder(lyric.lyricSourceOrder, ALL_PLATFORMS);
-        lyric.lyricFormatOrder = reconcileOrder(lyric.lyricFormatOrder, DEFAULT_LYRIC_FORMAT_ORDER);
+        if (
+          s.player &&
+          (s.player.outputDevice === "diretta:undefined" ||
+            s.player.outputDevice === "undefined" ||
+            s.player.outputDevice === "diretta:null" ||
+            s.player.outputDevice === "system-default")
+        ) {
+          s.player.outputDevice = null;
+        }
+        s.lyric.lyricSourceOrder = reconcileOrder(s.lyric.lyricSourceOrder, ALL_PLATFORMS);
+        s.lyric.lyricFormatOrder = reconcileOrder(s.lyric.lyricFormatOrder, DEFAULT_LYRIC_FORMAT_ORDER);
       },
     },
   },

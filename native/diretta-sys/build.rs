@@ -5,67 +5,49 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
-    println!("cargo:rerun-if-changed=include/diretta_c_api.h");
-    println!("cargo:rerun-if-changed=src/diretta_c_shim.cpp");
+    println!("cargo:rustc-check-cfg=cfg(diretta_sdk_enabled)");
+    println!("cargo:rerun-if-changed=include/diretta_bridge.h");
+    println!("cargo:rerun-if-changed=src/bridge.cpp");
     println!("cargo:rerun-if-env-changed=DIRETTA_ARCH");
     println!("cargo:rerun-if-env-changed=DIRETTA_SDK_DIR");
+    println!("cargo:rerun-if-env-changed=DIRETTA_SDK_ROOT");
     println!("cargo:rerun-if-env-changed=DIRETTA_USE_SDK_LOG");
 
-    // 定位 SDK 根目录（优先 150，其次 149 / 148）
-    let sdk_dir = env::var("DIRETTA_SDK_DIR")
+    // 定位 SDK 根目录（优先环境变量，其次 150/149/148）
+    let sdk_dir_opt = env::var("DIRETTA_SDK_DIR")
+        .or_else(|_| env::var("DIRETTA_SDK_ROOT"))
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
+        .ok()
+        .or_else(|| {
             let p150 = PathBuf::from("/home/songlian/DirettaHostSDK_150");
             let p149 = PathBuf::from("/home/songlian/DirettaHostSDK_149");
             let p148 = PathBuf::from("/home/songlian/DirettaHostSDK_148");
             if p150.exists() {
-                p150
+                Some(p150)
             } else if p149.exists() {
-                p149
+                Some(p149)
+            } else if p148.exists() {
+                Some(p148)
             } else {
-                p148
+                None
             }
         });
+
+    let Some(sdk_dir) = sdk_dir_opt else {
+        println!("cargo:warning=[diretta-sys] DirettaHostSDK not found, building stub mode.");
+        return;
+    };
 
     let sdk_include = sdk_dir.join("Host");
     let sdk_lib = sdk_dir.join("lib");
 
-    if !sdk_dir.exists() {
-        panic!(
-            "DirettaHostSDK not found at {}. Please set DIRETTA_SDK_DIR environment variable.",
+    if !sdk_include.is_dir() || !sdk_lib.is_dir() {
+        println!(
+            "cargo:warning=[diretta-sys] DirettaHostSDK Host/ or lib/ missing at {}, skipping native link",
             sdk_dir.display()
         );
+        return;
     }
-
-    // 动态探测 SDK Release 版本
-    let release_header = sdk_include.join("Release.hpp");
-    let release_no = if release_header.exists() {
-        std::fs::read_to_string(&release_header)
-            .ok()
-            .and_then(|content| {
-                for line in content.lines() {
-                    if line.contains("ReleaseNo") {
-                        let parts: Vec<&str> = line.split('=').collect();
-                        if parts.len() >= 2 {
-                            let val_str = parts[1].trim().trim_end_matches(';').trim();
-                            if let Ok(v) = val_str.parse::<u16>() {
-                                return Some(v);
-                            }
-                        }
-                    }
-                }
-                None
-            })
-            .unwrap_or(150)
-    } else {
-        150
-    };
-
-    let sdk_define = match release_no {
-        150 => "DIRETTA_SDK_150",
-        149 => "DIRETTA_SDK_149",
-        _ => "DIRETTA_SDK_148",
-    };
 
     // 微架构判定
     let diretta_arch = env::var("DIRETTA_ARCH").unwrap_or_else(|_| "auto".to_string());
@@ -74,23 +56,24 @@ fn main() {
         .unwrap_or(false);
     let (suffix, march) = resolve_arch(&target_arch, &diretta_arch, use_sdk_log);
 
-    println!("cargo:warning=[diretta-sys] Building for arch: target_arch={}, resolved_arch={}, suffix={}, march={}, sdk_release={}, sdk_log={}",
-             target_arch, diretta_arch, suffix, march, release_no, if use_sdk_log { "on" } else { "off" });
+    println!(
+        "cargo:warning=[diretta-sys] Building for arch: target_arch={}, resolved_arch={}, suffix={}, march={}, sdk_log={}",
+        target_arch, diretta_arch, suffix, march, if use_sdk_log { "on" } else { "off" }
+    );
 
-    // 编译 C++ shim
+    // 编译 C++ 桥接
     let mut build = cc::Build::new();
     build
         .cpp(true)
-        .std("c++17")
-        .define(sdk_define, None)
-        .file("src/diretta_c_shim.cpp")
+        .std("c++20")
+        .file("src/bridge.cpp")
         .include("include")
         .include(&sdk_include)
-        .flag("-fPIC")
-        .flag("-O3")
-        .flag(&format!("-march={}", march));
+        .flag_if_supported("-fPIC")
+        .flag_if_supported("-O3")
+        .flag_if_supported(&format!("-march={}", march));
 
-    build.compile("diretta_c_shim");
+    build.compile("splayer_diretta_bridge");
 
     // 静态链接 SDK 库
     let host_lib_name = format!("libDirettaHost_{}.a", suffix);
@@ -99,16 +82,17 @@ fn main() {
     let host_lib_path = sdk_lib.join(&host_lib_name);
     let acqua_lib_path = sdk_lib.join(&acqua_lib_name);
 
-    if !host_lib_path.exists() {
-        panic!("Diretta static lib not found: {}", host_lib_path.display());
-    }
-    if !acqua_lib_path.exists() {
-        panic!("ACQUA static lib not found: {}", acqua_lib_path.display());
+    if !host_lib_path.exists() || !acqua_lib_path.exists() {
+        println!(
+            "cargo:warning=[diretta-sys] Static libs not found: {} or {}",
+            host_lib_path.display(),
+            acqua_lib_path.display()
+        );
+        return;
     }
 
     println!("cargo:rustc-link-search=native={}", sdk_lib.display());
 
-    // 链接 Direct SDK 静态库 (去除 "lib" 前缀和 ".a" 后缀)
     let host_link_name = host_lib_name.trim_start_matches("lib").trim_end_matches(".a");
     let acqua_link_name = acqua_lib_name.trim_start_matches("lib").trim_end_matches(".a");
 
@@ -117,15 +101,17 @@ fn main() {
 
     // 链接系统依赖
     if target_os == "linux" {
-        println!("cargo:rustc-link-lib=stdc++");
-        println!("cargo:rustc-link-lib=pthread");
-        println!("cargo:rustc-link-lib=rt");
-        println!("cargo:rustc-link-lib=m");
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+        println!("cargo:rustc-link-lib=dylib=pthread");
+        println!("cargo:rustc-link-lib=dylib=dl");
+        println!("cargo:rustc-link-lib=dylib=m");
+        println!("cargo:rustc-link-lib=dylib=atomic");
     }
+
+    println!("cargo:rustc-cfg=diretta_sdk_enabled");
 }
 
 fn resolve_arch(target_arch: &str, requested_arch: &str, use_sdk_log: bool) -> (String, String) {
-    // 后缀：带日志版本去掉 "-nolog"，启用 SDK 内部 SysLog
     let log_suffix = if use_sdk_log { "" } else { "-nolog" };
 
     if target_arch == "aarch64" || requested_arch == "aarch64" || requested_arch == "arm64" {

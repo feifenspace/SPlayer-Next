@@ -757,7 +757,16 @@ export class HttpPlayerClient implements IPlayerClient {
   }
 
   async setOutputDevice(deviceName: string | null): Promise<IpcResponse> {
-    return this.selectDirettaTarget(deviceName);
+    const sanitized =
+      !deviceName ||
+      deviceName === "system-default" ||
+      deviceName === "undefined" ||
+      deviceName === "diretta:undefined" ||
+      deviceName === "null" ||
+      deviceName === "diretta:null"
+        ? null
+        : deviceName;
+    return this.selectDirettaTarget(sanitized);
   }
 
   async getSelectedDeviceName(): Promise<IpcResponse<string | null>> {
