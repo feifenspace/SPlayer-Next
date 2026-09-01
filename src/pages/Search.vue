@@ -196,6 +196,12 @@ const isAuthError = computed(() => {
   );
 });
 
+/** 当前 tab 是否无结果 */
+const isEmptyResult = computed(() => {
+  const state = states[activeTab.value];
+  return state.loaded && state.items.length === 0 && !state.loading && !error.value;
+});
+
 const loginDialogOpen = ref(false);
 const loginDialogTab = ref<"qobuz" | "tidal">("qobuz");
 
@@ -215,6 +221,7 @@ const onLoginDialogClose = (open: boolean): void => {
   }
 };
 </script>
+
 
 <template>
   <div class="flex flex-col h-full">
@@ -268,11 +275,12 @@ const onLoginDialogClose = (open: boolean): void => {
             : '搜索与播放该平台曲目需要先登录账号' }}
         </div>
         <div class="flex items-center gap-3">
-          <SButton variant="primary" size="medium" @click="openLoginModal">
+          <SButton type="primary" variant="filled" size="medium" @click="openLoginModal">
             <template #icon><IconLucideLogIn class="size-4" /></template>
             登录 {{ status.searchPlatform === 'tidal' ? 'TIDAL' : status.searchPlatform === 'qobuz' ? 'Qobuz' : status.searchPlatform.toUpperCase() }}
           </SButton>
           <SButton variant="secondary" size="medium" @click="onRetry">
+
             <template #icon><IconLucideRotateCw class="size-4" /></template>
             {{ t("common.retry") }}
           </SButton>

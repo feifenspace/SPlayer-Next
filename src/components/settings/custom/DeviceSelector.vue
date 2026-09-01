@@ -48,10 +48,11 @@ const options = computed(() => {
   if (direttaTargets.value.length > 0) {
     for (const target of direttaTargets.value) {
       const displayName = target.target_name || target.output_name || target.model_name || (target as any).name || "Target";
-      const targetVal = typeof target.id === "string" && target.id.startsWith("diretta:")
-        ? target.id
+      const targetVal = typeof (target as any).id === "string" && (target as any).id.startsWith("diretta:")
+        ? (target as any).id
         : `diretta:${target.full_addr || target.ipv6_addr || (target as any).id}`;
       opts.push({
+
         value: targetVal,
         label: `Diretta: ${displayName}`,
       });
