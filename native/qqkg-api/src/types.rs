@@ -79,6 +79,31 @@ pub struct KugouQrCheckResponse {
     pub vip_type: Option<String>,
 }
 
+/// QQ 音乐扫码 Key 响应（对齐前端 QmQrKeyResponse）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QmQrKeyResponse {
+    pub code: i32,
+    pub key: String,
+    pub content: String,
+    #[serde(rename = "type")]
+    pub qr_type: String,
+}
+
+/// QQ 音乐扫码状态轮询响应（对齐前端 QmQrCheckResponse 及凭据下发）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QmQrCheckResponse {
+    pub code: i32,
+    pub status: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cookies: Option<HashMap<String, String>>,
+}
+
+
 
 /// 搜索类型（前端 type 参数的内部表示）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

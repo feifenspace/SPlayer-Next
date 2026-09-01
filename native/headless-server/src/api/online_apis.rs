@@ -375,10 +375,47 @@ async fn call_qqmusic(
             let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
             to_qqkg_resp(client.hot_search().await)
         }
+        "login_qr_key" => {
+            let qr_type = params.get("type").and_then(Value::as_str).unwrap_or("qq");
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            match client.login_qr_key(qr_type).await {
+                Ok(resp) => ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default()),
+                Err(e) => ApiCallResponse::err(format!("QM login_qr_key error: {e}")),
+            }
+        }
+        "login_qr_check" => {
+            let key = params.get("key").and_then(Value::as_str).unwrap_or("");
+            let qr_type = params.get("type").and_then(Value::as_str).unwrap_or("qq");
+            let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
+            match client.login_qr_check(key, qr_type).await {
+                Ok(check_resp) => {
+                    // 当扫码成功 (status == 4) 且带有 cookies 时，将返回的凭据持久化到 account_sessions
+                    if check_resp.status == 4 {
+                        if let Some(new_cookies) = &check_resp.cookies {
+                            let mut cookies_map = load_platform_cookies(db, "qqmusic");
+                            for (k, v) in new_cookies {
+                                cookies_map.insert(k.clone(), v.clone());
+                            }
+                            if let Some(nickname) = &check_resp.nickname {
+                                cookies_map.insert("nickname".to_string(), nickname.clone());
+                            }
+                            if let Some(avatar) = &check_resp.avatar_url {
+                                cookies_map.insert("avatar".to_string(), avatar.clone());
+                            }
+                            let conn = db.lock();
+                            let _ = crate::db::save_account_cookies(&conn, "qqmusic", &cookies_map);
+                        }
+                    }
+                    ApiCallResponse::ok_data(serde_json::to_value(check_resp).unwrap_or_default())
+                }
+                Err(e) => ApiCallResponse::err(format!("QM login_qr_check error: {e}")),
+            }
+        }
         "lyric" => {
             let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
             to_qqkg_resp(client.lyric(&params).await)
         }
+
 
         _ => {
             // 通用 fcg 请求封装

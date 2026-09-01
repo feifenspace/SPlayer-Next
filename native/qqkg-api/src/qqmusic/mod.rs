@@ -7,11 +7,13 @@ mod album;
 mod artist;
 mod hot_search;
 mod leaderboard;
+mod login_qr;
 mod lyric;
 mod search;
 mod song_list;
 mod song_url;
 mod user_detail;
+
 
 pub use song_url::{get_song_url, qq_sign};
 
