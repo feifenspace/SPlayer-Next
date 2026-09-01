@@ -63,40 +63,30 @@ struct QualityCandidate {
     prefix: &'static str,
     ext: &'static str,
     level: &'static str,
+    size_key: &'static str,
 }
 
-fn get_candidates(level: &str) -> Vec<QualityCandidate> {
+const LADDER: &[QualityCandidate] = &[
+    QualityCandidate { prefix: "RS01", ext: ".flac", level: "hi-res", size_key: "size_hires" },
+    QualityCandidate { prefix: "AI00", ext: ".flac", level: "hi-res", size_key: "size_hires" },
+    QualityCandidate { prefix: "Q000", ext: ".flac", level: "hi-res", size_key: "size_dolby" },
+    QualityCandidate { prefix: "FD00", ext: ".flac", level: "lossless", size_key: "size_flac" },
+    QualityCandidate { prefix: "F000", ext: ".flac", level: "lossless", size_key: "size_flac" },
+    QualityCandidate { prefix: "A000", ext: ".ape", level: "lossless", size_key: "size_ape" },
+    QualityCandidate { prefix: "M800", ext: ".mp3", level: "hq", size_key: "size_320mp3" },
+    QualityCandidate { prefix: "O800", ext: ".ogg", level: "hq", size_key: "size_320ogg" },
+    QualityCandidate { prefix: "M500", ext: ".mp3", level: "sq", size_key: "size_128mp3" },
+    QualityCandidate { prefix: "C400", ext: ".m4a", level: "lq", size_key: "size_96aac" },
+];
+
+fn get_start_index(level: &str) -> usize {
     match level.to_lowercase().as_str() {
-        "hi-res" => vec![
-            QualityCandidate { prefix: "AI00", ext: ".flac", level: "hi-res" },
-            QualityCandidate { prefix: "RS01", ext: ".flac", level: "hi-res" },
-            QualityCandidate { prefix: "Q000", ext: ".flac", level: "hi-res" },
-            QualityCandidate { prefix: "FD00", ext: ".flac", level: "lossless" },
-            QualityCandidate { prefix: "F000", ext: ".flac", level: "lossless" },
-            QualityCandidate { prefix: "M800", ext: ".mp3", level: "hq" },
-            QualityCandidate { prefix: "M500", ext: ".mp3", level: "sq" },
-            QualityCandidate { prefix: "C400", ext: ".m4a", level: "lq" },
-        ],
-        "lossless" => vec![
-            QualityCandidate { prefix: "FD00", ext: ".flac", level: "lossless" },
-            QualityCandidate { prefix: "F000", ext: ".flac", level: "lossless" },
-            QualityCandidate { prefix: "M800", ext: ".mp3", level: "hq" },
-            QualityCandidate { prefix: "M500", ext: ".mp3", level: "sq" },
-            QualityCandidate { prefix: "C400", ext: ".m4a", level: "lq" },
-        ],
-        "hq" => vec![
-            QualityCandidate { prefix: "M800", ext: ".mp3", level: "hq" },
-            QualityCandidate { prefix: "M500", ext: ".mp3", level: "sq" },
-            QualityCandidate { prefix: "C400", ext: ".m4a", level: "lq" },
-        ],
-        "sq" => vec![
-            QualityCandidate { prefix: "M500", ext: ".mp3", level: "sq" },
-            QualityCandidate { prefix: "C400", ext: ".m4a", level: "lq" },
-        ],
-        _ => vec![
-            QualityCandidate { prefix: "C400", ext: ".m4a", level: "lq" },
-            QualityCandidate { prefix: "M500", ext: ".mp3", level: "sq" },
-        ],
+        "hi-res" | "hires" | "auto" | "dsd" => 0,
+        "lossless" | "flac" => 3,
+        "hq" | "320" => 6,
+        "sq" | "128" => 8,
+        "lq" | "96" => 9,
+        _ => 0,
     }
 }
 
@@ -123,44 +113,84 @@ pub async fn get_song_url(
 }
 
 impl QqmusicClient {
-    /// 查询歌曲详情以获取真实的 file.media_mid (strMediaMid)
-    async fn resolve_real_media_mid(&self, songmid: &str) -> Option<String> {
-        let comm = json!({
-            "comm": { "uin": 0, "format": "json", "ct": 24, "cv": 4747474 },
-            "req_0": {
-                "module": "music.pf_song_detail_svr",
-                "method": "get_song_detail_yqq",
-                "param": { "song_mid": songmid }
+    /// 调用 CgiGetTrackInfo 获取真实的 file.media_mid 与各音质档位的真实文件体积（对齐 tiny-lms-next）
+    async fn fetch_track_file(&self, songmid: &str) -> (String, HashMap<String, u64>) {
+        let uin = self.uin();
+        let uin_val: Value = if !uin.is_empty() && uin != "0" {
+            uin.parse::<i64>().map(Value::from).unwrap_or(Value::from(uin.as_str()))
+        } else {
+            Value::from(0)
+        };
+
+        let req_body = json!({
+            "comm": { "uin": uin_val, "format": "json", "ct": 24, "cv": 0 },
+            "req_1": {
+                "module": "music.trackInfo.UniformRuleCtrl",
+                "method": "CgiGetTrackInfo",
+                "param": { "ids": [], "mids": [songmid], "types": [0] }
             }
         });
+
+        let data_str = match serde_json::to_string(&req_body) {
+            Ok(s) => s,
+            Err(_) => return (songmid.to_string(), HashMap::new()),
+        };
+        let sign = zzc_sign(&data_str);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis().to_string())
+            .unwrap_or_else(|_| "0".to_string());
+
+        let url = format!("https://u6.y.qq.com/cgi-bin/musicu.fcg?_={timestamp}&sign={sign}");
+
         let resp = self
             .http
-            .post("https://u.y.qq.com/cgi-bin/musicu.fcg")
+            .post(&url)
             .header("Content-Type", "application/json")
-            .header("User-Agent", QM_WEB_UA)
             .header("Referer", "https://y.qq.com/")
+            .header("Origin", "https://y.qq.com")
+            .header("User-Agent", QM_WEB_UA)
             .header("Cookie", self.cookie_header())
-            .json(&comm)
+            .body(data_str)
             .send()
-            .await
-            .ok()?;
-        let json_val: Value = resp.json().await.ok()?;
-        let media_mid = json_val
-            .get("req_0")
-            .and_then(|r| r.get("data"))
-            .and_then(|d| d.get("track_info"))
-            .and_then(|t| t.get("file"))
-            .and_then(|f| f.get("media_mid"))
-            .and_then(Value::as_str)?
-            .trim();
-        if !media_mid.is_empty() {
-            Some(media_mid.to_string())
-        } else {
-            None
+            .await;
+
+        let mut sizes = HashMap::new();
+        let mut media_mid = songmid.to_string();
+
+        if let Ok(r) = resp {
+            if let Ok(json_resp) = r.json::<Value>().await {
+                if let Some(file) = json_resp
+                    .get("req_1")
+                    .and_then(|r| r.get("data"))
+                    .and_then(|d| d.get("tracks"))
+                    .and_then(Value::as_array)
+                    .and_then(|a| a.first())
+                    .and_then(|t| t.get("file"))
+                {
+                    if let Some(mm) = file.get("media_mid").and_then(Value::as_str) {
+                        let mm_trimmed = mm.trim();
+                        if !mm_trimmed.is_empty() {
+                            media_mid = mm_trimmed.to_string();
+                        }
+                    }
+                    if let Some(obj) = file.as_object() {
+                        for (k, v) in obj {
+                            if k.starts_with("size_") {
+                                if let Some(n) = v.as_u64() {
+                                    sizes.insert(k.clone(), n);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        (media_mid, sizes)
     }
 
-    /// 解析 QQ 音乐单曲播放直链（支持 Hi-Res、SQ 无损、HQ 及免费档全级别探测与 VIP 鉴权）
+    /// 解析 QQ 音乐单曲播放直链（采用 tiny-lms-next 架构：CgiGetTrackInfo 预过滤体积 + 阶梯逐级降级 + VIP 认证）
     pub async fn song_url(&self, params: &HashMap<String, Value>) -> Result<Value, QqkgError> {
         let mid = params
             .get("mid")
@@ -173,28 +203,45 @@ impl QqmusicClient {
             return Err(QqkgError::InvalidParam("missing mid".into()));
         }
 
-        let mut media_mid = params
-            .get("mediaMid")
-            .or_else(|| params.get("media_mid"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
-
-        if media_mid.is_empty() {
-            if let Some(real) = self.resolve_real_media_mid(mid).await {
-                media_mid = real;
-            } else {
-                media_mid = mid.to_string();
-            }
-        }
-
         let target_level = params
             .get("level")
             .and_then(Value::as_str)
             .unwrap_or("hi-res");
 
-        let candidates = get_candidates(target_level);
+        let start_idx = get_start_index(target_level);
+
+        // 1. 获取真实 media_mid 与服务端存在的各档位体积
+        let (fetched_media_mid, sizes) = self.fetch_track_file(mid).await;
+        let media_mid = params
+            .get("mediaMid")
+            .or_else(|| params.get("media_mid"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&fetched_media_mid);
+
+        let has_size_info = !sizes.is_empty();
+
+        // 2. 根据服务端真实文件体积过滤可用档位（size > 0 才请求，避免 404 幽灵母带）
+        let mut candidates: Vec<&QualityCandidate> = Vec::new();
+        for cand in &LADDER[start_idx..] {
+            if has_size_info {
+                if let Some(&sz) = sizes.get(cand.size_key) {
+                    if sz > 0 {
+                        candidates.push(cand);
+                    }
+                }
+            } else {
+                candidates.push(cand);
+            }
+        }
+
+        // 若全部被过滤，保底添加免费档
+        if candidates.is_empty() {
+            candidates.push(&LADDER[LADDER.len() - 1]); // C400 96k
+            candidates.push(&LADDER[LADDER.len() - 2]); // M500 128k
+        }
+
         let mut filenames: Vec<String> = candidates
             .iter()
             .map(|c| format!("{}{}{}", c.prefix, media_mid, c.ext))
@@ -230,7 +277,7 @@ impl QqmusicClient {
             "uin": uin_val,
             "format": "json",
             "ct": 24,
-            "cv": 4747474,
+            "cv": 0,
         });
         if !playback_key.is_empty() {
             comm["authst"] = json!(playback_key);
@@ -261,7 +308,7 @@ impl QqmusicClient {
             .map(|d| d.as_millis().to_string())
             .unwrap_or_else(|_| "0".to_string());
 
-        let signed_url = format!("https://u.y.qq.com/cgi-bin/musicu.fcg?_={timestamp}&sign={sign}");
+        let signed_url = format!("https://u6.y.qq.com/cgi-bin/musics.fcg?_={timestamp}&sign={sign}");
 
         let resp = self
             .http
@@ -312,7 +359,7 @@ impl QqmusicClient {
 
         let mut matched: Option<(&QualityCandidate, String)> = None;
 
-        for cand in &candidates {
+        for &cand in &candidates {
             let primary_fn = format!("{}{}{}", cand.prefix, media_mid, cand.ext);
             let alt_fn = format!("{}{}{}", cand.prefix, mid, cand.ext);
 
@@ -333,16 +380,8 @@ impl QqmusicClient {
                     format!("{sip}{purl}")
                 };
 
-                // 轻量级 HEAD 校验：腾讯部分母带(RS01)会下发虚拟 vkey 但 CDN 实际 404，通过 HEAD 验证确保 100% 可播
-                let is_available = match self.http.head(&full_url).send().await {
-                    Ok(resp) => resp.status().is_success() || resp.status().as_u16() == 206,
-                    Err(_) => false,
-                };
-
-                if is_available {
-                    matched = Some((cand, full_url));
-                    break;
-                }
+                matched = Some((cand, full_url));
+                break;
             }
         }
 
