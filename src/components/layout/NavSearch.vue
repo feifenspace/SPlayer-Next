@@ -275,6 +275,7 @@ onMounted(() => {
 </script>
 
 <template>
+  <!-- 搜索框触发器与听歌识曲 -->
   <div class="flex items-center gap-2 shrink-0">
     <div
       role="button"

@@ -12,7 +12,7 @@ import { NeteaseRequestError } from "@main/apis/netease/core/request";
 import { cookieToJson } from "@main/apis/netease/core/cookie";
 import { callQQMusic, clearQQMusicCookies, mergeQQMusicCookies } from "@main/apis/qqmusic";
 import { callKugou, clearKugouSession, mergeKugouSession } from "@main/apis/kugou";
-import { openNeteaseLoginWindow, openQQMusicLoginWindow } from "@main/window/login";
+import { openNeteaseLoginWindow } from "@main/window/login";
 import { coreLog } from "@main/utils/logger";
 import type { ApiPlatform } from "@shared/types/apis";
 
@@ -75,12 +75,6 @@ export const registerApisIpc = (): void => {
         const cookies = await openNeteaseLoginWindow();
         if (!cookies) return { ok: false, error: "canceled" };
         mergeNeteaseCookies(cookies);
-        return { ok: true };
-      }
-      if (platform === "qqmusic") {
-        const cookies = await openQQMusicLoginWindow();
-        if (!cookies) return { ok: false, error: "canceled" };
-        mergeQQMusicCookies(cookies);
         return { ok: true };
       }
       return { ok: false, error: "unsupported platform" };

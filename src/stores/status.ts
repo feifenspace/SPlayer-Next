@@ -8,6 +8,7 @@ import type {
 import type { Platform } from "@shared/types/platform";
 import type { ContentScope } from "@/types/collection";
 import type { SortField, SortOrder } from "@/types/list";
+import type { PersonalFmOptions } from "@/types/netease";
 export type { RepeatMode, ShuffleMode } from "@shared/types/player";
 export type { SortField, SortOrder } from "@/types/list";
 import * as queue from "./queue";
@@ -53,6 +54,8 @@ export const useStatusStore = defineStore(
     const heartMode = ref(false);
     /** 私人 FM 模式 */
     const fmMode = ref(false);
+    /** 私人 FM 选项偏好 */
+    const fmOptions = ref<PersonalFmOptions>({ mode: "DEFAULT" });
     /** 播放速度（0.5 ~ 2.0） */
     const speed = ref(1.0);
     /** 音调偏移（半音 -12 ~ 12） */
@@ -134,6 +137,7 @@ export const useStatusStore = defineStore(
       shuffleMode,
       heartMode,
       fmMode,
+      fmOptions,
       speed,
       pitch,
       pitchSync,
@@ -159,6 +163,7 @@ export const useStatusStore = defineStore(
         "repeatMode",
         "shuffleMode",
         "heartMode",
+        "fmOptions",
         "volume",
         "position",
         "searchPlatform",

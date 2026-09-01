@@ -63,6 +63,46 @@ export const DEFAULT_LYRIC_SOURCE_ORDER: LyricSourceOrder = [...ALL_PLATFORMS];
 /** 默认格式优先级 */
 export const DEFAULT_LYRIC_FORMAT_ORDER: LyricFormatOrder = [...DEFAULT_LYRIC_FORMAT_ORDER_SHARED];
 
+/** 侧边栏「我的歌单」分组 key（仅显隐，不参与排序） */
+export const SIDEBAR_GROUP_MY_PLAYLISTS = "group-my-playlists";
+
+/** 侧边栏「收藏的歌单」分组 key（仅显隐，不参与排序） */
+export const SIDEBAR_GROUP_SUBSCRIBED = "group-subscribed";
+
+/** 侧边栏导航分组（匿名分组，可命名；组间以分隔线或分组名区分） */
+export interface SidebarNavGroup {
+  /** 分组名，空字符串为未命名 */
+  name: string;
+  /** 是否在侧栏显示分组名 */
+  showName: boolean;
+  /** 组内导航项 key（路由路径） */
+  keys: string[];
+}
+
+/** 侧边栏歌单显示顺序（key 为歌单路由路径；空数组为自然顺序） */
+export interface SidebarPlaylistOrder {
+  /** 我的歌单 - 本地 */
+  myLocal: string[];
+  /** 我的歌单 - 在线 */
+  myOnline: string[];
+  /** 收藏的歌单 */
+  subscribed: string[];
+}
+
+/** 侧边栏导航项默认分组 */
+export const DEFAULT_SIDEBAR_NAV_GROUPS: SidebarNavGroup[] = [
+  {
+    name: "",
+    showName: false,
+    keys: ["/", "/library", "/artists/local", "/albums/local", "/folders", "/stats"],
+  },
+  {
+    name: "",
+    showName: false,
+    keys: ["/liked", "/favorites", "/cloud", "/download", "/streaming", "/history"],
+  },
+];
+
 /** 歌词设置 */
 export interface LyricSettings {
   /** 歌词来源偏好 */
@@ -220,6 +260,16 @@ export interface AppearanceSettings {
   sidebarCollapsed: boolean;
   /** 侧边栏歌单项显示封面 */
   sidebarPlaylistCover: boolean;
+  /** 侧边栏导航分组（匿名分组，可命名；组间以分隔线或分组名区分） */
+  sidebarNavGroups: SidebarNavGroup[];
+  /** 侧边栏隐藏的导航项与歌单分组 */
+  sidebarHiddenKeys: string[];
+  /** 无可见项的分组是否保留分隔线（留白） */
+  sidebarKeepEmptyDivider: boolean;
+  /** 显示分组名时是否叠加分隔线 */
+  sidebarNameWithDivider: boolean;
+  /** 侧边栏歌单显示顺序 */
+  sidebarPlaylistOrder: SidebarPlaylistOrder;
   /** 侧边栏显示播放统计入口 */
   showStatsInSidebar: boolean;
   /** 播放栏显示快捷音质切换 */

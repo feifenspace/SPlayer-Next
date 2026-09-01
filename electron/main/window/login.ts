@@ -141,78 +141,10 @@ const NETEASE_CONFIG: LoginPlatformConfig = {
   },
 };
 
-/** QM 关键 cookie 列表 */
-const QM_COOKIE_KEYS = [
-  "uin",
-  "qm_keyst",
-  "qqmusic_key",
-  "pskey",
-  "skey",
-  "p_skey",
-  "p_uin",
-  "pt4_token",
-  "pt2gguin",
-  "tmeLoginType",
-  "wxuin",
-  "wxopenid",
-  "wxrefresh_token",
-  "qimei",
-  "qimei_fuse",
-  "QIMEI36",
-];
-
-/** QQ 音乐登录配置 */
-const QQMUSIC_CONFIG: LoginPlatformConfig = {
-  title: "登录 QM",
-  url: "https://y.qq.com",
-  partition: "persist:qqmusic-login",
-  logTag: "[qm-login]",
-  collectCookies: async (ses) => {
-    const all = await ses.cookies.get({ domain: ".qq.com" });
-    const yAll = await ses.cookies.get({ url: "https://y.qq.com" });
-    const merged = [...all, ...yAll];
-
-    const hasUin = merged.find(
-      (c) => (c.name === "uin" || c.name === "wxuin" || c.name === "p_uin") && !!c.value,
-    );
-    const hasKey = merged.find(
-      (c) =>
-        (c.name === "qm_keyst" ||
-          c.name === "qqmusic_key" ||
-          c.name === "pskey" ||
-          c.name === "p_skey") &&
-        !!c.value,
-    );
-
-    if (!hasUin || !hasKey) return null;
-
-    const out: Record<string, string> = {};
-    for (const c of merged) {
-      if (c.name && c.value && (QM_COOKIE_KEYS.includes(c.name) || c.domain?.includes("qq.com"))) {
-        out[c.name] = c.value;
-      }
-    }
-    if (Object.keys(out).length > 0) {
-      const uin = (out.uin || out.wxuin || out.p_uin || "").replace(/^o/, "");
-      coreLog.info(`[qm-login] 成功获取登录凭据 (uin: ${uin})`);
-      return out;
-    }
-    return null;
-  },
-};
-
 /**
  * 打开 NCM 网页登录窗口
  * @returns 登录成功返回 cookies 对象；用户关闭窗口返回 null
  */
 export const openNeteaseLoginWindow = async (): Promise<Record<string, string> | null> => {
   return await openLoginWindow(NETEASE_CONFIG);
-};
-
-/**
- * 打开 QM 网页登录窗口
- * @returns 登录成功返回 cookies 对象；用户关闭窗口返回 null
- */
-export const openQQMusicLoginWindow = async (): Promise<Record<string, string> | null> => {
-  return await openLoginWindow(QQMUSIC_CONFIG);
 };

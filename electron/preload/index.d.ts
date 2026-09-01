@@ -66,6 +66,9 @@ declare global {
         testNetworkProxy: () => Promise<boolean>;
         onProtocolUrl: (callback: (url: string) => void) => () => void;
         consumePendingProtocolUrl: () => Promise<string | null>;
+        onOpenFiles: (callback: (files: string[]) => void) => () => void;
+        consumePendingAudioFiles: () => Promise<string[]>;
+        getPathForFile: (file: File) => string;
       };
       library: LibraryApi;
       playlist: PlaylistApi;

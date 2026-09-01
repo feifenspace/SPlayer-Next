@@ -2,6 +2,7 @@ import type { SettingCategory } from "@/types/settings-schema";
 import { useThemeStore } from "@/stores/theme";
 import FontConfig from "@/components/settings/custom/FontConfig.vue";
 import BackgroundImagePicker from "@/components/settings/custom/BackgroundImagePicker.vue";
+import SidebarCustomizeConfig from "@/components/settings/custom/SidebarCustomizeConfig.vue";
 import IconLucidePalette from "~icons/lucide/palette";
 
 const appearanceCategory: SettingCategory = {
@@ -159,6 +160,11 @@ const appearanceCategory: SettingCategory = {
           type: "switch",
           binding: { store: "settings", path: "appearance.sidebarPlaylistCover" },
           defaultValue: false,
+        },
+        {
+          key: "sidebarCustomize",
+          type: "custom",
+          component: SidebarCustomizeConfig,
         },
         {
           key: "showStatsInSidebar",
