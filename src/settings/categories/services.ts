@@ -4,6 +4,7 @@ import { toast } from "@/composables/useToast";
 import i18n from "@/i18n";
 import ExternalApiStatusCard from "@/components/settings/custom/ExternalApiStatusCard.vue";
 import LastfmPanel from "@/components/settings/custom/LastfmPanel.vue";
+import ListenBrainzPanel from "@/components/settings/custom/ListenBrainzPanel.vue";
 import IconLucideGlobe from "~icons/lucide/globe";
 
 const servicesCategory: SettingCategory = {
@@ -106,6 +107,32 @@ const servicesCategory: SettingCategory = {
                 { value: "state", labelKey: "settings.discordDisplayMode.state" },
               ],
               defaultValue: "name",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      id: "listenbrainz",
+      items: [
+        {
+          key: "listenbrainzEnabled",
+          type: "switch",
+          binding: { store: "settings", path: "system.listenbrainz.enabled" },
+          defaultValue: false,
+          children: [
+            {
+              key: "listenbrainzAccount",
+              type: "custom",
+              component: ListenBrainzPanel,
+              fullWidth: true,
+              keywords: ["ListenBrainz", "Scrobble"],
+            },
+            {
+              key: "listenbrainzNowPlaying",
+              type: "switch",
+              binding: { store: "settings", path: "system.listenbrainz.sendNowPlaying" },
+              defaultValue: true,
             },
           ],
         },

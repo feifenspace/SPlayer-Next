@@ -29,6 +29,7 @@ pub mod mqa;
 pub mod playback;
 pub mod player;
 pub mod priority;
+pub mod ram_buffer;
 pub mod sacd;
 pub mod scanner;
 pub mod shared;

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::path::Path;
 
+use encoding_rs::GBK;
 use ffmpeg_audio::SourceAudioInfo;
 
 mod cover;
@@ -9,10 +11,11 @@ mod lyrics;
 mod tag_fields;
 
 pub use cover::{
-    cover_thumb_path, extract_cover_thumbnail, extract_folder_cover_thumbnail,
-    make_thumbnail_jpeg, read_attached_pic,
+    cover_cache_needs_refresh, cover_thumb_path, extract_cover_thumbnail,
+    extract_cover_thumbnail_with_directory_cover, extract_directory_cover_thumbnail,
+    extract_folder_cover_thumbnail, find_directory_cover, make_thumbnail_jpeg, read_attached_pic,
 };
-pub use folder_cover::find_folder_cover;
+pub use folder_cover::find_folder_cover as legacy_find_folder_cover;
 pub use editor::{read_tags, write_tags, TagWriteRequest};
 pub use lyrics::{extract_embedded_lyric, find_all_external_lyrics, ExternalLyric};
 
@@ -92,6 +95,52 @@ pub fn extract_tags(dict: &HashMap<String, String>) -> Tags {
     }
 }
 
+/// 修复少量旧中文下载器写出的损坏 ID3 文本。
+///
+/// 这类文件把 GBK 原始字节逐字节扩成 Latin-1/UTF-16 码点，例如 `ÇôÄñ` 实际应为 `囚鸟`。
+/// 为避免误伤正常西文标签，仅当修复后的标题与真实文件名完全一致时，才修复同一文件的标题/歌手/专辑。
+pub fn repair_legacy_gbk_tags_for_path(mut tags: Tags, path: &str) -> Tags {
+    let Some(file_stem) = Path::new(path).file_stem().and_then(|value| value.to_str()) else {
+        return tags;
+    };
+    let Some(raw_title) = tags.title.as_deref() else {
+        return tags;
+    };
+    let Some(repaired_title) = decode_latin1_as_gbk(raw_title) else {
+        return tags;
+    };
+    if repaired_title != file_stem {
+        return tags;
+    }
+
+    tags.title = Some(repaired_title);
+    tags.artist = tags
+        .artist
+        .take()
+        .map(|value| decode_latin1_as_gbk(&value).unwrap_or(value));
+    tags.album = tags
+        .album
+        .take()
+        .map(|value| decode_latin1_as_gbk(&value).unwrap_or(value));
+    tags
+}
+
+fn decode_latin1_as_gbk(text: &str) -> Option<String> {
+    let bytes = text
+        .chars()
+        .map(|ch| u8::try_from(u32::from(ch)).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if bytes.iter().filter(|&&byte| byte >= 0x80).count() < 2 {
+        return None;
+    }
+    let (decoded, _, had_errors) = GBK.decode(&bytes);
+    if had_errors {
+        return None;
+    }
+    let decoded = decoded.trim_matches('\0').trim().to_string();
+    (!decoded.is_empty() && decoded != text).then_some(decoded)
+}
+
 /// 大小写不敏感查找：原 ffmpeg-next 的 Dictionary::get 默认 case-insensitive，
 /// 而 ffmpeg_audio 把 dict 转成普通 HashMap 后丢了这个语义，这里补回来
 fn dict_get<'a>(dict: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
@@ -148,6 +197,37 @@ mod tests {
         assert_eq!(tags.title.as_deref(), Some("Track"));
         assert_eq!(tags.artist.as_deref(), Some("Artist"));
         assert_eq!(tags.track, Some(7));
+    }
+
+    #[test]
+    fn malformed_legacy_gbk_tags_are_repaired_only_when_title_matches_file_name() {
+        let tags = Tags {
+            title: Some("ÇôÄñ".to_string()),
+            artist: Some("µË×ÏÆå".to_string()),
+            album: Some("ÔÚÏßÈÈËÑ£¨»ªÓï£©ÏµÁÐ63".to_string()),
+            track: None,
+            comment: None,
+        };
+        let repaired = repair_legacy_gbk_tags_for_path(tags, "/music/囚鸟.mp3");
+
+        assert_eq!(repaired.title.as_deref(), Some("囚鸟"));
+        assert_eq!(repaired.artist.as_deref(), Some("邓紫棋"));
+        assert_eq!(repaired.album.as_deref(), Some("在线热搜（华语）系列63"));
+    }
+
+    #[test]
+    fn malformed_legacy_gbk_guess_does_not_override_unrelated_file_name() {
+        let tags = Tags {
+            title: Some("ÇôÄñ".to_string()),
+            artist: Some("Beyoncé".to_string()),
+            album: Some("Album".to_string()),
+            track: None,
+            comment: None,
+        };
+        let repaired = repair_legacy_gbk_tags_for_path(tags, "/music/Other Song.mp3");
+
+        assert_eq!(repaired.title.as_deref(), Some("ÇôÄñ"));
+        assert_eq!(repaired.artist.as_deref(), Some("Beyoncé"));
     }
 
     #[test]

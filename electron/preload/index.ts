@@ -656,6 +656,14 @@ const api = {
     love: (artist: string, track: string, loved: boolean) =>
       ipcRenderer.invoke("lastfm:love", artist, track, loved),
   },
+  listenbrainz: {
+    // 查询连接状态
+    getStatus: () => ipcRenderer.invoke("listenbrainz:getStatus"),
+    // 绑定 Token
+    link: (token: string) => ipcRenderer.invoke("listenbrainz:link", token),
+    // 解除绑定
+    unlink: () => ipcRenderer.invoke("listenbrainz:unlink"),
+  },
   externalApi: {
     // 重启外部 API 服务
     restart: () => ipcRenderer.invoke("externalApi:restart"),

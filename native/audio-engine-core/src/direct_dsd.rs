@@ -10,6 +10,17 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use anyhow::{bail, ensure, Context, Result};
+use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
+
+/// DSD 专用静音字节（PDM 零电平）。
+///
+/// DSD（Direct Stream Digital）采用脉冲密度调制（PDM）编码，逻辑"0"代表负向偏转，
+/// 逻辑"1"代表正向偏转。当缓冲区欠载（Underrun）或切歌过渡时，若填充 `0x00`（全 0 位流），
+/// 等效于连续负向满幅直流偏置（DC Offset），会导致 DAC 模拟输出端产生极强的爆音和高频噪音。
+///
+/// `0x69`（二进制 `01101001`）是 1-bit PDM 流的直流均衡基准（01 交替平衡），
+/// 等效于零电平静音，是 Diretta、HQPlayer 等专业 DSD 播放器使用的标准 DSD 静音值。
+const DSD_SILENCE_BYTE: u8 = 0x69;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectDsdBitOrder {
@@ -629,7 +640,9 @@ impl DirectDsdSlot {
             boundary: AtomicBool::new(false),
             boundary_duration_micros: AtomicU64::new(0),
             boundary_generation: AtomicU64::new(0),
-            buffer: UnsafeCell::new(vec![0_u8; capacity].into_boxed_slice()),
+            // 注意：DSD 缓冲区初始值必须为 0x69（DSD 专用静音字节），
+            // 而非 0x00（0x00 会使 DSD DAC 输出满幅直流偏置，造成爆音）。
+            buffer: UnsafeCell::new(vec![DSD_SILENCE_BYTE; capacity].into_boxed_slice()),
         }
     }
 }
@@ -775,7 +788,8 @@ impl DirectDsdRing {
         for slot in &self.slots {
             let buffer = unsafe { &mut *slot.buffer.get() };
             if buffer.len() < capacity {
-                *buffer = vec![0_u8; capacity].into_boxed_slice();
+                // DSD 缓冲区必须用 0x69（DSD 静音）而非 0x00 初始化，防止扩容时送出爆音帧。
+                *buffer = vec![DSD_SILENCE_BYTE; capacity].into_boxed_slice();
             }
         }
     }
@@ -840,7 +854,8 @@ fn install_staged_dsd_slot(
     let required = staged.reader.max_output_len();
     let buffer = unsafe { &mut *slot.buffer.get() };
     if buffer.len() < required {
-        *buffer = vec![0_u8; required].into_boxed_slice();
+        // DSD staged 缓冲区扩容：填充 0x69 DSD 静音，防止空闲区间送出爆音帧。
+        *buffer = vec![DSD_SILENCE_BYTE; required].into_boxed_slice();
     }
     fill_claimed_slot(&mut staged.reader, slot, wire_bit_order)?
         .context("Native DSD staged 音源没有可播放 payload")?;
@@ -975,6 +990,10 @@ impl DirectDsdSource {
         let producer = thread::Builder::new()
             .name("diretta-direct-dsd".into())
             .spawn(move || {
+                // 绑定到 CPU 性能核心（ARM 大核 / x86 独立物理核）并设置 SCHED_FIFO 实时调度，
+                // 防止 DSD 推流时钟抖动（Jitter）和 CPU 大小核漂移造成 DAC 爆音。
+                bind_current_thread_to_performance_cores("diretta-direct-dsd");
+                boost_current_audio_thread("diretta-direct-dsd");
                 let mut active_format = format;
                 let mut wire_bit_order = format.bit_order;
                 let mut staged: Option<StagedDsdSource> = None;

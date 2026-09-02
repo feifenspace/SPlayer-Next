@@ -489,11 +489,11 @@ mod tests {
         assert!(connection.contains("~DirettaConnection()"));
         assert!(connection.contains("shutdown();"));
         assert!(connection.contains("disconnect_flgset();"));
-        assert!(connection.contains("disconnect(false);"));
-        assert!(connection.contains("kDisconnectTimeout"));
-        assert!(connection.contains("is_connect()"));
+        assert!(connection.contains("disconnect(true);"));
+        assert!(connection.contains("disconnectWait();"));
         assert!(connection.contains("sync->close();"));
-        assert!(!connection.contains("disconnectWait"));
+        assert!(!connection.contains("disconnect(false);"));
+        assert!(!connection.contains("kDisconnectTimeout"));
 
         let open = bridge
             .split("void* open_direct_with_format(")

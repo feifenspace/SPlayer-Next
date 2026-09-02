@@ -104,3 +104,38 @@ async fn test_diretta_select_endpoint() {
     let reset_resp = app.oneshot(reset_req).await.unwrap();
     assert_eq!(reset_resp.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn test_diretta_stage_and_cancel_endpoints() {
+    let state = create_test_app_state().await;
+    let app = build_router(state);
+
+    // 1. 在没有活跃 Direct runtime 时调用 stage_next，应优雅返回 staged: false 而非崩溃
+    let stage_req = Request::builder()
+        .uri("/api/v1/player/direct/stage_next")
+        .method("POST")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"source": "test.flac", "duration_secs": 180.0}"#))
+        .unwrap();
+
+    let stage_resp = app.clone().oneshot(stage_req).await.unwrap();
+    assert_eq!(stage_resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(stage_resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(body["success"].as_bool().unwrap());
+    assert_eq!(body["data"]["staged"], false);
+
+    // 2. 调用 cancel_next
+    let cancel_req = Request::builder()
+        .uri("/api/v1/player/direct/cancel_next")
+        .method("POST")
+        .body(Body::empty())
+        .unwrap();
+
+    let cancel_resp = app.clone().oneshot(cancel_req).await.unwrap();
+    assert_eq!(cancel_resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(cancel_resp.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(body["success"].as_bool().unwrap());
+    assert_eq!(body["data"]["cancelled"], true);
+}

@@ -404,6 +404,21 @@ export const installWebPolyfill = (): void => {
       cancelConnect: async () => {},
       disconnect: async () => {},
     }),
+    listenbrainz: createSafeProxy("listenbrainz", {
+      getStatus: async () => ({
+        enabled: false,
+        sendNowPlaying: true,
+        linked: false,
+        account: null,
+        state: "disabled",
+        pending: 0,
+        dead: 0,
+        lastError: null,
+        processActive: false,
+      }),
+      link: async () => ({ ok: false, error: "Web 模式不支持直连" }),
+      unlink: async () => {},
+    }),
     externalApi: createSafeProxy("externalApi", {
       getStatus: async () => ({ running: true, port: 14558 }),
       restart: async () => ({ running: true, port: 14558 }),

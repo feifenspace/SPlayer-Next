@@ -71,6 +71,14 @@ export interface DiscordSettings {
   displayMode: DiscordDisplayMode;
 }
 
+/** ListenBrainz 集成配置 */
+export interface ListenBrainzSettings {
+  /** 总开关 */
+  enabled: boolean;
+  /** 是否发送正在播放 */
+  sendNowPlaying: boolean;
+}
+
 /** Last.fm 集成配置 */
 export interface LastfmSettings {
   /** 总开关 */
@@ -455,6 +463,8 @@ export interface SystemConfig {
   download: DownloadSettings;
   /** 流媒体总开关 */
   streaming: StreamingSettings;
+  /** ListenBrainz 集成配置 */
+  listenbrainz: ListenBrainzSettings;
   /** Last.fm 集成配置 */
   lastfm: LastfmSettings;
   /** 外部 API 服务（HTTP + WS） */

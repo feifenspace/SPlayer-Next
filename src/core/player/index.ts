@@ -520,7 +520,13 @@ export const seek = async (posMs: number): Promise<void> => {
   if (result.success) {
     status.position = posMs;
     playback.setCurrentTime(posMs);
+    return;
   }
+
+  // 命令失败时必须解除 seek 冻结；后续 Core snapshot 会恢复真实位置。
+  seekTarget = null;
+  playback.setSeeking(false);
+  handleError(result.error ?? "UNKNOWN");
 };
 
 /**

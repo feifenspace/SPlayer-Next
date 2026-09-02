@@ -11,6 +11,7 @@ import { registerHotkeyIpc } from "./hotkey";
 import { registerThemeIpc } from "./theme";
 import { registerStreamingIpc } from "./streaming";
 import { registerLastfmIpc } from "./lastfm";
+import { registerListenBrainzIpc } from "./listenbrainz";
 import { registerCacheIpc } from "./cache";
 import { registerDownloadIpc } from "./download";
 import { registerExternalApiIpc } from "./externalApi";
@@ -44,6 +45,7 @@ export const registerIpcHandlers = (): void => {
   registerPlaylistIpc();
   registerRecognitionIpc();
   registerLastfmIpc();
+  registerListenBrainzIpc();
   registerCacheIpc();
   registerDownloadIpc();
   registerExternalApiIpc();

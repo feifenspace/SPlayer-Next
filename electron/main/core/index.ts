@@ -13,6 +13,7 @@ import { isMac } from "@main/utils/config";
 import { registerIpcHandlers } from "@main/ipc";
 import { init as initMedia, shutdown as shutdownMedia } from "@main/services/media";
 import { init as initLastfm } from "@main/services/lastfm";
+import { init as initListenBrainz } from "@main/services/listenbrainz";
 import { initGlobalHotkey } from "@main/services/globalHotkey";
 import { initDatabase, closeDatabase } from "@main/database";
 import { init as initSongCache } from "@main/services/songCache";
@@ -41,6 +42,12 @@ import { extractAudioFiles, captureAudioFiles } from "@main/services/externalFil
 const configureMemoryOptimizations = (): void => {
   // 禁止预热备用渲染进程
   app.commandLine.appendSwitch("disable-features", "SpareRendererForSitePerProcess");
+  if (isHeadless()) {
+    // 真正的无窗口运行不应依赖 X11/Wayland，也不需要 GPU 辅助进程。
+    app.commandLine.appendSwitch("headless");
+    app.commandLine.appendSwitch("disable-gpu");
+    app.disableHardwareAcceleration();
+  }
 };
 
 /** 内存指标采样间隔 */
@@ -122,6 +129,8 @@ export const initApp = (): void => {
     initMedia();
     // 初始化 Last.fm 集成
     initLastfm();
+    // 初始化 ListenBrainz 集成
+    initListenBrainz();
     // 初始化插件系统
     pluginRegistry.init();
     // 初始化播放事件桥（需在 pluginRegistry.init 之后，读 hasEnabledControlPlugin）

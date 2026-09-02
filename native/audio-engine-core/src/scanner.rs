@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
@@ -28,6 +28,7 @@ pub struct FileRecord {
     pub path: String,
     pub mtime: u64,
     pub size: u64,
+    pub cover_path: Option<String>,
 }
 
 /// 扫描到的曲目信息
@@ -94,8 +95,8 @@ fn is_iso_file(path: &Path) -> bool {
 }
 
 /// 根据本轮可见路径计算已删除文件；遍历不完整的目录必须整体排除
-fn collect_removed_paths(
-    existing: &HashMap<&str, (u64, u64)>,
+fn collect_removed_paths<V>(
+    existing: &HashMap<&str, V>,
     scanned_paths: &[String],
     unavailable_dirs: &[String],
 ) -> Vec<String> {
@@ -116,6 +117,14 @@ fn collect_removed_paths(
 ///
 /// 新 API 下 AudioReader 不再要求重采样参数，扫库每文件省一次 SwrContext 分配
 pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTrack> {
+    probe_fast_with_directory_cover(path, cover_cache_dir, None)
+}
+
+pub fn probe_fast_with_directory_cover(
+    path: &str,
+    cover_cache_dir: Option<&str>,
+    directory_cover: Option<&Path>,
+) -> Option<ScannedTrack> {
     if crate::sacd::is_sacd_iso_path(path) {
         if let Ok(disc) = crate::sacd::probe_sacd_iso(path) {
             let total_dur: f64 = disc.tracks.iter().map(|tr| tr.duration_secs).sum();
@@ -146,6 +155,11 @@ pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTr
         return None;
     }
 
+    let directory_cover_thumbnail = || {
+        cover_cache_dir
+            .zip(directory_cover)
+            .and_then(|(dir, cover)| metadata::extract_directory_cover_thumbnail(cover, dir))
+    };
 
     if crate::cue::is_cue_path(path) {
         if let Ok(cue) = crate::cue::CueSheet::parse_file(path) {
@@ -162,7 +176,7 @@ pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTr
                 bit_rate: 1_411_200,
                 channels: 2,
                 bits_per_sample: 16,
-                cover: None,
+                cover: directory_cover_thumbnail(),
                 file_size: 0,
                 mtime: 0,
                 ctime: 0,
@@ -188,7 +202,7 @@ pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTr
                     bit_rate: (dsf.sample_rate as i64 * dsf.channels as i64),
                     channels: dsf.channels as u32,
                     bits_per_sample: 1,
-                    cover: None,
+                    cover: directory_cover_thumbnail(),
                     file_size: dsf.data_size,
                     mtime: 0,
                     ctime: 0,
@@ -211,7 +225,7 @@ pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTr
                     bit_rate: (dff.sample_rate as i64 * dff.channels as i64),
                     channels: dff.channels as u32,
                     bits_per_sample: 1,
-                    cover: None,
+                    cover: directory_cover_thumbnail(),
                     file_size: dff.data_size,
                     mtime: 0,
                     ctime: 0,
@@ -239,10 +253,12 @@ pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTr
     }
 
     let raw_metadata = reader.metadata();
-    let tags = metadata::extract_tags(&raw_metadata);
+    let tags =
+        metadata::repair_legacy_gbk_tags_for_path(metadata::extract_tags(&raw_metadata), path);
 
-    let cover =
-        cover_cache_dir.and_then(|dir| metadata::extract_cover_thumbnail(&reader, path, dir));
+    let cover = cover_cache_dir.and_then(|dir| {
+        metadata::extract_cover_thumbnail_with_directory_cover(&reader, path, dir, directory_cover)
+    });
 
     Some(ScannedTrack {
         path: path.to_string(),
@@ -261,6 +277,17 @@ pub fn probe_fast(path: &str, cover_cache_dir: Option<&str>) -> Option<ScannedTr
         mtime: 0,
         ctime: 0,
     })
+}
+
+fn cached_directory_cover(
+    cache: &mut HashMap<PathBuf, Option<PathBuf>>,
+    source: &Path,
+) -> Option<PathBuf> {
+    let parent = source.parent()?.to_path_buf();
+    cache
+        .entry(parent)
+        .or_insert_with(|| metadata::find_directory_cover(source))
+        .clone()
 }
 
 /// 获取文件时间与大小：
@@ -300,22 +327,24 @@ pub fn scan_directories(
     let scan_start = Instant::now();
     info!("开始扫描，目录数: {}", dirs.len());
 
-    // 构建已有文件索引 path → (mtime, size)
-    let existing: HashMap<&str, (u64, u64)> = incremental_data
+    // 构建已有文件索引 path → (mtime, size, cover cache path)
+    let existing: HashMap<&str, (u64, u64, Option<&str>)> = incremental_data
         .map(|records| {
             records
                 .iter()
-                .map(|r| (r.path.as_str(), (r.mtime, r.size)))
+                .map(|r| (r.path.as_str(), (r.mtime, r.size, r.cover_path.as_deref())))
                 .collect()
         })
         .unwrap_or_default();
 
     // 第一遍：收集所有音频文件路径
     let walk_start = Instant::now();
-    let mut audio_files: Vec<(String, u64, u64, u64)> = Vec::new();
+    let mut audio_files: Vec<(String, u64, u64, u64, Option<PathBuf>)> = Vec::new();
     let mut scanned_paths: Vec<String> = Vec::new();
     let mut cue_files: Vec<String> = Vec::new();
     let mut iso_files: Vec<String> = Vec::new();
+    // 扫描结束即释放；避免同一目录的每首曲目都重复枚举封面文件。
+    let mut directory_cover_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
     // 本轮不可达的目录（NAS 掉线 / 移动硬盘未挂载），其下已有记录不得报告为已删除
     let mut unavailable_dirs: Vec<String> = Vec::new();
 
@@ -362,13 +391,22 @@ pub fn scan_directories(
                 continue;
             };
             scanned_paths.push(path_str.clone());
-            // 增量比对：mtime 和 size 都未变化则跳过
-            if let Some(&(old_mtime, old_size)) = existing.get(path_str.as_str()) {
-                if old_mtime == mtime && old_size == size {
+            let directory_cover = cover_cache_dir
+                .and_then(|_| cached_directory_cover(&mut directory_cover_cache, path));
+            // 增量比对：mtime 和 size 都未变化且封面有效则跳过
+            if let Some(&(old_mtime, old_size, cover_path)) = existing.get(path_str.as_str()) {
+                let cover_is_current = cover_cache_dir.is_none_or(|cache_dir| {
+                    !metadata::cover_cache_needs_refresh(
+                        cover_path,
+                        cache_dir,
+                        directory_cover.as_deref(),
+                    )
+                });
+                if old_mtime == mtime && old_size == size && cover_is_current {
                     continue;
                 }
             }
-            audio_files.push((path_str, mtime, ctime, size));
+            audio_files.push((path_str, mtime, ctime, size, directory_cover));
         }
         if had_traversal_error {
             unavailable_dirs.push(dir.clone());
@@ -389,7 +427,7 @@ pub fn scan_directories(
     let mut scanned: u32 = 0;
     let mut batch: Vec<ScannedTrack> = Vec::with_capacity(BATCH_SIZE);
 
-    for (path_str, mtime, ctime, size) in &audio_files {
+    for (path_str, mtime, ctime, size, directory_cover) in &audio_files {
         if cancel.load(Ordering::Relaxed) {
             info!("扫描已取消（元数据提取阶段，已处理 {scanned}/{total}）");
             callback(ScanEvent::Done {
@@ -407,7 +445,7 @@ pub fn scan_directories(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
 
-        match probe_fast(path_str, cover_cache_dir) {
+        match probe_fast_with_directory_cover(path_str, cover_cache_dir, directory_cover.as_deref()) {
             Some(mut track) => {
                 track.file_size = *size;
                 track.mtime = *mtime;
@@ -575,9 +613,9 @@ mod tests {
         let hidden = hidden.to_string_lossy().into_owned();
         let outside = outside.to_string_lossy().into_owned();
         let existing = HashMap::from([
-            (visible.as_str(), (1, 1)),
-            (hidden.as_str(), (1, 1)),
-            (outside.as_str(), (1, 1)),
+            (visible.as_str(), (1, 1, None::<&str>)),
+            (hidden.as_str(), (1, 1, None::<&str>)),
+            (outside.as_str(), (1, 1, None::<&str>)),
         ]);
 
         let removed = collect_removed_paths(
@@ -599,7 +637,10 @@ mod tests {
             .join("missing.mp3")
             .to_string_lossy()
             .into_owned();
-        let existing = HashMap::from([(present.as_str(), (1, 1)), (missing.as_str(), (1, 1))]);
+        let existing = HashMap::from([
+            (present.as_str(), (1, 1, None::<&str>)),
+            (missing.as_str(), (1, 1, None::<&str>)),
+        ]);
 
         let removed = collect_removed_paths(&existing, std::slice::from_ref(&present), &[]);
 

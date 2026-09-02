@@ -178,6 +178,7 @@ declare module 'vue' {
     IconSpPlayOrder: typeof import('~icons/sp/play-order')['default']
     IconSpTypeOff: typeof import('~icons/sp/type-off')['default']
     LastfmPanel: typeof import('./src/components/settings/custom/LastfmPanel.vue')['default']
+    ListenBrainzPanel: typeof import('./src/components/settings/custom/ListenBrainzPanel.vue')['default']
     LocalLyricRepoConfig: typeof import('./src/components/settings/custom/LocalLyricRepoConfig.vue')['default']
     LoginCookieDialog: typeof import('./src/components/modals/LoginCookieDialog.vue')['default']
     LoginDialog: typeof import('./src/components/modals/LoginDialog.vue')['default']

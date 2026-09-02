@@ -9,6 +9,7 @@ import {
   reloadDiscordConfig,
 } from "@main/services/media";
 import { reloadConfig as reloadLastfmConfig } from "@main/services/lastfm";
+import { reloadConfig as reloadListenBrainzConfig } from "@main/services/listenbrainz";
 import {
   setNormalizationEnabled,
   setEqualizerEnabled,
@@ -59,6 +60,10 @@ const applyConfigChange = (keyPath: string, value: unknown, previous: unknown): 
     case "lastfm.nowPlaying":
     case "lastfm.loveSync":
       reloadLastfmConfig();
+      break;
+    case "listenbrainz.enabled":
+    case "listenbrainz.sendNowPlaying":
+      reloadListenBrainzConfig();
       break;
     case "player.loudnessNormalization":
       setNormalizationEnabled(value as boolean);

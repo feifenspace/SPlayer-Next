@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::thread::JoinHandle;
+#[cfg(feature = "diretta")]
+use std::time::{Duration, Instant};
 
 use ffmpeg_audio::HttpCancelHandle;
 use napi::bindgen_prelude::*;
@@ -45,6 +47,69 @@ enum ReinitOutcome {
 
 /// load 被更新的 load/stop 取代时的标准错误标签与文案
 const LOAD_SUPERSEDED_REASON: &str = "[Cancelled] load 已被更新的 load 取代";
+
+#[cfg(feature = "diretta")]
+const DIRECT_START_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Diretta full reconnect 的 Target/DAC 格式稳定窗口。
+/// 仅替换现存 DirectPlayback 时使用；同格式 staged/gapless 不经过此路径。
+#[cfg(feature = "diretta")]
+const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(800);
+
+#[cfg(feature = "diretta")]
+fn wait_for_direct_start(
+    playback: &DirectPlayback,
+    load_token: &Arc<std::sync::atomic::AtomicU64>,
+    token: u64,
+) -> anyhow::Result<bool> {
+    let deadline = Instant::now() + DIRECT_START_TIMEOUT;
+    loop {
+        if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
+            anyhow::bail!(LOAD_SUPERSEDED_REASON);
+        }
+        if playback.failed() {
+            anyhow::bail!("[Direct] Diretta 音源在首块消费前失败");
+        }
+        if playback.position() > playback.seek_base() {
+            return Ok(true);
+        }
+        if playback.finished() {
+            anyhow::bail!("[Direct] Diretta 音源在首块消费前结束");
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "diretta")]
+fn open_verified_direct_playback(
+    selector: &str,
+    source: &str,
+    duration_secs: f64,
+    auto_play: bool,
+    load_token: &Arc<std::sync::atomic::AtomicU64>,
+    token: u64,
+) -> anyhow::Result<DirectPlayback> {
+    let mut playback = DirectPlayback::open_local(selector, source, duration_secs, 0.0, auto_play)?;
+    if !auto_play {
+        return Ok(playback);
+    }
+    match wait_for_direct_start(&playback, load_token, token) {
+        Ok(true) => Ok(playback),
+        Ok(false) => {
+            let _ = playback.pause();
+            drop(playback);
+            anyhow::bail!("[Device] Diretta 连接未开始消费音频");
+        }
+        Err(error) => {
+            let _ = playback.pause();
+            drop(playback);
+            Err(error)
+        }
+    }
+}
 
 /// 判断是否为取消/抢占错误
 fn is_cancelled_napi_error(error: &Error) -> bool {
@@ -543,8 +608,12 @@ impl AudioPlayer {
             let source_for_direct = source.clone();
             let load_token_for_direct = Arc::clone(&load_token);
             let result = tokio::task::spawn_blocking(move || {
+                let replacing_direct_playback = old_threads.direct_playback.is_some();
                 if let Some(h) = old_threads.join_aux() {
                     let _ = h.join();
+                }
+                if replacing_direct_playback {
+                    std::thread::sleep(DIRECT_FULL_RECONNECT_STABILIZATION);
                 }
                 if source_for_direct.starts_with("http://")
                     || source_for_direct.starts_with("https://")
@@ -558,12 +627,13 @@ impl AudioPlayer {
                 if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
                     anyhow::bail!(LOAD_SUPERSEDED_REASON);
                 }
-                let playback = DirectPlayback::open_local(
+                let playback = open_verified_direct_playback(
                     &selector,
                     &source_for_direct,
                     metadata.duration_secs,
-                    0.0,
                     auto_play,
+                    &load_token_for_direct,
+                    token,
                 )?;
                 match playback.format() {
                     DirectFormat::Pcm(format) => {
@@ -595,7 +665,7 @@ impl AudioPlayer {
                     if !player.is_load_token_current(token) {
                         return Err(Error::from_reason(LOAD_SUPERSEDED_REASON));
                     }
-                    player.clear_pending_load(token);
+                    player.stop();
                     return Err(error).into_napi();
                 }
             };

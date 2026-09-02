@@ -15,8 +15,6 @@
 namespace {
 
 constexpr std::size_t kTextCapacity = 256;
-constexpr auto kConnectPollInterval = std::chrono::milliseconds(10);
-constexpr auto kDisconnectTimeout = std::chrono::seconds(2);
 thread_local std::string g_last_error;
 
 using SPlayerDirettaNextBlock = bool (*)(void*, const std::uint8_t**, std::size_t*);
@@ -89,12 +87,8 @@ struct DirettaConnection {
         sync->stop();
         sync->releaseSourceBlock();
         sync->disconnect_flgset();
-        sync->disconnect(false);
-        const auto disconnect_deadline = std::chrono::steady_clock::now() + kDisconnectTimeout;
-        while (sync->is_connect() &&
-               std::chrono::steady_clock::now() < disconnect_deadline) {
-          std::this_thread::sleep_for(kConnectPollInterval);
-        }
+        sync->disconnect(true);
+        sync->disconnectWait();
       } else {
         sync->releaseSourceBlock();
       }

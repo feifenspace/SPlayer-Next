@@ -89,6 +89,7 @@ export const downloadLog = log.scope("download");
 export const serverLog = log.scope("server");
 export const pluginLog = log.scope("plugin");
 export const lastfmLog = log.scope("lastfm");
+export const listenbrainzLog = log.scope("listenbrainz");
 export const neteaseLog = log.scope("netease");
 export const updaterLog = log.scope("updater");
 export const cloudLog = log.scope("cloud");

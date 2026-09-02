@@ -263,6 +263,19 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/diretta/target_info",
             axum::routing::post(diretta_target_info_handler),
         )
+        // Diretta Source Direct Gapless 预加载与边界切换 (纯内存流式无缝切换)
+        .route(
+            "/api/v1/player/direct/stage_next",
+            axum::routing::post(direct_stage_next_handler),
+        )
+        .route(
+            "/api/v1/player/direct/cancel_next",
+            axum::routing::post(direct_cancel_next_handler),
+        )
+        .route(
+            "/api/v1/player/direct/commit_boundary",
+            axum::routing::post(direct_commit_boundary_handler),
+        )
         // 服务端目录文件浏览（Web UI 选择曲库目录）
         .route("/api/v1/fs/browse", axum::routing::get(fs_browse_handler))
         .route_layer(middleware::from_fn_with_state(
@@ -456,6 +469,140 @@ async fn volume_handler(
     Json(PlayerResponse::ok(json!({ "volume": volume })))
 }
 
+/// 获取流媒体音频 RAM 内存缓冲目录（优先 Linux /dev/shm 内存文件系统，彻底规避磁盘写入磨损与物理磁盘空间占用）
+fn get_stream_cache_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    let candidate_dirs = [
+        PathBuf::from("/dev/shm/splayer-headless-ram/streams"),
+        std::env::temp_dir().join("splayer-stream-cache"),
+        PathBuf::from("/opt/splayer-headless/data/cache/streams"),
+        PathBuf::from("data/cache/streams"),
+    ];
+
+    for dir in &candidate_dirs {
+        if std::fs::create_dir_all(dir).is_ok() {
+            let test_file = dir.join(".write_test");
+            if std::fs::write(&test_file, b"ok").is_ok() {
+                let _ = std::fs::remove_file(test_file);
+                return dir.clone();
+            }
+        }
+    }
+
+    std::env::temp_dir().join("splayer-stream-cache")
+}
+
+/// 自动清理过期的流媒体内存缓存，只保留当前播放曲目与下一首预载曲目（最多保留 2 首，其余立刻从内存释放）
+fn clean_old_stream_cache(cache_dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(cache_dir) {
+        let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if path.to_string_lossy().ends_with(".part") {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata() {
+                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    files.push((path, mtime));
+                }
+            }
+        }
+        // 纯内存模式：严格限制最多保留 2 首，防止物理 RAM 溢出
+        if files.len() > 2 {
+            files.sort_by_key(|(_, mtime)| *mtime);
+            let to_remove = files.len() - 2;
+            for (p, _) in files.into_iter().take(to_remove) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+}
+
+/// 将远端 HTTP(S) 音频流下载并固化到本地 RAM 缓冲文件中，以便 Diretta Source Direct 模式进行精确解码与传输
+fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
+    use std::fs::{self, File};
+
+    let cache_dir = get_stream_cache_dir();
+    let _ = fs::create_dir_all(&cache_dir);
+    clean_old_stream_cache(&cache_dir);
+
+    let hash = format!("{:x}", md5::compute(url.as_bytes()));
+    let mut ext = if url.contains(".flac") {
+        "flac"
+    } else if url.contains(".mp3") {
+        "mp3"
+    } else if url.contains(".m4a") || url.contains(".aac") {
+        "m4a"
+    } else if url.contains(".wav") {
+        "wav"
+    } else if url.contains(".dsf") {
+        "dsf"
+    } else if url.contains(".dff") {
+        "dff"
+    } else {
+        ""
+    };
+
+    if !ext.is_empty() {
+        let target_file = cache_dir.join(format!("{}.{}", hash, ext));
+        if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
+            return Ok(target_file.to_string_lossy().to_string());
+        }
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    let mut response = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity")
+        .send()?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("下载在线流媒体音频失败: HTTP {}", response.status());
+    }
+
+    if ext.is_empty() {
+        if let Some(ct) = response.headers().get("content-type").and_then(|v| v.to_str().ok()) {
+            let ct = ct.to_lowercase();
+            if ct.contains("flac") {
+                ext = "flac";
+            } else if ct.contains("mpeg") || ct.contains("mp3") {
+                ext = "mp3";
+            } else if ct.contains("mp4") || ct.contains("m4a") || ct.contains("aac") {
+                ext = "m4a";
+            } else if ct.contains("wav") {
+                ext = "wav";
+            } else if ct.contains("dsf") {
+                ext = "dsf";
+            }
+        }
+    }
+    if ext.is_empty() {
+        ext = "audio";
+    }
+
+    let target_file = cache_dir.join(format!("{}.{}", hash, ext));
+    if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(target_file.to_string_lossy().to_string());
+    }
+
+    let part_file = cache_dir.join(format!("{}.{}.part", hash, ext));
+    let mut file = File::create(&part_file)?;
+    std::io::copy(&mut response, &mut file)?;
+    file.sync_all()?;
+    drop(file);
+
+    fs::rename(&part_file, &target_file)?;
+    Ok(target_file.to_string_lossy().to_string())
+}
+
 const LOAD_SUPERSEDED_REASON: &str = "Load superseded by a newer request";
 
 /// 加载音轨（完整三段式异步 IO 闭环）
@@ -547,145 +694,16 @@ async fn load_handler(
         }
     }
 
-/// 获取安全的流媒体音频持久化缓存目录（避免挂载在小容量 /tmp tmpfs 上导致 No space left on device）
-fn get_stream_cache_dir() -> std::path::PathBuf {
-    use std::path::PathBuf;
-
-    let candidate_dirs = [
-        PathBuf::from("/opt/splayer-headless/data/cache/streams"),
-        PathBuf::from("data/cache/streams"),
-        PathBuf::from("/var/cache/splayer-headless/streams"),
-        std::env::temp_dir().join("splayer-stream-cache"),
-    ];
-
-    for dir in &candidate_dirs {
-        if std::fs::create_dir_all(dir).is_ok() {
-            let test_file = dir.join(".write_test");
-            if std::fs::write(&test_file, b"ok").is_ok() {
-                let _ = std::fs::remove_file(test_file);
-                return dir.clone();
-            }
-        }
-    }
-
-    std::env::temp_dir().join("splayer-stream-cache")
-}
-
-/// 自动清理过期的流媒体缓存，保持目录在合理大小（如最多保留最近 20 首曲目）
-fn clean_old_stream_cache(cache_dir: &std::path::Path) {
-    if let Ok(entries) = std::fs::read_dir(cache_dir) {
-        let mut files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if path.to_string_lossy().ends_with(".part") {
-                    let _ = std::fs::remove_file(&path);
-                    continue;
-                }
-                if let Ok(meta) = entry.metadata() {
-                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    files.push((path, mtime));
-                }
-            }
-        }
-        if files.len() > 20 {
-            files.sort_by_key(|(_, mtime)| *mtime);
-            let to_remove = files.len() - 20;
-            for (p, _) in files.into_iter().take(to_remove) {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
-}
-
-/// 将远端 HTTP(S) 音频流下载并固化到本地缓存文件中，以便 Diretta Source Direct 模式进行精确解码与传输
-fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
-    use std::fs::{self, File};
-
-    let cache_dir = get_stream_cache_dir();
-    let _ = fs::create_dir_all(&cache_dir);
-    clean_old_stream_cache(&cache_dir);
-
-    let hash = format!("{:x}", md5::compute(url.as_bytes()));
-    let mut ext = if url.contains(".flac") {
-        "flac"
-    } else if url.contains(".mp3") {
-        "mp3"
-    } else if url.contains(".m4a") || url.contains(".aac") {
-        "m4a"
-    } else if url.contains(".wav") {
-        "wav"
-    } else if url.contains(".dsf") {
-        "dsf"
-    } else if url.contains(".dff") {
-        "dff"
-    } else {
-        ""
-    };
-
-    if !ext.is_empty() {
-        let target_file = cache_dir.join(format!("{}.{}", hash, ext));
-        if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
-            return Ok(target_file.to_string_lossy().to_string());
-        }
-    }
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-
-    let mut response = client
-        .get(url)
-        .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .header("Accept", "*/*")
-        .header("Accept-Encoding", "identity")
-        .send()?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("下载在线流媒体音频失败: HTTP {}", response.status());
-    }
-
-    if ext.is_empty() {
-        if let Some(ct) = response.headers().get("content-type").and_then(|v| v.to_str().ok()) {
-            let ct = ct.to_lowercase();
-            if ct.contains("flac") {
-                ext = "flac";
-            } else if ct.contains("mpeg") || ct.contains("mp3") {
-                ext = "mp3";
-            } else if ct.contains("mp4") || ct.contains("m4a") || ct.contains("aac") {
-                ext = "m4a";
-            } else if ct.contains("wav") {
-                ext = "wav";
-            } else if ct.contains("dsf") {
-                ext = "dsf";
-            }
-        }
-    }
-    if ext.is_empty() {
-        ext = "audio";
-    }
-
-    let target_file = cache_dir.join(format!("{}.{}", hash, ext));
-    if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
-        return Ok(target_file.to_string_lossy().to_string());
-    }
-
-    let part_file = cache_dir.join(format!("{}.{}.part", hash, ext));
-    let mut file = File::create(&part_file)?;
-    std::io::copy(&mut response, &mut file)?;
-    file.sync_all()?;
-    drop(file);
-
-    fs::rename(&part_file, &target_file)?;
-    Ok(target_file.to_string_lossy().to_string())
-}
-
     if let Some(selector) = direct_selector {
         let source_for_direct = source_for_decoder.clone();
         let load_token_for_direct = Arc::clone(&load_token);
         let result = spawn_isolated_blocking("player-direct-load-worker", move || {
+            let replacing_direct_playback = old_threads.direct_playback.is_some();
             if let Some(h) = old_threads.join_aux() {
                 let _ = h.join();
+            }
+            if replacing_direct_playback {
+                std::thread::sleep(std::time::Duration::from_millis(800));
             }
             let physical_source = if source_for_direct.starts_with("http://") || source_for_direct.starts_with("https://") {
                 materialize_direct_input(&source_for_direct)?
@@ -740,7 +758,7 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
                         "source": source,
                     }))));
                 }
-                player.clear_pending_load(token);
+                player.stop();
                 return Err(ApiError::bad_request(format!("{err:#}")));
             }
         };
@@ -1030,6 +1048,94 @@ async fn seek_handler(
             }
         }
     }
+}
+
+/// Direct 预加载请求体
+#[derive(Debug, Deserialize)]
+pub struct DirectStageRequest {
+    pub source: String,
+    pub duration_secs: Option<f64>,
+    pub generation: Option<u64>,
+}
+
+/// Direct 提交切歌边界请求体
+#[derive(Debug, Deserialize)]
+pub struct DirectCommitBoundaryRequest {
+    pub source: String,
+    pub duration_secs: f64,
+}
+
+/// Diretta 预加载下一曲（支持远程流媒体预先下载至 RAM）
+async fn direct_stage_next_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<DirectStageRequest>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let source = payload.source;
+    let duration = payload.duration_secs.unwrap_or(0.0);
+    let generation = payload.generation.unwrap_or(0);
+
+    let stage_handle = state.player.lock().direct_stage_handle();
+
+    let Some(handle) = stage_handle else {
+        return Ok(Json(PlayerResponse::ok(json!({
+            "staged": false,
+            "reason": "Direct runtime inactive",
+        }))));
+    };
+
+    let physical_source = if source.starts_with("http://") || source.starts_with("https://") {
+        let src_clone = source.clone();
+        spawn_isolated_blocking("direct-stage-preload", move || {
+            materialize_direct_input(&src_clone)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Stage preload error: {e}")))?
+        .map_err(|e| ApiError::bad_request(format!("Failed to preload stream to RAM: {e}")))?
+    } else {
+        source.clone()
+    };
+
+    let result = spawn_isolated_blocking("direct-stage-next-worker", move || {
+        handle.stage_local(&physical_source, duration, generation)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("Stage next worker error: {e}")))?;
+
+    match result {
+        Ok(()) => Ok(Json(PlayerResponse::ok(json!({
+            "staged": true,
+            "source": source,
+            "generation": generation,
+        })))),
+        Err(err) => Err(ApiError::bad_request(format!("Direct stage failed: {err}"))),
+    }
+}
+
+/// 取消已暂存的 Direct 下一曲预加载
+async fn direct_cancel_next_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    if let Some(handle) = state.player.lock().direct_stage_handle() {
+        handle.cancel();
+    }
+    Ok(Json(PlayerResponse::ok(json!({ "cancelled": true }))))
+}
+
+/// 提交已完成的 Direct Gapless 边界切换
+async fn direct_commit_boundary_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<DirectCommitBoundaryRequest>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    state
+        .player
+        .lock()
+        .commit_direct_gapless_boundary(&payload.source, payload.duration_secs)
+        .map_err(|e| ApiError::bad_request(format!("Commit boundary failed: {e}")))?;
+    Ok(Json(PlayerResponse::ok(json!({
+        "committed": true,
+        "source": payload.source,
+        "duration": payload.duration_secs,
+    }))))
 }
 
 #[derive(Debug, Deserialize)]

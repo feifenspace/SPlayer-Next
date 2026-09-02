@@ -1601,6 +1601,14 @@
       "details": "歌曲名",
       "state": "歌手名"
     },
+    "listenbrainzEnabled": {
+      "label": "ListenBrainz",
+      "description": "连接 ListenBrainz 账号，记录播放与听歌历史"
+    },
+    "listenbrainzNowPlaying": {
+      "label": "发送正在播放",
+      "description": "向 ListenBrainz 同步当前正在播放的歌曲"
+    },
     "lastfmEnabled": {
       "label": "Last.fm",
       "description": "连接 Last.fm 账号，记录播放并同步喜欢"
@@ -1616,6 +1624,27 @@
     "lastfmLoveSync": {
       "label": "同步喜欢",
       "description": "点击喜欢时同步为 Last.fm 的 Love / Unlove"
+    },
+    "listenbrainz": {
+      "connect": "连接 Token",
+      "disconnect": "断开连接",
+      "connectedAs": "已连接：{name}",
+      "notConnected": "尚未连接 ListenBrainz 账号",
+      "tokenPlaceholder": "ListenBrainz User Token（保存后不回显）",
+      "state": {
+        "disabled": "已关闭",
+        "starting": "正在启动",
+        "unconfigured": "已启用，等待连接 Token",
+        "ready": "已就绪",
+        "retrying": "网络异常，等待重试",
+        "auth_error": "Token 认证失败，请重新连接",
+        "error": "服务异常"
+      },
+      "toast": {
+        "connected": "已连接到 ListenBrainz：{name}",
+        "failed": "连接失败：{error}",
+        "disconnected": "已断开 ListenBrainz 连接"
+      }
     },
     "lastfm": {
       "connect": "连接账号",

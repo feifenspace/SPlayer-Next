@@ -1613,6 +1613,14 @@
       "details": "Song Name",
       "state": "Artist Name"
     },
+    "listenbrainzEnabled": {
+      "label": "ListenBrainz",
+      "description": "Connect your ListenBrainz account to scrobble and track listening history"
+    },
+    "listenbrainzNowPlaying": {
+      "label": "Now Playing",
+      "description": "Send currently playing track to ListenBrainz"
+    },
     "lastfmEnabled": {
       "label": "Last.fm",
       "description": "Connect your Last.fm account to scrobble and sync loves"
@@ -1628,6 +1636,27 @@
     "lastfmLoveSync": {
       "label": "Sync Loves",
       "description": "Mirror your likes as Last.fm Love / Unlove"
+    },
+    "listenbrainz": {
+      "connect": "Connect Token",
+      "disconnect": "Disconnect",
+      "connectedAs": "Connected: {name}",
+      "notConnected": "No ListenBrainz account connected",
+      "tokenPlaceholder": "ListenBrainz User Token (hidden after saving)",
+      "state": {
+        "disabled": "Disabled",
+        "starting": "Starting",
+        "unconfigured": "Enabled, waiting for Token",
+        "ready": "Ready",
+        "retrying": "Network error, retrying",
+        "auth_error": "Token authentication failed, please reconnect",
+        "error": "Service error"
+      },
+      "toast": {
+        "connected": "Connected to ListenBrainz: {name}",
+        "failed": "Connection failed: {error}",
+        "disconnected": "Disconnected from ListenBrainz"
+      }
     },
     "lastfm": {
       "connect": "Connect account",

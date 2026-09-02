@@ -253,12 +253,13 @@ pub fn remove_scan_dir(conn: &Connection, path: &str) -> Result<()> {
 
 /// 获取增量对比所需的已有文件记录
 pub fn get_file_records(conn: &Connection) -> Result<Vec<FileRecord>> {
-    let mut stmt = conn.prepare("SELECT path, file_mtime, file_size FROM tracks")?;
+    let mut stmt = conn.prepare("SELECT path, file_mtime, file_size, cover FROM tracks")?;
     let rows = stmt.query_map([], |row| {
         Ok(FileRecord {
             path: row.get(0)?,
             mtime: row.get::<_, Option<u64>>(1)?.unwrap_or(0),
             size: row.get(2)?,
+            cover_path: row.get(3)?,
         })
     })?;
 

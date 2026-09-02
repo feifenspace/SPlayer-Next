@@ -130,6 +130,7 @@ export interface FileRecord {
   path: string
   mtime: number
   size: number
+  coverPath?: string
 }
 
 /** 初始化原生日志系统。重复调用是无害的（HMR 重载时主进程可能多次注入） */

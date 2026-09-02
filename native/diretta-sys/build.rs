@@ -71,6 +71,7 @@ fn main() {
         .include(&sdk_include)
         .flag_if_supported("-fPIC")
         .flag_if_supported("-O3")
+        .flag_if_supported("-Wno-ignored-qualifiers")
         .flag_if_supported(&format!("-march={}", march));
 
     build.compile("splayer_diretta_bridge");

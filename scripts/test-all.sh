@@ -13,7 +13,7 @@ CYAN="\033[36m"
 MAGENTA="\033[35m"
 RESET="\033[0m"
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
 cd "$ROOT_DIR"
 
 show_help() {
@@ -30,6 +30,7 @@ show_help() {
     echo -e "  ${YELLOW} 4${RESET} | ${CYAN}dsd${RESET}        - DSD 解码器与 Dsd2Pcm 比特流转换测试"
     echo -e "  ${YELLOW} 5${RESET} | ${CYAN}scanner${RESET}    - 本地音乐库多线程扫描与元数据提取测试"
     echo -e "  ${YELLOW} 6${RESET} | ${CYAN}hifi${RESET}       - HiFi 格式测试 (MQA / HDCD / DTS)"
+    echo -e "  ${YELLOW}16${RESET} | ${CYAN}ram${RESET}        - 纯内存 RAM Play 双缓冲 + CPU 亲和力调度测试"
     echo -e ""
     echo -e "${BOLD}2. Headless 服务端与网络引擎 (headless-server):${RESET}"
     echo -e "  ${YELLOW} 7${RESET} | ${CYAN}db${RESET}         - SQLite 本地曲库与统计测试 (Tracks/Albums/Artists)"
@@ -45,15 +46,15 @@ show_help() {
     echo -e "  ${YELLOW}15${RESET} | ${CYAN}web${RESET}        - Web 前端全量单元测试套件 (Vitest)"
     echo -e ""
     echo -e "${BOLD}4. 聚合/分类快捷测试:${RESET}"
-    echo -e "  ${MAGENTA}engine${RESET}      - 运行所有音频底层解码与扫描测试 (1-6)"
+    echo -e "  ${MAGENTA}engine${RESET}      - 运行所有音频底层解码与扫描测试 (1-6, 16)"
     echo -e "  ${MAGENTA}server${RESET}      - 运行所有 Headless 服务端测试 (7-12)"
-    echo -e "  ${MAGENTA}rust${RESET}        - 运行所有 Rust 后端核心测试 (1-12)"
-    echo -e "  ${MAGENTA}all${RESET}         - 运行全套 15 项测试 (默认)"
+    echo -e "  ${MAGENTA}rust${RESET}        - 运行所有 Rust 后端核心测试 (1-12, 16)"
+    echo -e "  ${MAGENTA}all${RESET}         - 运行全套 16 项测试 (默认)"
     echo -e ""
     echo -e "${BOLD}常用示例:${RESET}"
-    echo -e "  ./test.sh 13            # 仅测试 Web 流媒体 (Subsonic/Navidrome) 模块"
-    echo -e "  ./test.sh stream        # 仅测试 Web 流媒体模块"
-    echo -e "  ./test.sh db api        # 运行数据库和 REST API 测试"
+    echo -e "  ./test.sh 16            # 仅测试 RAM Play 纯内存模块"
+    echo -e "  ./test.sh ram           # 仅测试 RAM Play 纯内存模块"
+    echo -e "  ./test.sh 4 16          # DSD + RAM Play 联合测试"
     echo -e "  ./test.sh engine        # 运行全部音频解码引擎测试"
     echo -e "  ./test.sh -i            # 打开交互式菜单"
     echo -e "${BOLD}${CYAN}================================================================${RESET}\n"
@@ -75,6 +76,7 @@ if [ $# -eq 0 ] || [ "$1" = "-i" ] || [ "$1" = "--interactive" ] || [ "$1" = "me
     echo -e "    ${YELLOW}[ 1]${RESET} audio-engine-core 核心测试        ${YELLOW}[ 2]${RESET} SACD ISO 专项解析测试"
     echo -e "    ${YELLOW}[ 3]${RESET} CUE 分轨与智能匹配测试            ${YELLOW}[ 4]${RESET} DSD 解码与 Dsd2Pcm 测试"
     echo -e "    ${YELLOW}[ 5]${RESET} 音乐库多线程扫描测试              ${YELLOW}[ 6]${RESET} MQA / HDCD / DTS 特性测试"
+    echo -e "    ${YELLOW}[16]${RESET} RAM Play 纯内存双缓冲 + CPU 亲和力调度测试"
     echo -e "  ${BOLD}[服务端与网络]${RESET}"
     echo -e "    ${YELLOW}[ 7]${RESET} SQLite 曲库与检索测试             ${YELLOW}[ 8]${RESET} REST API 与播放器集成测试"
     echo -e "    ${YELLOW}[ 9]${RESET} 歌单存储与配置测试                ${YELLOW}[10]${RESET} Web 静态托管与 SPA 测试"
@@ -83,19 +85,19 @@ if [ $# -eq 0 ] || [ "$1" = "-i" ] || [ "$1" = "--interactive" ] || [ "$1" = "me
     echo -e "    ${YELLOW}[13]${RESET} Web 流媒体 (Subsonic/Jellyfin)     ${YELLOW}[14]${RESET} Web 客户端网络适配测试"
     echo -e "    ${YELLOW}[15]${RESET} Web 前端全量 Vitest 测试"
     echo -e "  ${BOLD}[快捷组合]${RESET}"
-    echo -e "    ${MAGENTA}[ E]${RESET} 全部音频引擎测试 (1-6)            ${MAGENTA}[ S]${RESET} 全部服务端测试 (7-12)"
-    echo -e "    ${MAGENTA}[ R]${RESET} 全部 Rust 后端测试 (1-12)          ${MAGENTA}[ A]${RESET} 运行全部 15 项测试 (默认)"
+    echo -e "    ${MAGENTA}[ E]${RESET} 全部音频引擎测试 (1-6, 16)        ${MAGENTA}[ S]${RESET} 全部服务端测试 (7-12)"
+    echo -e "    ${MAGENTA}[ R]${RESET} 全部 Rust 后端测试 (1-12, 16)      ${MAGENTA}[ A]${RESET} 运行全部 16 项测试 (默认)"
     echo -e "${BOLD}${CYAN}================================================================${RESET}"
-    echo -ne "${BOLD}请输入选择 [1-15/E/S/R/A] (支持多个如 7 13，回车默认全选): ${RESET}"
+    echo -ne "${BOLD}请输入选择 [1-16/E/S/R/A] (支持多个如 7 13，回车默认全选): ${RESET}"
     read -r user_input
     if [ -z "$user_input" ] || [ "$user_input" = "A" ] || [ "$user_input" = "a" ] || [ "$user_input" = "all" ]; then
-        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14" "15")
+        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14" "15" "16")
     elif [ "$user_input" = "E" ] || [ "$user_input" = "e" ] || [ "$user_input" = "engine" ]; then
-        SELECTED_STEPS=("1" "2" "3" "4" "5" "6")
+        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "16")
     elif [ "$user_input" = "S" ] || [ "$user_input" = "s" ] || [ "$user_input" = "server" ]; then
         SELECTED_STEPS=("7" "8" "9" "10" "11" "12")
     elif [ "$user_input" = "R" ] || [ "$user_input" = "r" ] || [ "$user_input" = "rust" ]; then
-        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12")
+        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "16")
     else
         SELECTED_STEPS=($user_input)
     fi
@@ -117,10 +119,11 @@ else
             13|stream|streaming|subsonic|navidrome|jellyfin) SELECTED_STEPS+=("13") ;;
             14|client|polyfill) SELECTED_STEPS+=("14") ;;
             15|web|frontend|vitest) SELECTED_STEPS+=("15") ;;
-            engine|audio) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6") ;;
+            16|ram|ram-play|rambuffer|memory) SELECTED_STEPS+=("16") ;;
+            engine|audio) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6" "16") ;;
             server|headless|backend) SELECTED_STEPS+=("7" "8" "9" "10" "11" "12") ;;
-            rust|rust-all|crates) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12") ;;
-            all|a) SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14" "15"); break ;;
+            rust|rust-all|crates) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "16") ;;
+            all|a) SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14" "15" "16"); break ;;
             *)
                 echo -e "${RED}未知测试参数: ${arg}${RESET}"
                 show_help
@@ -230,7 +233,7 @@ fi
 
 # 11. Diretta 守护进程与网络传输测试
 if should_run "11"; then
-    run_test_step 11 "Diretta 专网音频传输与守护进程测试" "cargo test -p headless-server --test diretta_integration_test -p diretta-sys"
+    run_test_step 11 "Diretta 专网音频传输与守护进程测试" "cargo test -p audio-engine-core --lib diretta -- --nocapture && cargo test -p headless-server --test diretta_integration_test -p diretta-sys"
 fi
 
 # 12. OpenCC 简繁中文转换测试
@@ -251,6 +254,17 @@ fi
 # 15. Web 前端全量单元测试
 if should_run "15"; then
     run_test_step 15 "Web 前端全量单元测试 (Vitest)" "pnpm test:web"
+fi
+
+# 16. 纯内存 RAM Play 双缓冲 + CPU 亲和力调度测试
+# 测试内容：
+#   - RamTrackBuffer：append/read/advance/fully_loaded/is_at_eof 生命周期
+#   - RamPlayManager：30 秒 Gapless 预加载触发 + 原子指针交换（SwapToNext）
+#   - DSD 静音字节（0x69）缓冲区初始化验证
+#   - Linux CPU 亲和力（detect_performance_cores）与 SCHED_FIFO 设置（编译验证）
+if should_run "16"; then
+    run_test_step 16 "纯内存 RAM Play 双缓冲 + CPU 亲和力调度测试" \
+        "cargo test -p audio-engine-core --lib ram_buffer -- --nocapture && cargo test -p audio-engine-core --lib priority -- --nocapture"
 fi
 
 # ==============================================================================

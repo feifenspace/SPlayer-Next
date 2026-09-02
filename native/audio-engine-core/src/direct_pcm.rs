@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ffmpeg_audio::sys;
+use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectPcmSampleFormat {
@@ -1197,6 +1198,10 @@ impl DirectPcmSource {
         let producer = thread::Builder::new()
             .name("diretta-direct-decode".into())
             .spawn(move || {
+                // 绑定到 CPU 性能核心（ARM 大核 / x86 独立物理核）并设置 SCHED_FIFO 实时调度，
+                // 防止 PCM 解码推流线程被调度到效率核或超线程虚拟核造成推流抗跟　2
+                bind_current_thread_to_performance_cores("diretta-direct-decode");
+                boost_current_audio_thread("diretta-direct-decode");
                 let mut active_format = format;
                 let mut staged: Option<StagedPcmSource> = None;
                 let mut next_slot = 1 % producer_ring.slots.len();

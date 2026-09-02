@@ -19,6 +19,7 @@ pub struct FileRecord {
     pub path: String,
     pub mtime: f64,
     pub size: f64,
+    pub cover_path: Option<String>,
 }
 
 /// 扫描到的曲目信息
@@ -115,6 +116,7 @@ pub fn scan_dirs(
                 path: r.path,
                 mtime: r.mtime as u64,
                 size: r.size as u64,
+                cover_path: r.cover_path,
             })
             .collect()
     });
