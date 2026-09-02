@@ -2,7 +2,11 @@
 defineOptions({ name: "SearchPage" });
 
 import type { Track } from "@shared/types/player";
-import { ALL_PLATFORMS, PLATFORM_SHORT_NAME, type Platform } from "@shared/types/platform";
+import {
+  ALL_SEARCH_PLATFORMS,
+  SEARCH_PLATFORM_SHORT_NAME,
+  type SearchPlatform,
+} from "@shared/types/platform";
 import type { CoverItem } from "@/types/artist";
 import { searchSongs, searchAlbums, searchArtists, searchPlaylists } from "@/apis/search";
 import SongList from "@/components/list/SongList.vue";
@@ -36,7 +40,10 @@ const tabs = computed(() => [
   { key: "playlists", label: t("search.tabs.playlists") },
 ]);
 
-const platformTabs = ALL_PLATFORMS.map((key) => ({ key, label: PLATFORM_SHORT_NAME[key] }));
+const platformTabs = ALL_SEARCH_PLATFORMS.map((key) => ({
+  key,
+  label: SEARCH_PLATFORM_SHORT_NAME[key],
+}));
 
 interface TabState<T> {
   items: T[];
@@ -163,7 +170,7 @@ const onTabSwitch = (key: string): void => {
 };
 
 const onPlatformSwitch = (key: string): void => {
-  status.searchPlatform = key as Platform;
+  status.searchPlatform = key as SearchPlatform;
 };
 
 /** 失败后重试加载当前 tab */
@@ -184,6 +191,7 @@ const isInitialLoading = computed(() => {
 });
 
 const isAuthError = computed(() => {
+  if (status.searchPlatform === "local" || status.searchPlatform === "streaming") return false;
   if (!error.value) return false;
   const lower = error.value.toLowerCase();
   return (
@@ -240,7 +248,7 @@ const onLoginDialogClose = (open: boolean): void => {
           </span>
         </h1>
         <!-- 平台切换 -->
-        <div class="shrink-0 w-80 max-w-full">
+        <div class="shrink-0 w-104 max-w-full">
           <STabs
             :model-value="status.searchPlatform"
             :tabs="platformTabs"

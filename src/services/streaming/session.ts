@@ -1,3 +1,5 @@
+import { generateUUID } from "@/utils/uuid";
+
 /**
  * PlaySessionId 生成器
  * Jellyfin/Emby stream URL 需要带 PlaySessionId 参数
@@ -13,7 +15,7 @@ let lastPlaySession: { trackId: string; sessionId: string } | null = null;
  */
 export const sessionIdForTrack = (trackId: string): string => {
   if (lastPlaySession?.trackId === trackId) return lastPlaySession.sessionId;
-  const sessionId = crypto.randomUUID();
+  const sessionId = generateUUID();
   lastPlaySession = { trackId, sessionId };
   return sessionId;
 };

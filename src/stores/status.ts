@@ -5,7 +5,7 @@ import type {
   ShuffleMode,
   Track,
 } from "@shared/types/player";
-import type { Platform } from "@shared/types/platform";
+import type { SearchPlatform } from "@shared/types/platform";
 import type { ContentScope } from "@/types/collection";
 import type { SortField, SortOrder } from "@/types/list";
 import type { PersonalFmOptions } from "@/types/netease";
@@ -79,7 +79,7 @@ export const useStatusStore = defineStore(
     /** 当前曲目歌词偏移（ms，正值为歌词提前） */
     const lyricOffsetMs = ref(0);
     /** 搜索页选中的平台 */
-    const searchPlatform = ref<Platform>("netease");
+    const searchPlatform = ref<SearchPlatform>("local");
     /** 侧栏「我的歌单」当前展示来源 */
     const myPlaylistSource = ref<ContentScope>("local");
     /** 「我喜欢的音乐」页当前 tab */

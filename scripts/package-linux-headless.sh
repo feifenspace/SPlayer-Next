@@ -252,7 +252,7 @@ check_web_needs_build() {
     fi
     # 查找是否有比现有构建产物更新的前端源码文件
     local newer_src
-    newer_src=$(find "$PROJECT_ROOT/src" "$PROJECT_ROOT/package.json" "$PROJECT_ROOT/electron.vite.config.ts" "$PROJECT_ROOT/index.html" -type f -newer "$WEB_DIST/index.html" 2>/dev/null | head -n 1 || true)
+    newer_src=$(find "$PROJECT_ROOT/src" "$PROJECT_ROOT/shared" "$PROJECT_ROOT/package.json" "$PROJECT_ROOT/electron.vite.config.ts" "$PROJECT_ROOT/index.html" -type f -newer "$WEB_DIST/index.html" 2>/dev/null | head -n 1 || true)
     if [[ -n "$newer_src" ]]; then
         return 0
     fi

@@ -1,5 +1,25 @@
 import { HttpPlayerClient } from "./httpClient";
 import { useStatusStore } from "@/stores/status";
+import { createWebStreamingApi } from "@/services/streaming/web/service";
+import { generateUUID } from "@/utils/uuid";
+
+// 在非安全上下文（如局域网 HTTP: http://192.168.x.x）中 polyfill crypto.randomUUID
+if (typeof window !== "undefined") {
+  if (!window.crypto) {
+    (window as any).crypto = {};
+  }
+  if (typeof window.crypto.randomUUID !== "function") {
+    try {
+      Object.defineProperty(window.crypto, "randomUUID", {
+        value: generateUUID,
+        configurable: true,
+        writable: true,
+      });
+    } catch {
+      (window.crypto as any).randomUUID = generateUUID;
+    }
+  }
+}
 
 /**
  * 为纯 Web / 浏览器环境提供完备的 window.api polyfill，
@@ -83,6 +103,9 @@ export const installWebPolyfill = (): void => {
       testNetworkProxy: async () => true,
       onProtocolUrl: () => () => {},
       consumePendingProtocolUrl: async () => null,
+      onOpenFiles: () => () => {},
+      consumePendingAudioFiles: async () => [],
+      getPathForFile: () => "",
     },
     window: {
       isMaximized: async () => false,
@@ -653,7 +676,7 @@ export const installWebPolyfill = (): void => {
         }
       },
     },
-    streaming: createSafeProxy("streaming"),
+    streaming: createWebStreamingApi(),
     recognition: createSafeProxy("recognition"),
   };
 

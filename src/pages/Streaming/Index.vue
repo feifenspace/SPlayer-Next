@@ -109,8 +109,12 @@ const handleReconnect = async (): Promise<void> => {
 
 /** 刷新当前 tab 数据 */
 const refreshKey = ref(0);
-const handleRefresh = (): void => {
+const handleRefresh = async (): Promise<void> => {
+  if (loading.value) return;
   refreshKey.value++;
+  if (activeServerId.value) {
+    await streaming.refreshLibrary(true);
+  }
 };
 
 provide("streamingRefreshKey", refreshKey);

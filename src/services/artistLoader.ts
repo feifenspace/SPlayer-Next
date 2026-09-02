@@ -91,17 +91,21 @@ const loadStreaming = async (id: string, options: LoadArtistOptions): Promise<vo
   const artistId = decodeURIComponent(id);
   const cached = streamingStore.artists.find((a) => a.id === artistId);
   const fallbackName = options.fallbackName ?? artistId;
-  const tracks = await streamingStore.fetchArtistSongs(artistId);
+  const [tracks, rawAlbums] = await Promise.all([
+    streamingStore.fetchArtistSongs(artistId).catch(() => []),
+    streamingStore.fetchArtistAlbums(artistId).catch(() => []),
+  ]);
   if (options.signal?.aborted) return;
+  const albums = albumsToCoverItems(rawAlbums);
   options.onUpdate({
     id: artistId,
     name: cached?.name ?? fallbackName,
-    avatar: cached?.avatar,
+    avatar: cached?.avatar ?? rawAlbums[0]?.cover ?? tracks[0]?.cover,
     source: "streaming",
     tracks,
-    albums: [],
+    albums,
     trackCount: tracks.length,
-    albumCount: 0,
+    albumCount: albums.length,
   });
 };
 

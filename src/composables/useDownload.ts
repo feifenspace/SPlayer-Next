@@ -3,6 +3,7 @@ import type { DownloadRequest, DownloadTagOptions, DownloadTask } from "@shared/
 import { QUALITY_LABELS, type QualityLevel } from "@/utils/quality";
 import { useSettingsStore } from "@/stores/settings";
 import { toast } from "@/composables/useToast";
+import { generateUUID } from "@/utils/uuid";
 
 /** 下载选项 */
 interface EnqueueOptions {
@@ -50,7 +51,7 @@ export const useDownload = () => {
       saveTtml: download.saveTtml,
     };
     return {
-      taskId: opts.taskId ?? crypto.randomUUID(),
+      taskId: opts.taskId ?? generateUUID(),
       track,
       qualityLevel: level,
       coverUrl: track.coverOriginal ?? track.cover,

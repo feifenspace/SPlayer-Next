@@ -39,7 +39,11 @@ export const handleError = (error: string): void => {
   if (SILENT_ERRORS.has(error)) return;
   const { t, te } = i18n.global;
   const key = `errors.${error}`;
-  const message = te(key) ? t(key) : t("errors.UNKNOWN");
+  const message = te(key)
+    ? t(key)
+    : error && typeof error === "string" && !error.startsWith("ErrorCode.")
+      ? error
+      : t("errors.UNKNOWN");
   if (CRITICAL_ERRORS.has(error)) {
     if (pendingCritical.has(error)) return;
     pendingCritical.add(error);

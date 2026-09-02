@@ -6,6 +6,7 @@ import { resolveByPlugin } from "@/services/audioSource";
 import { resolveNeteaseDownloadUrl } from "@/apis/song/netease";
 import { resolveQQMusicUrl } from "@/apis/song/qqmusic";
 import { resolveKugouUrl } from "@/apis/song/kugou";
+import { generateUUID } from "@/utils/uuid";
 
 /** 下载源解析结果 */
 export interface DownloadSource {
@@ -18,9 +19,10 @@ export interface DownloadSource {
 
 /**
  * 按下载音质解析歌曲下载地址
- * @param track - 要下载的歌曲
- * @param level - 下载音质档位
- * @returns 下载源；无法下载（VIP/试听/无插件/流媒体失败）返回 null
+ * 依次尝试：流媒体 > 官方解析 > 插件降级
+ * @param track - 歌曲元数据
+ * @param level - 目标音质等级
+ * @param usePlaybackForDownload - 官方解析失败时是否允许降级到试听流
  */
 export const resolveDownloadSource = async (
   track: Track,
@@ -31,7 +33,7 @@ export const resolveDownloadSource = async (
   if (track.source === "streaming") {
     try {
       const url = await useStreamingStore().getStreamUrl(track, {
-        playSessionId: crypto.randomUUID(),
+        playSessionId: generateUUID(),
       });
       return { url };
     } catch {

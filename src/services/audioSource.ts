@@ -12,6 +12,7 @@ import { resolveQobuzUrl } from "@/apis/song/qobuz";
 import { resolveTidalUrl } from "@/apis/song/tidal";
 import { ErrorCode } from "@shared/types/errors";
 import { handleError } from "@/utils/errors";
+import { generateUUID } from "@/utils/uuid";
 
 /** 在线平台 source → 插件 source key */
 const PLATFORM_TO_PLUGIN_SOURCE: Record<Platform, string> = {
@@ -311,7 +312,7 @@ export const resolveTrackSource = async (
         result.cacheRequest = async () => {
           try {
             const cacheUrl = await store.getStreamUrl(track, {
-              playSessionId: crypto.randomUUID(),
+              playSessionId: generateUUID(),
             });
             void window.api.cache.song.fetch(cacheKey, "streaming", cacheUrl);
           } catch (err) {

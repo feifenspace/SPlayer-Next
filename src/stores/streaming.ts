@@ -106,17 +106,51 @@ export const useStreamingStore = defineStore("streaming", () => {
     return window.api.streaming.testConnection(toRaw(input), serverId);
   };
 
-  /** runConnect 返回值；ok=false 时把具体错误透传给调用方 */
-  type ConnectResult = { ok: true } | { ok: false; error: string; code: StreamingErrorCode };
+  /**
+   * 从主进程读取媒体库快照
+   * @param serverId - 服务器 ID
+   */
+  const loadLibrarySnapshot = async (serverId: string): Promise<void> => {
+    const seq = ++snapshotFetchSeq;
+    try {
+      const snapshot = await window.api.streaming.getSnapshot(serverId);
+      if (seq !== snapshotFetchSeq || activeServerId.value !== serverId || !snapshot) return;
+      songs.value = snapshot.songs ?? [];
+      albums.value = snapshot.albums ?? [];
+      artists.value = snapshot.artists ?? [];
+      playlists.value = snapshot.playlists ?? [];
+    } catch (err) {
+      console.error("[streaming] loadLibrarySnapshot failed:", err);
+    }
+  };
 
   /**
-   * 连接/重登的内部实现
+   * 显示本地快照并请求主进程后台刷新
+   * @param force - 是否强制重新同步
+   */
+  const refreshLibrary = async (force = false): Promise<void> => {
+    const id = activeServerId.value;
+    if (!id) return;
+    loading.value = true;
+    try {
+      await loadLibrarySnapshot(id);
+      await window.api.streaming.sync(id, force);
+    } finally {
+      loading.value = false;
+    }
+  };
+
+  /**
+   * 运行一次带状态同步的连接
    * @param id - 目标 server id
-   * @param isActive - 写 connectionStatus 时再求值；避免长 await 期间用户切了 server，把旧结果写到当前激活态上
+   * @param isActive - 校验是否仍为当前激活服务器
    * @returns 连接结果
    */
-  const runConnect = async (id: string, isActive: () => boolean): Promise<ConnectResult> => {
-    const cfg = servers.value.find((s) => s.id === id);
+  const runConnect = async (
+    id: string,
+    isActive: () => boolean,
+  ): Promise<{ ok: true } | { ok: false; error: string; code?: StreamingErrorCode }> => {
+    const cfg = servers.value.find((server) => server.id === id);
     if (!cfg) return { ok: false, error: "找不到服务器配置", code: "unknown" };
     /** 只更新仍然激活的服务器状态 */
     const writeStatus = (next: typeof connectionStatus.value): void => {
@@ -177,90 +211,71 @@ export const useStreamingStore = defineStore("streaming", () => {
   };
 
   /**
-   * 从主进程读取媒体库快照
-   * @param serverId - 服务器 ID
-   */
-  const loadLibrarySnapshot = async (serverId: string): Promise<void> => {
-    const seq = ++snapshotFetchSeq;
-    try {
-      const snapshot = await window.api.streaming.getSnapshot(serverId);
-      if (seq !== snapshotFetchSeq || activeServerId.value !== serverId) return;
-      songs.value = snapshot.songs;
-      albums.value = snapshot.albums;
-      artists.value = snapshot.artists;
-      playlists.value = snapshot.playlists;
-    } catch (err) {
-      console.error("[streaming] loadLibrarySnapshot failed:", err);
-    }
-  };
-
-  /**
-   * 显示本地快照并请求主进程后台刷新
-   * @param force - 是否强制重新同步
-   */
-  const refreshLibrary = async (force = false): Promise<void> => {
-    const serverId = activeServerId.value;
-    if (!serverId) return;
-    loading.value = true;
-    try {
-      await loadLibrarySnapshot(serverId);
-      const started = await window.api.streaming.sync(serverId, force);
-      if (!started && activeServerId.value === serverId) loading.value = false;
-    } catch (err) {
-      if (activeServerId.value === serverId) loading.value = false;
-      console.error("[streaming] refreshLibrary failed:", err);
-    }
-  };
-
-  /**
-   * 拉取指定专辑的歌曲
-   * @param albumId - 专辑 originalId
+   * 读取专辑歌曲
+   * @param albumId - 服务端专辑 ID
    * @returns 专辑歌曲
    */
-  const fetchAlbumSongs = (albumId: string): Promise<Track[]> =>
-    activeServerId.value
-      ? window.api.streaming.getAlbumSongs(activeServerId.value, albumId)
-      : Promise.reject(new Error("没有激活的流媒体服务器"));
+  const ensureActiveServerId = async (): Promise<string> => {
+    if (!initialized) {
+      await init();
+    }
+    if (activeServerId.value) return activeServerId.value;
+    if (servers.value.length > 0) {
+      activeServerId.value = servers.value[0].id;
+      return servers.value[0].id;
+    }
+    throw new Error("没有激活的流媒体服务器");
+  };
 
   /**
-   * 拉取指定歌单的歌曲
-   * @param playlistId - 歌单 originalId
+   * 读取专辑歌曲
+   * @param albumId - 服务端专辑 ID
+   * @returns 专辑歌曲
+   */
+  const fetchAlbumSongs = async (albumId: string): Promise<Track[]> => {
+    const srvId = await ensureActiveServerId();
+    return window.api.streaming.getAlbumSongs(srvId, albumId);
+  };
+
+  /**
+   * 读取歌单歌曲
+   * @param playlistId - 服务端歌单 ID
    * @returns 歌单歌曲
    */
-  const fetchPlaylistSongs = (playlistId: string): Promise<Track[]> =>
-    activeServerId.value
-      ? window.api.streaming.getPlaylistSongs(activeServerId.value, playlistId)
-      : Promise.reject(new Error("没有激活的流媒体服务器"));
+  const fetchPlaylistSongs = async (playlistId: string): Promise<Track[]> => {
+    const srvId = await ensureActiveServerId();
+    return window.api.streaming.getPlaylistSongs(srvId, playlistId);
+  };
 
   /**
-   * 拉取指定歌手名下的专辑
-   * @param artistId - 歌手 originalId
+   * 读取歌手专辑
+   * @param artistId - 服务端歌手 ID
    * @returns 歌手专辑
    */
-  const fetchArtistAlbums = (artistId: string): Promise<Album[]> =>
-    activeServerId.value
-      ? window.api.streaming.getArtistAlbums(activeServerId.value, artistId)
-      : Promise.reject(new Error("没有激活的流媒体服务器"));
+  const fetchArtistAlbums = async (artistId: string): Promise<Album[]> => {
+    const srvId = await ensureActiveServerId();
+    return window.api.streaming.getArtistAlbums(srvId, artistId);
+  };
 
   /**
-   * 拉取指定歌手名下的所有歌曲
-   * @param artistId - 歌手 originalId
+   * 读取歌手歌曲
+   * @param artistId - 服务端歌手 ID
    * @returns 歌手歌曲
    */
-  const fetchArtistSongs = (artistId: string): Promise<Track[]> =>
-    activeServerId.value
-      ? window.api.streaming.getArtistSongs(activeServerId.value, artistId)
-      : Promise.reject(new Error("没有激活的流媒体服务器"));
+  const fetchArtistSongs = async (artistId: string): Promise<Track[]> => {
+    const srvId = await ensureActiveServerId();
+    return window.api.streaming.getArtistSongs(srvId, artistId);
+  };
 
   /**
    * 在激活服务器上搜索（歌曲/专辑/歌手聚合）
    * @param query - 搜索关键词
    * @returns 聚合搜索结果
    */
-  const search = (query: string): Promise<StreamingSearchResult> =>
-    activeServerId.value
-      ? window.api.streaming.search(activeServerId.value, query)
-      : Promise.reject(new Error("没有激活的流媒体服务器"));
+  const search = async (query: string): Promise<StreamingSearchResult> => {
+    const srvId = await ensureActiveServerId();
+    return window.api.streaming.search(srvId, query);
+  };
 
   /**
    * 取流播放 URL
@@ -270,17 +285,21 @@ export const useStreamingStore = defineStore("streaming", () => {
    * @returns 当前会话可用的播放地址
    */
   const getStreamUrl = async (track: Track, opts?: { playSessionId?: string }): Promise<string> => {
-    if (track.source !== "streaming" || !track.serverId || !track.originalId) {
-      throw new Error("非流媒体 Track");
+    let serverId = track.serverId;
+    let originalId = track.originalId;
+    if (!serverId && track.id?.includes(":")) {
+      const parts = track.id.split(":");
+      serverId = parts[0];
+      originalId = originalId || parts.slice(1).join(":");
     }
-    const cfg = servers.value.find((server) => server.id === track.serverId);
-    if (!cfg) throw new Error("找不到服务器配置");
-    if (cfg.id === activeServerId.value && !connectionStatus.value.connected) {
-      const result = await runConnect(cfg.id, () => cfg.id === activeServerId.value);
-      if (!result.ok) throw new Error(result.error);
-    }
+    serverId = serverId || activeServerId.value || "";
+    originalId = originalId || track.id;
+
+    const cfg = servers.value.find((server) => server.id === serverId) || activeServer.value;
+    if (!cfg) throw new Error("找不到流媒体服务器配置");
+
     const sessionId = opts?.playSessionId ?? session.sessionIdForTrack(track.id);
-    return window.api.streaming.getStreamUrl(cfg.id, track.originalId!, sessionId);
+    return window.api.streaming.getStreamUrl(cfg.id, originalId, sessionId);
   };
 
   /** 初始化服务器配置和媒体库更新订阅 */
@@ -292,8 +311,8 @@ export const useStreamingStore = defineStore("streaming", () => {
       if (serverId === activeServerId.value) loading.value = false;
     });
     const result = await window.api.streaming.loadServers();
-    servers.value = result.servers;
-    activeServerId.value = result.activeServerId;
+    servers.value = Array.isArray(result?.servers) ? result.servers : [];
+    activeServerId.value = result?.activeServerId ?? null;
     if (activeServerId.value && !servers.value.find((s) => s.id === activeServerId.value)) {
       activeServerId.value = null;
     }

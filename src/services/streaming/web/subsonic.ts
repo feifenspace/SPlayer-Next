@@ -1,8 +1,12 @@
-import { createHash, randomBytes } from "node:crypto";
 import type { Album, Artist, Playlist, Track } from "@shared/types/player";
-import type { StreamingPingResult } from "@shared/types/streaming";
-import type { StreamingRuntimeConfig } from "@shared/types/streaming";
-import type { StreamingAdapter } from "./types";
+import type {
+  StreamingListParams,
+  StreamingPingResult,
+  StreamingRuntimeConfig,
+  StreamingSearchResult,
+} from "@shared/types/streaming";
+import { md5 } from "./md5";
+import type { WebStreamingAdapter } from "./types";
 
 const API_VERSION = "1.16.1";
 const CLIENT_NAME = "SPlayer-Next";
@@ -55,18 +59,15 @@ interface SubsonicPlaylist {
   entry?: SubsonicSong[];
 }
 
-/**
- * 生成 Subsonic 请求鉴权参数
- * @param config - 主进程服务器配置
- * @returns 每次请求独立的鉴权参数
- */
+const randomSalt = (): string => {
+  return Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
+};
+
 const buildAuth = (config: StreamingRuntimeConfig, isRestData = true): URLSearchParams => {
-  const salt = randomBytes(6).toString("hex");
+  const salt = randomSalt();
   const params = new URLSearchParams({
     u: config.username,
-    t: createHash("md5")
-      .update(config.password + salt)
-      .digest("hex"),
+    t: md5(config.password + salt),
     s: salt,
     v: API_VERSION,
     c: CLIENT_NAME,
@@ -77,14 +78,6 @@ const buildAuth = (config: StreamingRuntimeConfig, isRestData = true): URLSearch
   return params;
 };
 
-/**
- * 生成 Subsonic API 地址
- * @param config - 主进程服务器配置
- * @param endpoint - API 端点
- * @param extra - 业务参数
- * @param isRestData - 是否为 JSON 数据接口（默认为 true，音频流与图片为 false）
- * @returns 完整请求地址
- */
 const buildUrl = (
   config: StreamingRuntimeConfig,
   endpoint: string,
@@ -92,23 +85,18 @@ const buildUrl = (
   isRestData = true,
 ): string => {
   const params = buildAuth(config, isRestData);
-  for (const [key, value] of Object.entries(extra)) params.set(key, String(value));
+  for (const [key, value] of Object.entries(extra)) {
+    params.set(key, String(value));
+  }
   return `${config.url.replace(/\/+$/, "")}/rest/${endpoint}?${params.toString()}`;
 };
 
-/**
- * 请求 Subsonic API
- * @param config - 主进程服务器配置
- * @param endpoint - API 端点
- * @param extra - 业务参数
- * @returns API 响应内容
- */
 const callApi = async <T>(
   config: StreamingRuntimeConfig,
   endpoint: string,
   extra?: Record<string, string | number>,
 ): Promise<T> => {
-  const response = await fetch(buildUrl(config, endpoint, extra), {
+  const response = await fetch(buildUrl(config, endpoint, extra, true), {
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (!response.ok) throw new Error(`${endpoint}: HTTP ${response.status}`);
@@ -122,29 +110,15 @@ const callApi = async <T>(
   return result as T;
 };
 
-/**
- * 生成主进程代理封面地址
- * @param config - 主进程服务器配置
- * @param coverId - 服务端封面 ID
- * @param size - 封面尺寸
- * @returns renderer 使用的封面地址
- */
 const coverUrl = (
   config: StreamingRuntimeConfig,
   coverId: string | undefined,
-  size: number,
+  size = 300,
 ): string | undefined => {
   if (!coverId) return undefined;
-  const params = new URLSearchParams({ serverId: config.id, coverId, size: String(size) });
-  return `streaming-cover://image?${params.toString()}`;
+  return buildUrl(config, "getCoverArt", { id: coverId, size }, false);
 };
 
-/**
- * 转换 Subsonic 歌曲
- * @param config - 主进程服务器配置
- * @param song - 服务端歌曲
- * @returns 统一歌曲
- */
 const toTrack = (config: StreamingRuntimeConfig, song: SubsonicSong): Track => {
   const artists = song.artists?.length
     ? song.artists.map((artist) => ({ id: artist.id, name: artist.name }))
@@ -173,12 +147,6 @@ const toTrack = (config: StreamingRuntimeConfig, song: SubsonicSong): Track => {
   };
 };
 
-/**
- * 转换 Subsonic 专辑
- * @param config - 主进程服务器配置
- * @param album - 服务端专辑
- * @returns 统一专辑
- */
 const toAlbum = (config: StreamingRuntimeConfig, album: SubsonicAlbum): Album => ({
   id: album.id,
   name: album.name,
@@ -188,12 +156,6 @@ const toAlbum = (config: StreamingRuntimeConfig, album: SubsonicAlbum): Album =>
   year: album.year,
 });
 
-/**
- * 转换 Subsonic 歌手
- * @param config - 主进程服务器配置
- * @param artist - 服务端歌手
- * @returns 统一歌手
- */
 const toArtist = (config: StreamingRuntimeConfig, artist: SubsonicArtist): Artist => ({
   id: artist.id,
   name: artist.name,
@@ -201,12 +163,6 @@ const toArtist = (config: StreamingRuntimeConfig, artist: SubsonicArtist): Artis
   albumCount: artist.albumCount,
 });
 
-/**
- * 转换 Subsonic 歌单
- * @param config - 主进程服务器配置
- * @param playlist - 服务端歌单
- * @returns 统一歌单
- */
 const toPlaylist = (config: StreamingRuntimeConfig, playlist: SubsonicPlaylist): Playlist => ({
   id: playlist.id,
   name: playlist.name,
@@ -216,13 +172,8 @@ const toPlaylist = (config: StreamingRuntimeConfig, playlist: SubsonicPlaylist):
   owner: playlist.owner,
 });
 
-export const subsonicAdapter: StreamingAdapter = {
-  /**
-   * 检查 Subsonic 连通性
-   * @param config - 主进程服务器配置
-   * @returns 连通性结果
-   */
-  async ping(config): Promise<StreamingPingResult> {
+export const subsonicWebAdapter: WebStreamingAdapter = {
+  async ping(config: StreamingRuntimeConfig): Promise<StreamingPingResult> {
     try {
       const result = await callApi<{ version?: string; serverVersion?: string }>(config, "ping");
       return { ok: true, version: result.serverVersion ?? result.version };
@@ -230,13 +181,8 @@ export const subsonicAdapter: StreamingAdapter = {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
   },
-  /**
-   * 分页读取 Subsonic 歌曲
-   * @param config - 主进程服务器配置
-   * @param params - 分页参数
-   * @returns 歌曲列表
-   */
-  async listSongs(config, params) {
+
+  async listSongs(config: StreamingRuntimeConfig, params?: StreamingListParams): Promise<Track[]> {
     try {
       const result = await callApi<{ searchResult3?: { song?: SubsonicSong[] } }>(config, "search3", {
         query: "",
@@ -265,45 +211,29 @@ export const subsonicAdapter: StreamingAdapter = {
     }
   },
 
-  /**
-   * 分页读取 Subsonic 专辑
-   * @param config - 主进程服务器配置
-   * @param params - 分页参数
-   * @returns 专辑列表
-   */
-  async listAlbums(config, params) {
+  async listAlbums(config: StreamingRuntimeConfig, params?: StreamingListParams): Promise<Album[]> {
     const result = await callApi<{ albumList2?: { album?: SubsonicAlbum[] } }>(
       config,
       "getAlbumList2",
       {
         type: "alphabeticalByName",
-        size: params?.limit ?? 500,
+        size: params?.limit ?? 100,
         offset: params?.offset ?? 0,
       },
     );
     return (result.albumList2?.album ?? []).map((album) => toAlbum(config, album));
   },
 
-  /**
-   * 读取 Subsonic 歌手
-   * @param config - 主进程服务器配置
-   * @returns 歌手列表
-   */
-  async listArtists(config) {
+  async listArtists(config: StreamingRuntimeConfig): Promise<Artist[]> {
     const result = await callApi<{
       artists?: { index?: { artist?: SubsonicArtist[] }[] };
+      indexes?: { index?: { artist?: SubsonicArtist[] }[] };
     }>(config, "getArtists");
-    return (result.artists?.index ?? []).flatMap((index) =>
-      (index.artist ?? []).map((artist) => toArtist(config, artist)),
-    );
+    const indexes = result.artists?.index ?? result.indexes?.index ?? [];
+    return indexes.flatMap((entry) => (entry.artist ?? []).map((artist) => toArtist(config, artist)));
   },
 
-  /**
-   * 读取 Subsonic 歌单
-   * @param config - 主进程服务器配置
-   * @returns 歌单列表
-   */
-  async listPlaylists(config) {
+  async listPlaylists(config: StreamingRuntimeConfig): Promise<Playlist[]> {
     const result = await callApi<{ playlists?: { playlist?: SubsonicPlaylist[] } }>(
       config,
       "getPlaylists",
@@ -311,88 +241,81 @@ export const subsonicAdapter: StreamingAdapter = {
     return (result.playlists?.playlist ?? []).map((playlist) => toPlaylist(config, playlist));
   },
 
-  /**
-   * 读取 Subsonic 专辑歌曲
-   * @param config - 主进程服务器配置
-   * @param albumId - 服务端专辑 ID
-   * @returns 专辑歌曲
-   */
-  async getAlbumSongs(config, albumId) {
-    const result = await callApi<{ album?: SubsonicAlbum }>(config, "getAlbum", { id: albumId });
+  async getAlbumSongs(config: StreamingRuntimeConfig, albumId: string): Promise<Track[]> {
+    const cleanId = albumId.includes(":") ? albumId.split(":").slice(1).join(":") : albumId;
+    const result = await callApi<{ album?: SubsonicAlbum }>(config, "getAlbum", { id: cleanId });
     return (result.album?.song ?? []).map((song) => toTrack(config, song));
   },
 
-  /**
-   * 读取 Subsonic 歌单歌曲
-   * @param config - 主进程服务器配置
-   * @param playlistId - 服务端歌单 ID
-   * @returns 歌单歌曲
-   */
-  async getPlaylistSongs(config, playlistId) {
+  async getPlaylistSongs(config: StreamingRuntimeConfig, playlistId: string): Promise<Track[]> {
+    const cleanId = playlistId.includes(":") ? playlistId.split(":").slice(1).join(":") : playlistId;
     const result = await callApi<{ playlist?: SubsonicPlaylist }>(config, "getPlaylist", {
-      id: playlistId,
+      id: cleanId,
     });
     return (result.playlist?.entry ?? []).map((song) => toTrack(config, song));
   },
 
-  /**
-   * 读取 Subsonic 歌手专辑
-   * @param config - 主进程服务器配置
-   * @param artistId - 服务端歌手 ID
-   * @returns 歌手专辑
-   */
-  async getArtistAlbums(config, artistId) {
+  async getArtistAlbums(config: StreamingRuntimeConfig, artistId: string): Promise<Album[]> {
+    const cleanId = artistId.includes(":") ? artistId.split(":").slice(1).join(":") : artistId;
     const result = await callApi<{ artist?: { album?: SubsonicAlbum[] } }>(config, "getArtist", {
-      id: artistId,
+      id: cleanId,
     });
     return (result.artist?.album ?? []).map((album) => toAlbum(config, album));
   },
 
-  /**
-   * 逐张专辑读取 Subsonic 歌手歌曲
-   * @param config - 主进程服务器配置
-   * @param artistId - 服务端歌手 ID
-   * @returns 歌手歌曲
-   */
-  async getArtistSongs(config, artistId) {
+  async getArtistSongs(config: StreamingRuntimeConfig, artistId: string): Promise<Track[]> {
+    const cleanId = artistId.includes(":") ? artistId.split(":").slice(1).join(":") : artistId;
     const result = await callApi<{ artist?: { album?: SubsonicAlbum[] } }>(config, "getArtist", {
-      id: artistId,
+      id: cleanId,
     });
+    const albums = result.artist?.album ?? [];
+    const results = await Promise.allSettled(
+      albums.map((album) =>
+        callApi<{ album?: SubsonicAlbum }>(config, "getAlbum", { id: album.id }),
+      ),
+    );
     const tracks: Track[] = [];
-    for (const album of result.artist?.album ?? []) {
-      try {
-        const albumResult = await callApi<{ album?: SubsonicAlbum }>(config, "getAlbum", {
-          id: album.id,
-        });
-        tracks.push(...(albumResult.album?.song ?? []).map((song) => toTrack(config, song)));
-      } catch {
-        // 单张专辑不可用时仍返回该歌手的其它歌曲
+    for (const res of results) {
+      if (res.status === "fulfilled" && res.value.album?.song) {
+        tracks.push(...res.value.album.song.map((song) => toTrack(config, song)));
       }
     }
     return tracks;
   },
 
-  /**
-   * 生成 Subsonic 播放地址
-   * @param config - 主进程服务器配置
-   * @param trackId - 服务端歌曲 ID
-   * @returns 播放地址
-   */
-  async getStreamUrl(config, trackId) {
+  async search(config: StreamingRuntimeConfig, query: string): Promise<StreamingSearchResult> {
+    const result = await callApi<{
+      searchResult3?: {
+        song?: SubsonicSong[];
+        album?: SubsonicAlbum[];
+        artist?: SubsonicArtist[];
+      };
+    }>(config, "search3", {
+      query,
+      songCount: 100,
+      albumCount: 50,
+      artistCount: 50,
+    });
+    const data = result.searchResult3;
+    return {
+      songs: (data?.song ?? []).map((song) => toTrack(config, song)),
+      albums: (data?.album ?? []).map((album) => toAlbum(config, album)),
+      artists: (data?.artist ?? []).map((artist) => toArtist(config, artist)),
+    };
+  },
+
+  async getStreamUrl(config: StreamingRuntimeConfig, trackId: string): Promise<string> {
     const cleanId = trackId.includes(":") ? trackId.split(":").slice(1).join(":") : trackId;
     return buildUrl(config, "stream", {
       id: cleanId,
     }, false);
   },
 
-  /**
-   * 读取 Subsonic 歌词
-   * @param config - 主进程服务器配置
-   * @param trackId - 服务端歌曲 ID
-   * @param hint - 旧歌词端点使用的歌曲信息
-   * @returns 原始歌词文本
-   */
-  async getLyrics(config, trackId, hint) {
+  async getLyrics(
+    config: StreamingRuntimeConfig,
+    trackId: string,
+    hint?: { artist?: string; title?: string },
+  ): Promise<string | null> {
     try {
       const result = await callApi<{
         lyricsList?: { structuredLyrics?: { line?: { start?: number; value: string }[] }[] };
@@ -410,7 +333,7 @@ export const subsonicAdapter: StreamingAdapter = {
           .join("\n");
       }
     } catch {
-      // 旧版 Subsonic 不支持按歌曲 ID 获取歌词。
+      // 回退
     }
     if (!hint?.artist && !hint?.title) return null;
     try {
@@ -424,14 +347,7 @@ export const subsonicAdapter: StreamingAdapter = {
     }
   },
 
-  /**
-   * 生成 Subsonic 真实封面地址
-   * @param config - 主进程服务器配置
-   * @param coverId - 服务端封面 ID
-   * @param size - 目标尺寸
-   * @returns 真实封面地址
-   */
-  async getCoverUrl(config, coverId, size) {
-    return buildUrl(config, "getCoverArt", { id: coverId, size: size ?? 300 }, false);
+  getCoverUrl(config: StreamingRuntimeConfig, coverId: string, size = 300): string {
+    return buildUrl(config, "getCoverArt", { id: coverId, size }, false);
   },
 };

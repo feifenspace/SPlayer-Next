@@ -108,7 +108,10 @@ const pickCover = async (): Promise<void> => {
 const newCoverUrl = ref<string | null>(null);
 
 /** 在线匹配平台，初始值跟随搜索页偏好，命名与搜索页同源 */
-const matchPlatform = ref<Platform>(useStatusStore().searchPlatform);
+const initialMatchPlatform = useStatusStore().searchPlatform;
+const matchPlatform = ref<Platform>(
+  initialMatchPlatform === "local" ? "netease" : initialMatchPlatform,
+);
 const platformOptions = ALL_PLATFORMS.map((key) => ({
   value: key,
   label: PLATFORM_SHORT_NAME[key],
