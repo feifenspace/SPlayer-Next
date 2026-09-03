@@ -1,6 +1,8 @@
 use std::ffi::{c_char, c_void};
 
 pub const TEXT_CAPACITY: usize = 256;
+pub const TARGET_TEXT_MAX: usize = 128;
+pub const TARGET_FW_MAX: usize = 64;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -29,6 +31,54 @@ impl Default for SPlayerDirettaDevice {
             model_name: [0; TEXT_CAPACITY],
             mtu: 0,
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SPlayerDirettaTargetCaps {
+    pub target_name: [c_char; TARGET_TEXT_MAX],
+    pub output_name: [c_char; TARGET_TEXT_MAX],
+    pub firmware_version: [c_char; TARGET_FW_MAX],
+    pub ipv6_addr: [c_char; TARGET_TEXT_MAX],
+    pub full_addr: [c_char; TARGET_TEXT_MAX],
+    pub if_idx: i32,
+
+    pub supports_pcm: u8,
+    pub support_pcm_raw: u64,
+    pub pcm_min_bits: u32,
+    pub pcm_max_bits: u32,
+    pub pcm_min_sample_rate: u32,
+    pub pcm_max_sample_rate: u32,
+    pub pcm_min_channels: u32,
+    pub pcm_max_channels: u32,
+
+    pub supports_dsd: u8,
+    pub supports_dsd_lsb: u8,
+    pub supports_dsd_msb: u8,
+    pub support_dsd_lsb_raw: u64,
+    pub support_dsd_msb_raw: u64,
+    pub dsd_min_sample_rate: u32,
+    pub dsd_max_sample_rate: u32,
+    pub dsd_min_bits: u32,
+    pub dsd_max_bits: u32,
+    pub dsd_min_channels: u32,
+    pub dsd_max_channels: u32,
+
+    pub mtu_measured: u32,
+    pub mtu_min: u16,
+    pub mtu_req: u16,
+    pub mtu_max: u32,
+    pub max_size: u16,
+
+    pub support_ms_mode: u16,
+}
+
+impl Default for SPlayerDirettaTargetCaps {
+    fn default() -> Self {
+        // 固定宽度 C 结构：全零即"未知/不支持"
+        // SAFETY: 结构体仅由 POD（整数与 c_char 数组）组成，全零位模式有效
+        unsafe { std::mem::zeroed() }
     }
 }
 
@@ -62,6 +112,10 @@ unsafe extern "C" {
     pub fn splayer_diretta_play(handle: *mut c_void) -> bool;
     pub fn splayer_diretta_pause(handle: *mut c_void) -> bool;
     pub fn splayer_diretta_close(handle: *mut c_void);
+    pub fn splayer_diretta_query_target_caps(
+        target_id: *const c_char,
+        out_caps: *mut SPlayerDirettaTargetCaps,
+    ) -> bool;
 }
 
 #[cfg(not(diretta_sdk_enabled))]
@@ -113,3 +167,11 @@ pub unsafe fn splayer_diretta_pause(_handle: *mut c_void) -> bool {
 
 #[cfg(not(diretta_sdk_enabled))]
 pub unsafe fn splayer_diretta_close(_handle: *mut c_void) {}
+
+#[cfg(not(diretta_sdk_enabled))]
+pub unsafe fn splayer_diretta_query_target_caps(
+    _target_id: *const c_char,
+    _out_caps: *mut SPlayerDirettaTargetCaps,
+) -> bool {
+    false
+}

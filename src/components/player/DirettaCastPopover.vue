@@ -294,20 +294,37 @@ onMounted(() => {
     </div>
     <div v-else-if="currentCaps" class="space-y-3 text-xs">
       <div class="p-3 rounded-lg bg-primary/8 border border-primary/15 space-y-1">
-        <div class="font-medium text-sm text-primary">Diretta 发烧级音频流协议</div>
+        <div class="font-medium text-sm text-primary">
+          {{ currentCaps.target_name || currentCaps.output_name || "Diretta Target" }}
+          <span
+            v-if="currentCaps.output_name && currentCaps.target_name"
+            class="text-[10px] opacity-60 font-normal"
+          >
+            ({{ currentCaps.output_name }})
+          </span>
+        </div>
         <div class="text-[11px] opacity-75 font-mono truncate">
           目标地址: {{ currentCaps.target_address }}
+        </div>
+        <div
+          v-if="currentCaps.firmware_version"
+          class="text-[11px] opacity-75 font-mono truncate"
+        >
+          固件版本: {{ currentCaps.firmware_version }}
         </div>
       </div>
 
       <div class="space-y-2">
         <div class="flex justify-between py-1.5 border-b border-on-surface/6">
           <span class="text-on-surface-variant">PCM 高清能力</span>
-          <span class="font-medium">{{ currentCaps.pcm_format_desc }}</span>
+          <span class="font-medium text-right">{{ currentCaps.pcm_format_desc }}</span>
         </div>
         <div class="flex justify-between py-1.5 border-b border-on-surface/6">
           <span class="text-on-surface-variant">DSD 原生能力</span>
-          <span class="font-medium text-emerald-600 dark:text-emerald-400">
+          <span
+            class="font-medium text-right"
+            :class="currentCaps.supports_dsd ? 'text-emerald-600 dark:text-emerald-400' : ''"
+          >
             {{ currentCaps.dsd_format_desc }}
           </span>
         </div>
@@ -319,11 +336,35 @@ onMounted(() => {
           <span class="text-on-surface-variant">实测网络 MTU</span>
           <span class="font-mono">{{ currentCaps.mtu }} Bytes</span>
         </div>
+        <div
+          v-if="currentCaps.mtu_min > 0 || currentCaps.mtu_max > 0"
+          class="flex justify-between py-1.5 border-b border-on-surface/6"
+        >
+          <span class="text-on-surface-variant">MTU 范围 (min/req/max)</span>
+          <span class="font-mono">
+            {{ currentCaps.mtu_min }} / {{ currentCaps.mtu_req }} / {{ currentCaps.mtu_max }}
+          </span>
+        </div>
+        <div
+          v-if="currentCaps.max_packet_size > 0"
+          class="flex justify-between py-1.5 border-b border-on-surface/6"
+        >
+          <span class="text-on-surface-variant">单次传输最大包</span>
+          <span class="font-mono">{{ currentCaps.max_packet_size }} Bytes</span>
+        </div>
         <div class="flex justify-between py-1.5">
           <span class="text-on-surface-variant">Bit-Perfect 纯净直通</span>
-          <span class="text-emerald-500 font-medium">支持 (DSP 自动避让)</span>
+          <span
+            class="font-medium"
+            :class="currentCaps.bit_perfect_supported ? 'text-emerald-500' : ''"
+          >
+            {{ currentCaps.bit_perfect_supported ? "支持 (DSP 自动避让)" : "不支持" }}
+          </span>
         </div>
       </div>
+    </div>
+    <div v-else class="py-8 text-center text-sm opacity-70">
+      <span>暂无目标能力信息，请重试查询</span>
     </div>
   </SDialog>
 </template>

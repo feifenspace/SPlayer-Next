@@ -3,7 +3,10 @@
 #include <Diretta/Sync>
 #include <ACQUA/Clock>
 
+#include "diretta_bridge.h"
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -245,18 +248,6 @@ void* open_direct_with_format(
 
 extern "C" {
 
-struct SPlayerDirettaDevice {
-  char id[kTextCapacity];
-  char name[kTextCapacity];
-  char ipv6_addr[kTextCapacity];
-  char full_addr[kTextCapacity];
-  int32_t if_idx;
-  char target_name[kTextCapacity];
-  char output_name[kTextCapacity];
-  char model_name[kTextCapacity];
-  uint32_t mtu;
-};
-
 const char* splayer_diretta_last_error() {
   return g_last_error.c_str();
 }
@@ -426,3 +417,254 @@ void splayer_diretta_close(void* opaque) {
 }
 
 } // extern "C"
+
+// ============================================================================
+// 临时 Sync（仅用于能力查询，不接收音频数据）
+// ============================================================================
+constexpr std::size_t kQuerySilenceSize = 65536;
+std::uint8_t s_query_silence_block[kQuerySilenceSize] = {0};
+
+class QuerySync final : public DIRETTA::Sync {
+ protected:
+  bool getNewStream(diretta_stream& stream) override {
+    // 连接握手期间 SDK 工作线程会持续索要数据流；返回 false 会终止工作线程，
+    // 导致 connectWait 无法完成。参照 tinyLMS 临时连接回送静音块。
+    const std::size_t cycle = getCycleSize();
+    if (cycle == 0) {
+      return true;
+    }
+    stream.Data.P = s_query_silence_block;
+    stream.Size = cycle;
+    return true;
+  }
+};
+
+// 把字符串写入固定宽度 C 字段（保证 NUL 终止）
+template <std::size_t N>
+void fill_cstr(char (&dst)[N], const std::string& value) {
+  static_assert(N > 0);
+  const std::size_t count = std::min(value.size(), N - 1);
+  std::memcpy(dst, value.data(), count);
+  dst[count] = '\0';
+}
+
+extern "C" bool splayer_diretta_query_target_caps(const char* target_id,
+                                                SPlayerDirettaTargetCaps* out_caps) {
+  // 整个函数被 try/catch 包裹；C ABI 不抛异常
+  try {
+    if (out_caps == nullptr) {
+      set_error("out_caps pointer is null");
+      return false;
+    }
+    if (target_id == nullptr || *target_id == '\0') {
+      set_error("target_id is required");
+      return false;
+    }
+    clear_error();
+    std::memset(out_caps, 0, sizeof(SPlayerDirettaTargetCaps));
+
+    // 1. 发现目标
+    DIRETTA::Find::Setting setting;
+    setting.Loopback = false;
+    setting.ProductID = 0;
+    DIRETTA::Find find(setting);
+    DIRETTA::Find::PortResalts results;
+    if (!discover(find, results)) {
+      return false;
+    }
+
+    ACQUA::IPAddress target;
+    DIRETTA::Find::TargetConnectInfo target_info;
+    bool found = false;
+    for (const auto& [address, info] : results) {
+      // 优先按 IPv6,PORT 全地址匹配
+      if (address.get_full_str() == target_id) {
+        target = address;
+        target_info = info;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      // 退化：按 IPv6 字符串（不含 port）匹配
+      for (const auto& [address, info] : results) {
+        if (address.get_str() == target_id) {
+          target = address;
+          target_info = info;
+          found = true;
+          break;
+        }
+      }
+    }
+    if (!found) {
+      set_error("requested Diretta target was not found");
+      return false;
+    }
+
+    // 2. 预填基本字段
+    fill_cstr(out_caps->target_name, target_info.targetName);
+    fill_cstr(out_caps->output_name, target_info.outputName);
+    fill_cstr(out_caps->ipv6_addr, target.get_str());
+    fill_cstr(out_caps->full_addr, target.get_full_str());
+    out_caps->if_idx = static_cast<int32_t>(target.get_ifno());
+
+    // 3. 测量 MTU（Find 需预热；尽量复用扫描结果）
+    std::uint32_t measured_mtu = 0;
+    if (!find.measSendMTU(target, measured_mtu) || measured_mtu == 0) {
+      measured_mtu = 1500;
+    }
+    out_caps->mtu_measured = measured_mtu;
+
+    // 4. 创建临时 QuerySync 并打开
+    QuerySync sync;
+    const std::uint16_t ifno = static_cast<std::uint16_t>(target.get_ifno());
+    if (!sync.open(
+          static_cast<DIRETTA::Sync::THRED_MODE>(0),
+          ACQUA::Clock::MilliSeconds(100),
+          ifno,
+          "SPlayer-Query",
+          0,
+          0,
+          0,
+          0,
+          DIRETTA::Sync::MSMODE_AUTO)) {
+      set_error("failed to open temporary Diretta query sync");
+      return false;
+    }
+
+    // 后续清理 lambda（任何异常路径都会执行）
+    auto cleanup = [&sync]() noexcept {
+      try {
+        if (sync.is_connect()) {
+          sync.stop();
+          sync.disconnect_flgset();
+          sync.disconnect(true);
+          sync.disconnectWait();
+        }
+        sync.close();
+      } catch (...) {
+        // 清理失败不能穿过 C ABI
+      }
+    };
+
+    // 5. setSink（tinyLMS QueryDeviceCapabilitiesEarly 传 false, 0）
+    if (!sync.setSink(target, ACQUA::Clock::MilliSeconds(100), false, 0)) {
+      set_error("failed to setSink for Diretta query");
+      cleanup();
+      return false;
+    }
+
+    // 6. 尝试 PCM 配置（按优先级：32bit@48k → 32bit@44.1k → 16bit@48k → 16bit@44.1k）
+    DIRETTA::FormatConfigure fcfg;
+    fcfg.setSpeed(48000);
+    fcfg.setChannel(2);
+    bool format_ok = false;
+    const std::array<std::pair<DIRETTA::FormatID, DIRETTA::FormatID>, 4> try_formats = {{
+      {DIRETTA::FormatID::CHA_2 | DIRETTA::FormatID::FMT_PCM_SIGNED_32 | DIRETTA::FormatID::RAT_48000,
+       DIRETTA::FormatID::RAT_48000},
+      {DIRETTA::FormatID::CHA_2 | DIRETTA::FormatID::FMT_PCM_SIGNED_32 | DIRETTA::FormatID::RAT_44100,
+       DIRETTA::FormatID::RAT_44100},
+      {DIRETTA::FormatID::CHA_2 | DIRETTA::FormatID::FMT_PCM_SIGNED_16 | DIRETTA::FormatID::RAT_48000,
+       DIRETTA::FormatID::RAT_48000},
+      {DIRETTA::FormatID::CHA_2 | DIRETTA::FormatID::FMT_PCM_SIGNED_16 | DIRETTA::FormatID::RAT_44100,
+       DIRETTA::FormatID::RAT_44100},
+    }};
+    for (const auto& [fid, /*rat*/ _ignore] : try_formats) {
+      fcfg.setFormat(fid);
+      if (sync.checkSinkSupport(fcfg)) {
+        if (sync.setSinkConfigure(fcfg)) {
+          format_ok = true;
+          break;
+        }
+      }
+    }
+    if (!format_ok) {
+      // 回退到 32bit@48k（即使设备不支持也尝试建立连接以读取 Info）
+      fcfg.setFormat(DIRETTA::FormatID::CHA_2 |
+                     DIRETTA::FormatID::FMT_PCM_SIGNED_32 |
+                     DIRETTA::FormatID::RAT_48000);
+      sync.setSinkConfigure(fcfg);
+    }
+
+    // 7. configTransferAuto + connectPrepare(true) + connect + connectWait
+    sync.configTransferAuto(
+      ACQUA::Clock::MicroSeconds(2620),
+      ACQUA::Clock(),
+      ACQUA::Clock::MicroSeconds(100000));
+
+    if (!sync.connectPrepare(true)) {
+      set_error("failed to prepare Diretta query connection");
+      cleanup();
+      return false;
+    }
+    if (!sync.connect(0)) {
+      set_error("failed to start Diretta query connection");
+      cleanup();
+      return false;
+    }
+    if (!sync.connectWait()) {
+      set_error("failed to complete Diretta query connection");
+      cleanup();
+      return false;
+    }
+
+    // 8. 读取 Sync::Info 并填充 PCM/DSD/MTU/MS
+    const DIRETTA::Sync::Info& info = sync.getSinkInfo();
+    out_caps->supports_pcm     = info.checkSinkSupportPCM()  ? 1u : 0u;
+    out_caps->supports_dsd     = info.checkSinkSupportDSD()  ? 1u : 0u;
+    out_caps->support_pcm_raw  = static_cast<std::uint64_t>(info.supportPCM);
+    out_caps->support_dsd_lsb_raw = static_cast<std::uint64_t>(info.supportDSDlsb);
+    out_caps->support_dsd_msb_raw = static_cast<std::uint64_t>(info.supportDSDmsb);
+    out_caps->supports_dsd_lsb = info.checkSinkSupportDSDlsb() ? 1u : 0u;
+    out_caps->supports_dsd_msb = info.checkSinkSupportDSDmsb() ? 1u : 0u;
+
+    // PCM FormatSupport 范围
+    if (info.checkSinkSupportPCM()) {
+      DIRETTA::FormatSupport pcm(info.supportPCM);
+      out_caps->pcm_min_sample_rate = pcm.getSpeedMin();
+      out_caps->pcm_max_sample_rate = pcm.getSpeedMax();
+      out_caps->pcm_min_bits        = pcm.getBitsMin();
+      out_caps->pcm_max_bits        = pcm.getBitsMax();
+      out_caps->pcm_min_channels    = pcm.getChMin();
+      out_caps->pcm_max_channels    = pcm.getChMax();
+    }
+
+    // DSD FormatSupport 范围（LSB | MSB 合并）
+    if (info.checkSinkSupportDSD()) {
+      const DIRETTA::FormatID dsd_combined =
+        DIRETTA::FormatID(static_cast<std::uint64_t>(info.supportDSDlsb) |
+                          static_cast<std::uint64_t>(info.supportDSDmsb));
+      DIRETTA::FormatSupport dsd(dsd_combined);
+      out_caps->dsd_min_sample_rate = dsd.getSpeedMin();
+      out_caps->dsd_max_sample_rate = dsd.getSpeedMax();
+      out_caps->dsd_min_bits        = dsd.getBitsMin();
+      out_caps->dsd_max_bits        = dsd.getBitsMax();
+      out_caps->dsd_min_channels    = dsd.getChMin();
+      out_caps->dsd_max_channels    = dsd.getChMax();
+    }
+
+    // MTU 范围
+    out_caps->mtu_min   = info.minMTU;
+    out_caps->mtu_req   = info.reqMTU;
+    out_caps->mtu_max   = static_cast<std::uint32_t>(info.maxMTU);
+    out_caps->max_size  = info.maxSize;
+
+    // MS mode 位图
+    out_caps->support_ms_mode = info.supportMSmode;
+
+    // 9. 固件版本（Find::FwVersion），失败不致命
+    std::string fw_version;
+    if (find.FwVersion(target, fw_version)) {
+      fill_cstr(out_caps->firmware_version, fw_version);
+    }
+
+    // 10. 清理
+    cleanup();
+    return true;
+  } catch (const std::exception& error) {
+    set_error(error.what());
+  } catch (...) {
+    set_error("unknown exception while querying Diretta target capabilities");
+  }
+  return false;
+}
