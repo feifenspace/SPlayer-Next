@@ -132,6 +132,14 @@ const api = {
     dispatch: (type: string) => ipcRenderer.send("player:dispatch", type),
     // 订阅主进程推送的播放事件
     onEvent: (callback: (event: unknown) => void) => subscribe("player:event", callback),
+    // Diretta Source Direct 无缝预载下一曲
+    stageDirectNext: (source: string, durationSecs: number, generation = 0) =>
+      ipcRenderer.invoke("player:stageDirectNext", source, durationSecs, generation),
+    // 作废尚未进入音频 ring 的 Direct staged 下一音源
+    cancelDirectNext: () => ipcRenderer.invoke("player:cancelDirectNext"),
+    // directTrackBoundary 后确认 queue/media 已推进到下一曲
+    commitDirectBoundary: (source: string, durationSecs: number) =>
+      ipcRenderer.invoke("player:commitDirectBoundary", source, durationSecs),
   },
   system: {
     installType: getInstallType(),

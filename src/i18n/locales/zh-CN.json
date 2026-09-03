@@ -862,6 +862,12 @@
       "label": "预载下一首歌曲",
       "description": "提前获取下一首的播放信息，可能会增加网络占用"
     },
+    "onlineSourceMode": {
+      "label": "在线音源播放模式",
+      "description": "preload：整曲下载到内存后再播放（支持无缝切曲）；stream：边下边播（起播更快，切曲有间隙）。DSD 音源始终使用 preload",
+      "preload": "预加载（纯内存，支持无缝）",
+      "stream": "流式播放（边下边播）"
+    },
     "outputDevice": {
       "label": "输出设备",
       "description": "选择音频输出设备",

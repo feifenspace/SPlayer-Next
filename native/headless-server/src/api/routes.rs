@@ -521,7 +521,82 @@ fn clean_old_stream_cache(cache_dir: &std::path::Path) {
     }
 }
 
-/// 将远端 HTTP(S) 音频流下载并固化到本地 RAM 缓冲文件中，以便 Diretta Source Direct 模式进行精确解码与传输
+/// 读取在线源播放模式设置：`preload`（默认，全量下载后播放，可无缝 stage）
+/// 或 `stream`（边下边播，起播快但切曲重建连接）
+fn online_source_mode(state: &AppState) -> String {
+    let conn = state.db.lock();
+    // 前端设置绑定路径为 system.player.onlineSourceMode，DB 键与绑定路径逐字对应；
+    // 兼容无前缀写法
+    for key in [
+        "system.player.onlineSourceMode",
+        "player.onlineSourceMode",
+    ] {
+        if let Ok(Some(v)) = crate::db::get_setting(&conn, key) {
+            if let Some(mode) = v.as_str() {
+                return mode.to_string();
+            }
+        }
+    }
+    "preload".to_string()
+}
+
+/// memfd 常驻注册表：preload 模式下载到匿名内存文件，
+/// `/proc/self/fd/N` 路径交给 FFmpeg 打开；File 移入注册表保持 fd 存活，
+/// 直到被后续下载挤出（保留最近 3 个：当前播放 + gapless staged + 余量）。
+#[cfg(target_os = "linux")]
+fn memfd_registry() -> &'static std::sync::Mutex<Vec<std::fs::File>> {
+    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<Vec<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 下载在线音源到 memfd 匿名内存文件（preload 模式纯内存播放）
+#[cfg(target_os = "linux")]
+fn download_to_memfd(
+    url: &str,
+    client: &reqwest::blocking::Client,
+) -> anyhow::Result<String> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    let mut response = client
+        .get(url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity")
+        .send()?;
+    if !response.status().is_success() {
+        anyhow::bail!("下载在线流媒体音频失败: HTTP {}", response.status());
+    }
+
+    let name = c"splayer-stream-cache";
+    let fd = unsafe { libc::memfd_create(name.as_ptr() as *const _, libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        anyhow::bail!("memfd_create 失败: {}", std::io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut file = file;
+    std::io::copy(&mut response, &mut file)?;
+    file.flush()?;
+    // memfd 无需落盘 sync；路径必须在 File 移入注册表前用 fd 值构造
+    let path = format!("/proc/self/fd/{fd}");
+    {
+        let mut registry = memfd_registry().lock().expect("memfd registry poisoned");
+        registry.push(file);
+        if registry.len() > 3 {
+            let drain = registry.len() - 3;
+            registry.drain(0..drain);
+        }
+    }
+    tracing::info!(url = %url, path = %path, "在线音源已下载至 memfd 纯内存缓存");
+    Ok(path)
+}
+
+/// 将远端 HTTP(S) 音频流下载并固化到本地缓存（preload 模式：优先 memfd 纯内存，
+/// 失败回退磁盘缓存），以便 Diretta Source Direct 模式进行精确解码与传输
 fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     use std::fs::{self, File};
 
@@ -591,6 +666,21 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     let target_file = cache_dir.join(format!("{}.{}", hash, ext));
     if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(target_file.to_string_lossy().to_string());
+    }
+
+    // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO），
+    // memfd 不可用（非 Linux/创建失败）时回退传统磁盘缓存
+    #[cfg(target_os = "linux")]
+    {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()?;
+        match download_to_memfd(url, &client) {
+            Ok(path) => return Ok(path),
+            Err(error) => {
+                tracing::warn!(url = %url, %error, "memfd 下载失败，回退磁盘缓存");
+            }
+        }
     }
 
     let part_file = cache_dir.join(format!("{}.{}.part", hash, ext));
@@ -697,6 +787,12 @@ async fn load_handler(
     if let Some(selector) = direct_selector {
         let source_for_direct = source_for_decoder.clone();
         let load_token_for_direct = Arc::clone(&load_token);
+        let source_mode = online_source_mode(&state);
+        let meta_duration_secs = payload
+            .meta
+            .as_ref()
+            .and_then(|m| m.duration)
+            .map(|ms| ms as f64 / 1000.0);
         let result = spawn_isolated_blocking("player-direct-load-worker", move || {
             let replacing_direct_playback = old_threads.direct_playback.is_some();
             if let Some(h) = old_threads.join_aux() {
@@ -705,7 +801,53 @@ async fn load_handler(
             if replacing_direct_playback {
                 std::thread::sleep(std::time::Duration::from_millis(800));
             }
-            let physical_source = if source_for_direct.starts_with("http://") || source_for_direct.starts_with("https://") {
+            let is_http = source_for_direct.starts_with("http://")
+                || source_for_direct.starts_with("https://");
+            // DSD 原生流（DSF/DFF/SACD ISO）需要 seekable 输入做 chunk 定位，
+            // stream 模式下强制走 preload（memfd/磁盘缓存）
+            let is_dsd_stream = [".dsf", ".dff"]
+                .iter()
+                .any(|ext| source_for_direct.to_lowercase().contains(ext))
+                || source_for_direct.contains(".iso|")
+                || source_for_direct.contains(".ISO|");
+            let stream_mode = is_http && source_mode == "stream" && !is_dsd_stream;
+
+            if stream_mode {
+                // stream 模式：HttpAudioSource Range 流式拉取，demuxer 驱动读进度，
+                // 不做全量预下载；元数据由前端 payload + 解码格式回填
+                let http = audio_engine_core::ffmpeg_audio::HttpAudioSource::new_with_cancel_handle(
+                    &source_for_direct, &handle,
+                )?;
+                if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
+                    anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                }
+                let playback = audio_engine_core::direct_runtime::DirectPlayback::open_stream(
+                    &selector,
+                    &source_for_direct,
+                    Box::new(http),
+                    meta_duration_secs.unwrap_or(0.0),
+                    auto_play,
+                )?;
+                let mut metadata = audio_engine_core::AudioMetadata {
+                    duration_secs: meta_duration_secs.unwrap_or(0.0),
+                    channels: 2,
+                    codec: "stream".to_string(),
+                    ..Default::default()
+                };
+                if let audio_engine_core::direct_runtime::DirectFormat::Pcm(format) = playback.format() {
+                    metadata.sample_rate = format.sample_rate;
+                    metadata.original_sample_rate = format.sample_rate;
+                    metadata.channels = format.channels;
+                    metadata.bits_per_sample = u32::from(format.valid_bits);
+                }
+                metadata.duration_secs = playback.duration();
+                if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
+                    anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                }
+                return Ok::<_, anyhow::Error>((metadata, playback));
+            }
+
+            let physical_source = if is_http {
                 materialize_direct_input(&source_for_direct)?
             } else {
                 source_for_direct
@@ -1083,7 +1225,16 @@ async fn direct_stage_next_handler(
         }))));
     };
 
-    let physical_source = if source.starts_with("http://") || source.starts_with("https://") {
+    let is_http = source.starts_with("http://") || source.starts_with("https://");
+    // stream 模式下在线源不做全量下载 stage（与用户选择的流式策略冲突）
+    if is_http && online_source_mode(&state) == "stream" {
+        return Ok(Json(PlayerResponse::ok(json!({
+            "staged": false,
+            "reason": "onlineSourceMode=stream skips online preloading",
+        }))));
+    }
+
+    let physical_source = if is_http {
         let src_clone = source.clone();
         spawn_isolated_blocking("direct-stage-preload", move || {
             materialize_direct_input(&src_clone)
@@ -1970,50 +2121,102 @@ pub struct DirettaTargetInfoRequest {
 async fn diretta_target_info_handler(
     Json(payload): Json<DirettaTargetInfoRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
-    let target = payload.target.trim().to_string();
-    let target_clean = target
+    let target = payload
+        .target
+        .trim()
         .strip_prefix("diretta:")
-        .or_else(|| target.strip_prefix("diretta@"))
-        .unwrap_or(&target)
+        .or_else(|| payload.target.trim().strip_prefix("diretta@"))
+        .unwrap_or(payload.target.trim())
         .to_string();
+    if target.is_empty() || target == "undefined" || target == "null" {
+        return Err(ApiError::bad_request("Diretta target is required"));
+    }
 
-    let devices = spawn_isolated_blocking("diretta-info-worker", move || {
-        audio_engine_core::diretta::scan_devices().unwrap_or_default()
+    let caps = spawn_isolated_blocking("diretta-info-worker", move || {
+        audio_engine_core::diretta::query_target_caps(&target)
     })
     .await
-    .map_err(|e| ApiError::internal(format!("Diretta target info task failed: {e}")))?;
+    .map_err(|e| ApiError::internal(format!("Diretta target info task failed: {e}")))?
+    .map_err(|e| ApiError::internal(format!("Diretta target capability query failed: {e}")))?;
 
-    let dev = devices.into_iter().find(|d| {
-        d.id == target
-            || d.full_addr == target_clean
-            || d.ipv6_addr == target_clean
-            || d.id == format!("diretta:{target_clean}")
-            || d.name == target
-    });
-
-    let mtu = dev.as_ref().map(|d| d.mtu).unwrap_or(1500);
-    let target_display = if !target_clean.is_empty() && target_clean != "undefined" {
-        target_clean
-    } else if let Some(ref d) = dev {
-        d.full_addr.clone()
+    let pcm_format_desc = if caps.supports_pcm {
+        format!(
+            "{}-{} Hz / {}-{} bit / {}-{} 声道",
+            caps.pcm_min_sample_rate,
+            caps.pcm_max_sample_rate,
+            caps.pcm_min_bits,
+            caps.pcm_max_bits,
+            caps.pcm_min_channels,
+            caps.pcm_max_channels,
+        )
     } else {
-        "Diretta Target".to_string()
+        "不支持 PCM".to_string()
+    };
+    let dsd_format_desc = if caps.supports_dsd {
+        format!(
+            "{}-{} Hz / {}-{} 声道 ({})",
+            caps.dsd_min_sample_rate,
+            caps.dsd_max_sample_rate,
+            caps.dsd_min_channels,
+            caps.dsd_max_channels,
+            match (caps.supports_dsd_lsb, caps.supports_dsd_msb) {
+                (true, true) => "LSB/MSB",
+                (true, false) => "LSB",
+                (false, true) => "MSB",
+                (false, false) => "Native DSD",
+            },
+        )
+    } else {
+        "不支持 Native DSD".to_string()
+    };
+    let transmission_mode = match caps.support_ms_mode {
+        0 => "Auto 自动自适应".to_string(),
+        mode => format!("Auto 自动自适应 (MS 0x{mode:04x})"),
+    };
+    let target_address = if caps.full_addr.is_empty() {
+        caps.ipv6_addr.clone()
+    } else {
+        caps.full_addr.clone()
     };
 
     Ok(Json(PlayerResponse::ok(json!({
-        "target_address": target_display,
-        "pcm_format_desc": "最高 768kHz / 32-bit / 2-8 声道",
-        "dsd_format_desc": "Native DSD512 (22.5MHz/24.5MHz) MSB/LSB",
-        "transmission_mode": "Mode 3 (MicroSecond Sync)",
-        "mtu": mtu,
-        "supports_pcm": true,
-        "supports_dsd": true,
-        "supports_native_dsd": true,
-        "pcm_max_sample_rate": 768000,
-        "pcm_max_bits": 32,
-        "pcm_channels": 2,
-        "dsd_max_sample_rate": 22579200,
-        "bit_perfect_supported": true,
+        "target_address": target_address,
+        "target_name": caps.target_name,
+        "output_name": caps.output_name,
+        "firmware_version": caps.firmware_version,
+        "ipv6_addr": caps.ipv6_addr,
+        "full_addr": caps.full_addr,
+        "if_idx": caps.if_idx,
+        "pcm_format_desc": pcm_format_desc,
+        "dsd_format_desc": dsd_format_desc,
+        "transmission_mode": transmission_mode,
+        "mtu": caps.mtu_measured,
+        "mtu_measured": caps.mtu_measured,
+        "mtu_min": caps.mtu_min,
+        "mtu_req": caps.mtu_req,
+        "mtu_max": caps.mtu_max,
+        "max_packet_size": caps.max_packet_size,
+        "supports_pcm": caps.supports_pcm,
+        "pcm_min_sample_rate": caps.pcm_min_sample_rate,
+        "pcm_max_sample_rate": caps.pcm_max_sample_rate,
+        "pcm_min_bits": caps.pcm_min_bits,
+        "pcm_max_bits": caps.pcm_max_bits,
+        "pcm_min_channels": caps.pcm_min_channels,
+        "pcm_max_channels": caps.pcm_max_channels,
+        "pcm_channels": caps.pcm_max_channels,
+        "supports_dsd": caps.supports_dsd,
+        "supports_dsd_lsb": caps.supports_dsd_lsb,
+        "supports_dsd_msb": caps.supports_dsd_msb,
+        "supports_native_dsd": caps.supports_dsd,
+        "dsd_min_sample_rate": caps.dsd_min_sample_rate,
+        "dsd_max_sample_rate": caps.dsd_max_sample_rate,
+        "dsd_min_bits": caps.dsd_min_bits,
+        "dsd_max_bits": caps.dsd_max_bits,
+        "dsd_min_channels": caps.dsd_min_channels,
+        "dsd_max_channels": caps.dsd_max_channels,
+        "dsd_max_sample_rate": caps.dsd_max_sample_rate,
+        "support_ms_mode": caps.support_ms_mode,
+        "bit_perfect_supported": caps.supports_pcm || caps.supports_dsd,
         "available": true,
     }))))
 }

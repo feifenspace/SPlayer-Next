@@ -36,6 +36,9 @@ export interface EqualizerSettings {
   preamp: number;
 }
 
+/** 在线音源播放模式 */
+export type OnlineSourceMode = "preload" | "stream";
+
 /** 播放器配置 */
 export interface PlayerSettings {
   /** 加载后自动播放 */
@@ -56,6 +59,8 @@ export interface PlayerSettings {
   equalizer: EqualizerSettings;
   /** 按 `{Track.id}|{歌词源}` 记忆的歌词偏移（ms，正值为歌词提前）；为 0 时不写入 */
   lyricOffsets: Record<string, number>;
+  /** 在线音源播放模式：preload=整曲进内存（支持无缝），stream=边下边播 */
+  onlineSourceMode: OnlineSourceMode;
 }
 
 /** Discord 显示模式 */

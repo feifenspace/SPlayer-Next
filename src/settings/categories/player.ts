@@ -75,6 +75,18 @@ const playerCategory: SettingCategory = {
           type: "switch",
           binding: { store: "settings", path: "player.preloadNextTrack" },
           defaultValue: false,
+          children: [
+            {
+              key: "onlineSourceMode",
+              type: "select",
+              binding: { store: "settings", path: "system.player.onlineSourceMode" },
+              options: [
+                { value: "preload", labelKey: "settings.onlineSourceMode.preload" },
+                { value: "stream", labelKey: "settings.onlineSourceMode.stream" },
+              ],
+              defaultValue: "preload",
+            },
+          ],
         },
       ],
     },

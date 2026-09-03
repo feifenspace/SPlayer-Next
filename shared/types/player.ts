@@ -210,6 +210,11 @@ export type PlayerEvent =
   | { type: "seek"; data: { position: number } }
   | { type: "ended" }
   | { type: "sourceError" }
+  | {
+      type: "directTrackBoundary";
+      /** 无缝切换后新曲时长（毫秒） */
+      data: { duration: number; generation: number };
+    }
   | { type: "play" }
   | { type: "pause" }
   | { type: "next" }
@@ -301,4 +306,18 @@ export interface PlayerApi {
   dispatch: (type: string) => void;
   /** 订阅播放事件 */
   onEvent: (callback: (event: PlayerEvent) => void) => () => void;
+  /**
+   * Diretta Source Direct 无缝预载下一曲（需本地可 seek 音源或 CUE/SACD 虚拟路径）。
+   * 非 Direct runtime 时返回 success 且 data=false（轻量探测，无副作用）。
+   * @returns data=true 表示已成功暂存
+   */
+  stageDirectNext: (
+    source: string,
+    durationSecs: number,
+    generation?: number,
+  ) => Promise<IpcResponse<boolean>>;
+  /** 作废尚未进入音频 ring 的 Direct staged 下一音源 */
+  cancelDirectNext: () => Promise<IpcResponse>;
+  /** renderer 在 directTrackBoundary 后确认 queue/media 已推进到下一曲 */
+  commitDirectBoundary: (source: string, durationSecs: number) => Promise<IpcResponse>;
 }

@@ -874,6 +874,12 @@
       "label": "Preload next track",
       "description": "Fetch the next track's playback info in advance, which may increase network usage"
     },
+    "onlineSourceMode": {
+      "label": "Online Source Playback Mode",
+      "description": "preload: download the full track into memory before playback (enables gapless); stream: play while downloading (faster start, gap between tracks). DSD sources always use preload",
+      "preload": "Preload (in-memory, gapless)",
+      "stream": "Stream (play while downloading)"
+    },
     "outputDevice": {
       "label": "Output Device",
       "description": "Select audio output device",

@@ -35,6 +35,15 @@ export declare class AudioPlayer {
    * 持锁阶段都是纯内存操作，主线程其它同步 NAPI 调用最多等几微秒，不会被 IO 卡住
    */
   load(source: string, autoPlay?: boolean): Promise<JsMusicMetadata>
+  /**
+   * 为当前 Diretta Source Direct 播放预备一个同 wire-format 的本地下一音源。
+   * 返回 false 表示当前不是 Direct runtime；格式不兼容等 staging 错误会明确抛出。
+   */
+  stageDirectNext(source: string, durationSecs: number, generation: number): Promise<boolean>
+  /** 作废尚未进入音频 ring 的 Direct staged 下一音源 */
+  cancelDirectNext(): void
+  /** renderer 在 directTrackBoundary 后确认其 queue/media 已推进到实际正在播放的下一首 */
+  commitDirectGaplessBoundary(source: string, durationSecs: number): void
   /** 恢复播放。如果已停止或播放结束，自动从头重新加载 */
   play(): Promise<void>
   /** 暂停播放 */
@@ -191,14 +200,16 @@ export interface JsMusicMetadata {
 
 /** 播放器事件，推送给 JS 侧 */
 export interface JsPlayerEvent {
-  /** 事件类型："stateChanged" | "ended" | "sourceError" | "position" | "fftData" | "outputStalled" | "outputFailed" */
+  /** 事件类型："stateChanged" | "ended" | "directTrackBoundary" | "sourceError" | "position" | "fftData" | "outputStalled" | "outputFailed" */
   type: string
   /** 状态（仅 stateChanged 时有值） */
   state?: string
   /** 位置（秒，仅 position 时有值） */
   position?: number
-  /** 时长（秒，仅 position 时有值） */
+  /** 时长（秒，仅 position/directTrackBoundary 时有值） */
   duration?: number
+  /** renderer 提供的 Direct staged generation（仅 directTrackBoundary 时有值） */
+  generation?: number
   /** FFT 频谱数据（仅 fftData 时有值，128 个频段，值域 0.0 ~ 1.0） */
   fftData?: JsFftData
 }

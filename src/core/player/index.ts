@@ -2,6 +2,7 @@ import type { PlaybackContext, Track } from "@shared/types/player";
 import type { TagEditRequest, TagWriteOutcome } from "@shared/types/tagEditor";
 import type { PersonalFmOptions } from "@/types/netease";
 import { handleEvent } from "./events";
+import { cancelStagedDirectNext } from "./gapless";
 import type { RepeatMode, ShuffleMode } from "@/stores/status";
 import { useMediaStore } from "@/stores/media";
 import { useSettingsStore } from "@/stores/settings";
@@ -291,6 +292,8 @@ const loadTrack = async (track: Track | null, context?: PlaybackContext): Promis
     return;
   }
   const myToken = ++trackToken;
+  // 作废已 stage 的无缝下一曲（引擎侧随旧 playback drop 双保险清理）
+  cancelStagedDirectNext();
   // 消费预载结果
   const preloaded = consumePreloadedTrack(track);
   // 乐观更新

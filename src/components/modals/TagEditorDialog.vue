@@ -110,7 +110,9 @@ const newCoverUrl = ref<string | null>(null);
 /** 在线匹配平台，初始值跟随搜索页偏好，命名与搜索页同源 */
 const initialMatchPlatform = useStatusStore().searchPlatform;
 const matchPlatform = ref<Platform>(
-  initialMatchPlatform === "local" ? "netease" : initialMatchPlatform,
+  initialMatchPlatform === "local" || initialMatchPlatform === "streaming"
+    ? "netease"
+    : initialMatchPlatform,
 );
 const platformOptions = ALL_PLATFORMS.map((key) => ({
   value: key,

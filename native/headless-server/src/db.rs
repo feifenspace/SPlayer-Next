@@ -314,13 +314,23 @@ pub fn upsert_scanned_tracks(conn: &mut Connection, tracks: &[ScannedTrack]) -> 
             let title = track
                 .title
                 .as_deref()
-                .filter(|s| !s.trim().is_empty())
+                .filter(|s| !s.trim().is_empty() && !s.contains('\u{fffd}'))
                 .unwrap_or_else(|| {
                     Path::new(&track.path)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("Unknown Title")
                 });
+
+            let artist = track
+                .artist
+                .as_deref()
+                .filter(|s| !s.trim().is_empty() && !s.contains('\u{fffd}'));
+
+            let album = track
+                .album
+                .as_deref()
+                .filter(|s| !s.trim().is_empty() && !s.contains('\u{fffd}'));
 
             let duration_ms = (track.duration * 1000.0) as u64;
 
@@ -329,8 +339,8 @@ pub fn upsert_scanned_tracks(conn: &mut Connection, tracks: &[ScannedTrack]) -> 
                 track.path,
                 title,
                 track.track,
-                track.artist.as_deref(),
-                track.album.as_deref(),
+                artist,
+                album,
                 duration_ms,
                 track.cover.as_deref(),
                 track.codec,

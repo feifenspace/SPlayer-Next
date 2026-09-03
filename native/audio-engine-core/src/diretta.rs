@@ -25,6 +25,70 @@ pub struct DirettaDevice {
     pub mtu: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct DirettaTargetCapabilities {
+    /// 目标设备名称
+    pub target_name: String,
+    /// 输出端口名称
+    pub output_name: String,
+    /// 固件版本字符串
+    pub firmware_version: String,
+    /// 设备 IPv6 地址（不含端口）
+    pub ipv6_addr: String,
+    /// 设备 full address（IPv6%IFNO,PORT）
+    pub full_addr: String,
+    /// 网络接口号
+    pub if_idx: i32,
+
+    /// 是否支持 PCM
+    pub supports_pcm: bool,
+    /// 最小 PCM 位深
+    pub pcm_min_bits: u32,
+    /// 最大 PCM 位深
+    pub pcm_max_bits: u32,
+    /// 最小 PCM 采样率（Hz）
+    pub pcm_min_sample_rate: u32,
+    /// 最大 PCM 采样率（Hz）
+    pub pcm_max_sample_rate: u32,
+    /// 最小 PCM 声道数
+    pub pcm_min_channels: u32,
+    /// 最大 PCM 声道数
+    pub pcm_max_channels: u32,
+
+    /// 是否支持 DSD
+    pub supports_dsd: bool,
+    /// 是否支持 DSD LSB（DSF）
+    pub supports_dsd_lsb: bool,
+    /// 是否支持 DSD MSB（DFF）
+    pub supports_dsd_msb: bool,
+    /// 最小 DSD 采样率（Hz）
+    pub dsd_min_sample_rate: u32,
+    /// 最大 DSD 采样率（Hz）
+    pub dsd_max_sample_rate: u32,
+    /// 最小 DSD 位深
+    pub dsd_min_bits: u32,
+    /// 最大 DSD 位深
+    pub dsd_max_bits: u32,
+    /// 最小 DSD 声道数
+    pub dsd_min_channels: u32,
+    /// 最大 DSD 声道数
+    pub dsd_max_channels: u32,
+
+    /// 实测路径 MTU
+    pub mtu_measured: u32,
+    /// 设备最小 MTU
+    pub mtu_min: u32,
+    /// 设备请求 MTU
+    pub mtu_req: u32,
+    /// 设备最大 MTU
+    pub mtu_max: u32,
+    /// 单次传输最大数据大小（字节）
+    pub max_packet_size: u32,
+
+    /// MS 模式支持位图
+    pub support_ms_mode: u16,
+}
+
 pub fn selector_target(selector: &str) -> Option<&str> {
     selector
         .strip_prefix(DEVICE_PREFIX)
@@ -52,7 +116,8 @@ mod imp {
     use diretta_sys::{
         splayer_diretta_close, splayer_diretta_last_error, splayer_diretta_open_direct,
         splayer_diretta_open_dsd_direct, splayer_diretta_pause, splayer_diretta_play,
-        splayer_diretta_scan, SPlayerDirettaDevice, TEXT_CAPACITY,
+        splayer_diretta_query_target_caps, splayer_diretta_scan, SPlayerDirettaDevice,
+        SPlayerDirettaTargetCaps, TARGET_FW_MAX, TARGET_TEXT_MAX, TEXT_CAPACITY,
     };
 
     const MAX_SCAN_DEVICES: usize = 32;
@@ -78,8 +143,59 @@ mod imp {
             .into_owned()
     }
 
+    fn raw_text_fixed<const N: usize>(value: &[c_char; N]) -> String {
+        unsafe { CStr::from_ptr(value.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
     pub fn available() -> bool {
         true
+    }
+
+    /// 查询指定 Diretta Target 的硬件解码能力（同步阻塞，约 2-3 秒）
+    ///
+    /// `target_id` 接受 IPv6,PORT 格式的 full address，或不含端口的 IPv6 字符串。
+    pub fn query_target_caps(target_id: &str) -> Result<DirettaTargetCapabilities> {
+        let target = selector_target(target_id).unwrap_or(target_id);
+        let c_target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
+        let mut raw = SPlayerDirettaTargetCaps::default();
+        let ok = unsafe {
+            splayer_diretta_query_target_caps(c_target.as_ptr(), &mut raw as *mut _)
+        };
+        if !ok {
+            return Err(last_error("failed to query Diretta target capabilities"));
+        }
+        Ok(DirettaTargetCapabilities {
+            target_name: raw_text_fixed::<{ TARGET_TEXT_MAX }>(&raw.target_name),
+            output_name: raw_text_fixed::<{ TARGET_TEXT_MAX }>(&raw.output_name),
+            firmware_version: raw_text_fixed::<{ TARGET_FW_MAX }>(&raw.firmware_version),
+            ipv6_addr: raw_text_fixed::<{ TARGET_TEXT_MAX }>(&raw.ipv6_addr),
+            full_addr: raw_text_fixed::<{ TARGET_TEXT_MAX }>(&raw.full_addr),
+            if_idx: raw.if_idx,
+            supports_pcm: raw.supports_pcm != 0,
+            pcm_min_bits: raw.pcm_min_bits,
+            pcm_max_bits: raw.pcm_max_bits,
+            pcm_min_sample_rate: raw.pcm_min_sample_rate,
+            pcm_max_sample_rate: raw.pcm_max_sample_rate,
+            pcm_min_channels: raw.pcm_min_channels,
+            pcm_max_channels: raw.pcm_max_channels,
+            supports_dsd: raw.supports_dsd != 0,
+            supports_dsd_lsb: raw.supports_dsd_lsb != 0,
+            supports_dsd_msb: raw.supports_dsd_msb != 0,
+            dsd_min_sample_rate: raw.dsd_min_sample_rate,
+            dsd_max_sample_rate: raw.dsd_max_sample_rate,
+            dsd_min_bits: raw.dsd_min_bits,
+            dsd_max_bits: raw.dsd_max_bits,
+            dsd_min_channels: raw.dsd_min_channels,
+            dsd_max_channels: raw.dsd_max_channels,
+            mtu_measured: raw.mtu_measured,
+            mtu_min: u32::from(raw.mtu_min),
+            mtu_req: u32::from(raw.mtu_req),
+            mtu_max: raw.mtu_max,
+            max_packet_size: u32::from(raw.max_size),
+            support_ms_mode: raw.support_ms_mode,
+        })
     }
 
     pub fn scan_devices() -> Result<Vec<DirettaDevice>> {
@@ -149,6 +265,34 @@ mod imp {
                 .ok_or_else(|| anyhow!("invalid Diretta output selector"))?;
             let target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
             let (source, actual_position) = DirectPcmSource::open_local_at(path, position_secs)?;
+            let format = source.format();
+            let raw = unsafe {
+                splayer_diretta_open_direct(
+                    target.as_ptr(),
+                    format.sample_rate,
+                    format.channels,
+                    format.storage_bits,
+                    source.callback_context(),
+                    direct_pcm_next_block,
+                    direct_pcm_release_block,
+                )
+            };
+            let raw = NonNull::new(raw)
+                .ok_or_else(|| last_error("failed to open Diretta Source Direct target"))?;
+            Ok((Self { raw, source }, actual_position))
+        }
+
+        /// 以流式 Reader 打开（在线音源 stream 模式，wire-format 协商与本地路径一致）
+        pub fn open_reader_at(
+            selector: &str,
+            reader: Box<dyn crate::direct_pcm::ReadSeek>,
+            position_secs: f64,
+        ) -> Result<(Self, f64)> {
+            let target = selector_target(selector)
+                .ok_or_else(|| anyhow!("invalid Diretta output selector"))?;
+            let target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
+            let (source, actual_position) =
+                DirectPcmSource::open_reader_at(reader, position_secs)?;
             let format = source.format();
             let raw = unsafe {
                 splayer_diretta_open_direct(
@@ -420,7 +564,7 @@ mod imp {
     }
 }
 
-pub use imp::scan_devices;
+pub use imp::{query_target_caps, scan_devices};
 #[cfg(feature = "diretta")]
 pub use imp::{DirettaDirectConnection, DirettaDirectDsdConnection};
 

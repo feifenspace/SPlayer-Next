@@ -1,12 +1,5 @@
 import { md5 } from "../src/services/streaming/web/md5";
 
-interface ServerOption {
-  type: "subsonic" | "jellyfin";
-  url: string;
-  username: string;
-  password: string;
-}
-
 const host = process.argv[2] || "192.168.31.59";
 const username = process.argv[3] || "root";
 const password = process.argv[4] || "audiosys";

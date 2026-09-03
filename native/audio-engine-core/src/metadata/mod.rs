@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use encoding_rs::GBK;
-use ffmpeg_audio::SourceAudioInfo;
+use encoding_rs::{GB18030, GBK};
+use ffmpeg_audio::{AudioReader, SourceAudioInfo};
 
 mod cover;
 mod editor;
@@ -95,6 +95,169 @@ pub fn extract_tags(dict: &HashMap<String, String>) -> Tags {
     }
 }
 
+/// 统一的高保真标签提取入口（Lofty 原生标签优先 + FFmpeg 容器回退 + tinyLMS 启发式探测与目录推断）
+pub fn extract_file_tags(path: &str, reader: &AudioReader) -> Tags {
+    // 1. 优先使用 Lofty 读取真实标签（支持 ID3v2、Vorbis Comments、APEv2、RIFF INFO、MP4 等）
+    // 特别是对于 WAV 文件，FFmpeg 往往只读取 RIFF INFO chunk 导致 GBK 被破坏为 \u{FFFD}，
+    // 而 Lofty 能准确读取末尾的 ID3v2 chunk（包含原生 UTF-16LE / UTF-8 中文标签）
+    let lofty_tags = editor::read_tags(path).ok();
+
+    let mut title = lofty_tags.as_ref().and_then(|t| t.title.clone()).and_then(clean_and_repair_tag);
+    let mut artist = lofty_tags.as_ref().and_then(|t| t.artist.clone()).and_then(clean_and_repair_tag);
+    let mut album = lofty_tags.as_ref().and_then(|t| t.album.clone()).and_then(clean_and_repair_tag);
+    let mut track = lofty_tags.as_ref().and_then(|t| t.track_number.map(|n| n as u16));
+    let mut comment = None;
+
+    // 2. 若 Lofty 缺失字段，从 FFmpeg 容器 metadata 回退补全
+    if title.is_none() || artist.is_none() || album.is_none() || track.is_none() {
+        let raw_metadata = reader.metadata();
+        let ffmpeg_tags = extract_tags(&raw_metadata);
+        if title.is_none() {
+            title = ffmpeg_tags.title.and_then(clean_and_repair_tag);
+        }
+        if artist.is_none() {
+            artist = ffmpeg_tags.artist.and_then(clean_and_repair_tag);
+        }
+        if album.is_none() {
+            album = ffmpeg_tags.album.and_then(clean_and_repair_tag);
+        }
+        if track.is_none() {
+            track = ffmpeg_tags.track;
+        }
+        if comment.is_none() {
+            comment = ffmpeg_tags.comment.and_then(clean_and_repair_tag);
+        }
+    }
+
+    // 3. 【标签兜底与文件名/目录层级推断】（借鉴 tinyLMS-old 经验）
+    if title.is_none() {
+        title = clean_title_from_filename(path);
+    }
+    if artist.is_none() {
+        artist = infer_artist_from_path(path);
+    }
+    if album.is_none() {
+        album = infer_album_from_path(path);
+    }
+
+    Tags {
+        title,
+        artist,
+        album,
+        track,
+        comment,
+    }
+}
+
+/// 清洗和修复标签字符串（检测并丢弃 \u{FFFD} 坏字符，修复以 Latin-1 存储的 GBK/GB18030）
+pub fn clean_and_repair_tag(text: String) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 包含 Unicode 替换符说明原文本已被有损截断，直接丢弃以触发高质量回退
+    if trimmed.contains('\u{fffd}') {
+        return None;
+    }
+
+    // GBK 双字节被误当作 UTF-8 解码（例如 GBK "色" = C9 AB → U+026B "ɫ"）时，
+    // 产物集中在 Latin Extended-B / IPA 区段（U+0180–U+02AF）。
+    // 真实音乐标签几乎不会出现这些字符，直接丢弃以触发高质量回退
+    if trimmed.chars().any(is_gbk_as_utf8_mojibake_char) {
+        return None;
+    }
+
+    // 检查是否为 Latin-1 误存的 GBK/GB18030
+    if is_pure_latin1(trimmed) {
+        if let Some(repaired) = decode_latin1_as_gbk(trimmed) {
+            return Some(repaired);
+        }
+    }
+
+    Some(trimmed.to_string())
+}
+
+/// 从文件名提取纯净标题（剥离音轨序号和分隔符前缀，例如 "01._机遇Ⅰ" -> "机遇Ⅰ"）
+pub fn clean_title_from_filename(path: &str) -> Option<String> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    let mut s = stem.trim();
+    let bytes = s.as_bytes();
+    let mut num_end = 0;
+    while num_end < bytes.len() && bytes[num_end].is_ascii_digit() {
+        num_end += 1;
+    }
+    if num_end > 0 && num_end <= 3 && num_end < bytes.len() {
+        let after_num = &s[num_end..];
+        let trimmed_after = after_num
+            .trim_start_matches(|c: char| c == '.' || c == '_' || c == '-' || c == ' ' || c == '、');
+        if !trimmed_after.is_empty() {
+            s = trimmed_after;
+        }
+    }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// 从直接父目录提取专辑名（忽略通用根目录）
+pub fn infer_album_from_path(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let parent = p.parent()?;
+    let name = parent.file_name()?.to_str()?.trim();
+    if is_generic_dir_name(name) {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// 从祖父目录提取艺术家（忽略通用根目录，如 /media/music2/蔡琴/机遇/01.wav -> "蔡琴"）
+pub fn infer_artist_from_path(path: &str) -> Option<String> {
+    let p = Path::new(path);
+    let parent = p.parent()?;
+    let grandparent = parent.parent()?;
+    let name = grandparent.file_name()?.to_str()?.trim();
+    if is_generic_dir_name(name) {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn is_generic_dir_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "" | "." | ".." | "music" | "music2" | "test" | "download" | "downloads" | "audio" | "media" | "root" | "home"
+    )
+}
+
+fn is_pure_latin1(s: &str) -> bool {
+    let mut has_high = false;
+    for ch in s.chars() {
+        let code = ch as u32;
+        if code > 255 {
+            return false;
+        }
+        if code >= 0x80 {
+            has_high = true;
+        }
+    }
+    has_high
+}
+
+/// 判断字符是否为 GBK 字节被误当作 UTF-8 解码后的典型产物。
+///
+/// GBK 首字节 C4–CA、次字节 80–BF 的双字节组恰好是合法 UTF-8 序列，
+/// 解码结果落在 Latin Extended-B（U+0180–U+024F）与 IPA Extensions
+/// （U+0250–U+02AF）区段；真实标签中这些区段的出现概率可以忽略。
+fn is_gbk_as_utf8_mojibake_char(ch: char) -> bool {
+    let code = ch as u32;
+    (0x0180..=0x02AF).contains(&code)
+}
+
 /// 修复少量旧中文下载器写出的损坏 ID3 文本。
 ///
 /// 这类文件把 GBK 原始字节逐字节扩成 Latin-1/UTF-16 码点，例如 `ÇôÄñ` 实际应为 `囚鸟`。
@@ -133,12 +296,60 @@ fn decode_latin1_as_gbk(text: &str) -> Option<String> {
     if bytes.iter().filter(|&&byte| byte >= 0x80).count() < 2 {
         return None;
     }
-    let (decoded, _, had_errors) = GBK.decode(&bytes);
-    if had_errors {
-        return None;
+
+    // 借鉴 tinyLMS-old：高位统计启发式检测 GBK/GB18030
+    let mut gbk_score = 0;
+    let mut total_high = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c1 = bytes[i];
+        if c1 >= 0x80 {
+            total_high += 1;
+            if i + 1 < bytes.len() {
+                let c2 = bytes[i + 1];
+                if c1 >= 0x81 && c1 <= 0xfe && ((c2 >= 0x40 && c2 <= 0x7e) || (c2 >= 0x80 && c2 <= 0xfe)) {
+                    gbk_score += 1;
+                    i += 1;
+                    total_high += 1;
+                }
+            }
+        }
+        i += 1;
     }
-    let decoded = decoded.trim_matches('\0').trim().to_string();
-    (!decoded.is_empty() && decoded != text).then_some(decoded)
+
+    // 若高位成对比例 >= 0.7，优先使用 GB18030 解码
+    if total_high > 0 && (gbk_score * 2 * 10 >= total_high * 7) {
+        let (decoded, _, had_errors) = GB18030.decode(&bytes);
+        if !had_errors {
+            let res = decoded.trim_matches('\0').trim().to_string();
+            if !res.is_empty() && res != text {
+                return Some(res);
+            }
+        }
+    }
+
+    // 备用：使用 GBK 解码
+    let (decoded, _, had_errors) = GBK.decode(&bytes);
+    if !had_errors {
+        let decoded = decoded.trim_matches('\0').trim().to_string();
+        if !decoded.is_empty() && decoded != text {
+            return Some(decoded);
+        }
+    }
+
+    // 再次备用：使用 chardetng 自动探测
+    let mut detector = chardetng::EncodingDetector::new();
+    detector.feed(&bytes, true);
+    let guessed = detector.guess(None, true);
+    let (decoded, _, had_errors) = guessed.decode(&bytes);
+    if !had_errors {
+        let res = decoded.trim_matches('\0').trim().to_string();
+        if !res.is_empty() && res != text {
+            return Some(res);
+        }
+    }
+
+    None
 }
 
 /// 大小写不敏感查找：原 ffmpeg-next 的 Dictionary::get 默认 case-insensitive，
@@ -244,4 +455,33 @@ mod tests {
     fn decibels_are_converted_to_linear_gain() {
         assert!((db_to_linear(-6.0) - 0.501_187_2).abs() < 0.000_001);
     }
+
+    #[test]
+    fn test_clean_title_and_path_inference() {
+        let path = "/media/music2/蔡琴/机遇（绿色版）/01._机遇Ⅰ.wav";
+        assert_eq!(clean_title_from_filename(path), Some("机遇Ⅰ".to_string()));
+        assert_eq!(infer_album_from_path(path), Some("机遇（绿色版）".to_string()));
+        assert_eq!(infer_artist_from_path(path), Some("蔡琴".to_string()));
+
+        let path2 = "/music/张学友/吻别/02. 每天爱你多一些.flac";
+        assert_eq!(clean_title_from_filename(path2), Some("每天爱你多一些".to_string()));
+        assert_eq!(infer_album_from_path(path2), Some("吻别".to_string()));
+        assert_eq!(infer_artist_from_path(path2), Some("张学友".to_string()));
+    }
+
+    #[test]
+    fn test_clean_and_repair_tag_discards_fffd_and_decodes_latin1_gbk() {
+        // 包含 \u{FFFD} 的损坏文本被彻底丢弃
+        assert_eq!(clean_and_repair_tag("".to_string()), None);
+        assert_eq!(clean_and_repair_tag("(2003) (ɫ)".to_string()), None);
+        assert_eq!(clean_and_repair_tag("(2003) (\u{fffd})".to_string()), None);
+
+        // 以 Latin-1 保存的 GBK 文本自动转码
+        let raw_caiqin = "²ÌÇÙ".to_string(); // "蔡琴" in Latin-1 representation of GBK
+        assert_eq!(clean_and_repair_tag(raw_caiqin), Some("蔡琴".to_string()));
+
+        let raw_jiyu = "»úÓö¢ñ".to_string(); // "机遇Ⅰ" in Latin-1 representation of GBK
+        assert_eq!(clean_and_repair_tag(raw_jiyu), Some("机遇Ⅰ".to_string()));
+    }
 }
+

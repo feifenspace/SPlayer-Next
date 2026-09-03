@@ -215,8 +215,7 @@ pub fn prepare_decode(
     let codec = info.codec_name.clone().unwrap_or_default();
 
     let raw_metadata = reader.metadata();
-    let tags =
-        metadata::repair_legacy_gbk_tags_for_path(metadata::extract_tags(&raw_metadata), source);
+    let tags = metadata::extract_file_tags(source, &reader);
     let cover =
         cover_cache_dir.and_then(|dir| metadata::extract_cover_thumbnail(&reader, source, dir));
     let cover_raw = metadata::read_attached_pic(&reader);

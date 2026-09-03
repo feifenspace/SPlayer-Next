@@ -138,12 +138,115 @@ impl DirectPcmFrame {
             usize::try_from(frame.nb_samples).context("Source Direct sample count 越界")?;
         ensure!(start_sample < total_samples, "Source Direct planar seek offset 越界");
         let samples = total_samples - start_sample;
-        let channels =
+        let source_channels =
             usize::try_from(frame.ch_layout.nb_channels).context("Source Direct 声道数越界")?;
-        let total_samples = samples
-            .checked_mul(channels)
+        let output_channels = if source_channels > 2 { 2 } else { source_channels };
+        let total_output_samples = samples
+            .checked_mul(output_channels)
             .context("Source Direct planar sample count 溢出")?;
-        self.preallocate_repack(sample_format, total_samples)?;
+        self.preallocate_repack(sample_format, total_output_samples)?;
+
+        // 多声道（5.1 / 6.1 / 7.1 等）演播室标准（ITU-R BS.775）下混至双声道立体声
+        if source_channels > 2 {
+            match frame.format as sys::AVSampleFormat {
+                sys::AVSampleFormat_AV_SAMPLE_FMT_FLTP => unsafe {
+                    if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
+                        downmix_float_planar_to_i32(
+                            frame.extended_data,
+                            source_channels,
+                            start_sample,
+                            samples,
+                            output,
+                        )?;
+                    } else {
+                        bail!("Source Direct planar repack buffer 类型不匹配");
+                    }
+                },
+                sys::AVSampleFormat_AV_SAMPLE_FMT_FLT => unsafe {
+                    if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
+                        let ptr = frame.data[0].cast::<f32>();
+                        ensure!(!ptr.is_null(), "Source Direct packed float PCM 缺少 data[0]");
+                        downmix_packed_float_to_i32(
+                            ptr,
+                            source_channels,
+                            start_sample,
+                            samples,
+                            output,
+                        )?;
+                    } else {
+                        bail!("Source Direct packed repack buffer 类型不匹配");
+                    }
+                },
+                sys::AVSampleFormat_AV_SAMPLE_FMT_S16P => unsafe {
+                    if let DirectPcmRepackBuffer::Signed16(output) = &mut self.repack {
+                        ensure!(
+                            !frame.extended_data.is_null(),
+                            "Source Direct planar PCM 缺少 extended_data"
+                        );
+                        downmix_planar_i16(
+                            frame.extended_data,
+                            source_channels,
+                            start_sample,
+                            samples,
+                            output,
+                        )?;
+                    } else {
+                        bail!("Source Direct planar repack buffer 类型不匹配");
+                    }
+                },
+                sys::AVSampleFormat_AV_SAMPLE_FMT_S16 => unsafe {
+                    if let DirectPcmRepackBuffer::Signed16(output) = &mut self.repack {
+                        let ptr = frame.data[0].cast::<i16>();
+                        ensure!(!ptr.is_null(), "Source Direct packed 16-bit PCM 缺少 data[0]");
+                        downmix_packed_i16(
+                            ptr,
+                            source_channels,
+                            start_sample,
+                            samples,
+                            output,
+                        )?;
+                    } else {
+                        bail!("Source Direct packed repack buffer 类型不匹配");
+                    }
+                },
+                sys::AVSampleFormat_AV_SAMPLE_FMT_S32P => unsafe {
+                    if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
+                        ensure!(
+                            !frame.extended_data.is_null(),
+                            "Source Direct planar PCM 缺少 extended_data"
+                        );
+                        downmix_planar_i32(
+                            frame.extended_data,
+                            source_channels,
+                            start_sample,
+                            samples,
+                            output,
+                        )?;
+                    } else {
+                        bail!("Source Direct planar repack buffer 类型不匹配");
+                    }
+                },
+                sys::AVSampleFormat_AV_SAMPLE_FMT_S32 => unsafe {
+                    if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
+                        let ptr = frame.data[0].cast::<i32>();
+                        ensure!(!ptr.is_null(), "Source Direct packed 32-bit PCM 缺少 data[0]");
+                        downmix_packed_i32(
+                            ptr,
+                            source_channels,
+                            start_sample,
+                            samples,
+                            output,
+                        )?;
+                    } else {
+                        bail!("Source Direct packed repack buffer 类型不匹配");
+                    }
+                },
+                other => bail!("Source Direct 不支持的多声道 FFmpeg 格式: {other}"),
+            }
+            return Ok(());
+        }
+
+        // 原始单声道 / 双声道处理逻辑
         ensure!(
             !frame.extended_data.is_null(),
             "Source Direct planar PCM 缺少 extended_data"
@@ -154,7 +257,7 @@ impl DirectPcmFrame {
                 if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
                     convert_float_planar_to_i32(
                         frame.extended_data,
-                        channels,
+                        source_channels,
                         start_sample,
                         samples,
                         output,
@@ -167,8 +270,8 @@ impl DirectPcmFrame {
                 if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
                     let ptr = frame.data[0].cast::<f32>();
                     ensure!(!ptr.is_null(), "Source Direct packed float PCM 缺少 data[0]");
-                    let start_offset = start_sample * channels;
-                    for i in 0..total_samples {
+                    let start_offset = start_sample * source_channels;
+                    for i in 0..total_output_samples {
                         let val = (*ptr.add(start_offset + i)).clamp(-1.0_f32, 1.0_f32);
                         output[i] = (val * 2147483647.0) as i32;
                     }
@@ -180,7 +283,7 @@ impl DirectPcmFrame {
                 (DirectPcmRepackBuffer::Signed16(output), DirectPcmSampleFormat::Signed16) => unsafe {
                     interleave_planar::<i16>(
                         frame.extended_data,
-                        channels,
+                        source_channels,
                         start_sample,
                         samples,
                         output,
@@ -189,7 +292,7 @@ impl DirectPcmFrame {
                 (DirectPcmRepackBuffer::Signed32(output), DirectPcmSampleFormat::Signed32) => unsafe {
                     interleave_planar::<i32>(
                         frame.extended_data,
-                        channels,
+                        source_channels,
                         start_sample,
                         samples,
                         output,
@@ -210,7 +313,7 @@ impl DirectPcmFrame {
 
     fn accept_decoded_frame(&mut self, valid_bits_hint: u8) -> Result<()> {
         let frame = unsafe { self.raw.as_ref() };
-        let (sample_format, memory_path) = match frame.format as sys::AVSampleFormat {
+        let (sample_format, mut memory_path) = match frame.format as sys::AVSampleFormat {
             sys::AVSampleFormat_AV_SAMPLE_FMT_S16 => (
                 DirectPcmSampleFormat::Signed16,
                 DirectPcmMemoryPath::ZeroCopyPacked,
@@ -246,8 +349,15 @@ impl DirectPcmFrame {
         ensure!(frame.nb_samples > 0, "Source Direct frame 没有 PCM samples");
 
         let sample_rate = u32::try_from(frame.sample_rate).context("Source Direct 采样率越界")?;
-        let channels =
-            u16::try_from(frame.ch_layout.nb_channels).context("Source Direct 声道数越界")?;
+        let source_channels =
+            usize::try_from(frame.ch_layout.nb_channels).context("Source Direct 声道数越界")?;
+        let is_multichannel = source_channels > 2;
+        let channels: u16 = if is_multichannel { 2 } else { source_channels as u16 };
+        if is_multichannel {
+            // 多声道必须经由演播室级下混输出为双声道立体声，以适配 Diretta Target
+            memory_path = DirectPcmMemoryPath::BitPerfectRepack;
+        }
+
         let storage_bits = match sample_format {
             DirectPcmSampleFormat::Signed16 => 16,
             DirectPcmSampleFormat::Signed32 => 32,
@@ -278,17 +388,19 @@ impl DirectPcmFrame {
                 );
             }
             DirectPcmMemoryPath::BitPerfectRepack => {
-                ensure!(
-                    frame.linesize[0] >= 0,
-                    "Source Direct planar PCM linesize 无效"
-                );
-                let plane_len = samples_per_channel
-                    .checked_mul(bytes_per_sample)
-                    .context("Source Direct planar plane 长度溢出")?;
-                ensure!(
-                    usize::try_from(frame.linesize[0]).unwrap_or(0) >= plane_len,
-                    "Source Direct planar PCM plane 超过 FFmpeg frame buffer"
-                );
+                if !frame.extended_data.is_null() && !is_multichannel {
+                    ensure!(
+                        frame.linesize[0] >= 0,
+                        "Source Direct planar PCM linesize 无效"
+                    );
+                    let plane_len = samples_per_channel
+                        .checked_mul(bytes_per_sample)
+                        .context("Source Direct planar plane 长度溢出")?;
+                    ensure!(
+                        usize::try_from(frame.linesize[0]).unwrap_or(0) >= plane_len,
+                        "Source Direct planar PCM plane 超过 FFmpeg frame buffer"
+                    );
+                }
                 self.repack_planar(sample_format, 0)?;
             }
         }
@@ -322,6 +434,368 @@ impl DirectPcmFrame {
         }
         Ok(())
     }
+}
+
+const INV_SQRT2_F32: f32 = 0.70710678;
+const INV_SQRT2_F64: f64 = 0.7071067811865475;
+
+unsafe fn downmix_planar_i16(
+    extended_data: *mut *mut u8,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i16],
+) -> Result<()> {
+    ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    let mut planes = [ptr::null::<i16>(); 8];
+    for ch in 0..channels.min(8) {
+        let p = (*extended_data.add(ch)).cast::<i16>();
+        ensure!(!p.is_null(), "Source Direct planar PCM plane 为空");
+        planes[ch] = p;
+    }
+
+    if channels == 6 {
+        // 5.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL/SL, 5=BR/SR
+        let fl = planes[0];
+        let fr = planes[1];
+        let fc = planes[2];
+        let bl = planes[4];
+        let br = planes[5];
+        for i in 0..samples {
+            let idx = start_sample + i;
+            let l = *fl.add(idx) as f32 + INV_SQRT2_F32 * (*fc.add(idx) as f32) + INV_SQRT2_F32 * (*bl.add(idx) as f32);
+            let r = *fr.add(idx) as f32 + INV_SQRT2_F32 * (*fc.add(idx) as f32) + INV_SQRT2_F32 * (*br.add(idx) as f32);
+            output[i * 2] = l.round().clamp(-32768.0, 32767.0) as i16;
+            output[i * 2 + 1] = r.round().clamp(-32768.0, 32767.0) as i16;
+        }
+        return Ok(());
+    }
+
+    if channels == 7 {
+        // 6.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BC, 5=SL, 6=SR
+        let fl = planes[0];
+        let fr = planes[1];
+        let fc = planes[2];
+        let bc = planes[4];
+        let sl = planes[5];
+        let sr = planes[6];
+        for i in 0..samples {
+            let idx = start_sample + i;
+            let l = *fl.add(idx) as f32 + INV_SQRT2_F32 * (*fc.add(idx) as f32) + INV_SQRT2_F32 * (*sl.add(idx) as f32) + 0.5 * (*bc.add(idx) as f32);
+            let r = *fr.add(idx) as f32 + INV_SQRT2_F32 * (*fc.add(idx) as f32) + INV_SQRT2_F32 * (*sr.add(idx) as f32) + 0.5 * (*bc.add(idx) as f32);
+            output[i * 2] = l.round().clamp(-32768.0, 32767.0) as i16;
+            output[i * 2 + 1] = r.round().clamp(-32768.0, 32767.0) as i16;
+        }
+        return Ok(());
+    }
+
+    if channels == 8 {
+        // 7.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL, 5=BR, 6=SL, 7=SR
+        let fl = planes[0];
+        let fr = planes[1];
+        let fc = planes[2];
+        let bl = planes[4];
+        let br = planes[5];
+        let sl = planes[6];
+        let sr = planes[7];
+        for i in 0..samples {
+            let idx = start_sample + i;
+            let l = *fl.add(idx) as f32 + INV_SQRT2_F32 * (*fc.add(idx) as f32) + INV_SQRT2_F32 * (*sl.add(idx) as f32) + 0.5 * (*bl.add(idx) as f32);
+            let r = *fr.add(idx) as f32 + INV_SQRT2_F32 * (*fc.add(idx) as f32) + INV_SQRT2_F32 * (*sr.add(idx) as f32) + 0.5 * (*br.add(idx) as f32);
+            output[i * 2] = l.round().clamp(-32768.0, 32767.0) as i16;
+            output[i * 2 + 1] = r.round().clamp(-32768.0, 32767.0) as i16;
+        }
+        return Ok(());
+    }
+
+    // 通用多声道下混
+    for i in 0..samples {
+        let idx = start_sample + i;
+        let mut l = *planes[0].add(idx) as f32;
+        let mut r = *planes[1].add(idx) as f32;
+        if channels > 2 && !planes[2].is_null() {
+            let c = *planes[2].add(idx) as f32;
+            l += INV_SQRT2_F32 * c;
+            r += INV_SQRT2_F32 * c;
+        }
+        for ch in 3..channels.min(8) {
+            if !planes[ch].is_null() {
+                let s = *planes[ch].add(idx) as f32;
+                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+            }
+        }
+        output[i * 2] = l.round().clamp(-32768.0, 32767.0) as i16;
+        output[i * 2 + 1] = r.round().clamp(-32768.0, 32767.0) as i16;
+    }
+    Ok(())
+}
+
+unsafe fn downmix_planar_i32(
+    extended_data: *mut *mut u8,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i32],
+) -> Result<()> {
+    ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    let mut planes = [ptr::null::<i32>(); 8];
+    for ch in 0..channels.min(8) {
+        let p = (*extended_data.add(ch)).cast::<i32>();
+        ensure!(!p.is_null(), "Source Direct planar PCM plane 为空");
+        planes[ch] = p;
+    }
+
+    if channels == 6 {
+        // 5.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL/SL, 5=BR/SR
+        let fl = planes[0];
+        let fr = planes[1];
+        let fc = planes[2];
+        let bl = planes[4];
+        let br = planes[5];
+        for i in 0..samples {
+            let idx = start_sample + i;
+            let l = *fl.add(idx) as f64 + INV_SQRT2_F64 * (*fc.add(idx) as f64) + INV_SQRT2_F64 * (*bl.add(idx) as f64);
+            let r = *fr.add(idx) as f64 + INV_SQRT2_F64 * (*fc.add(idx) as f64) + INV_SQRT2_F64 * (*br.add(idx) as f64);
+            output[i * 2] = l.round().clamp(-2147483648.0, 2147483647.0) as i32;
+            output[i * 2 + 1] = r.round().clamp(-2147483648.0, 2147483647.0) as i32;
+        }
+        return Ok(());
+    }
+
+    if channels == 7 {
+        // 6.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BC, 5=SL, 6=SR
+        let fl = planes[0];
+        let fr = planes[1];
+        let fc = planes[2];
+        let bc = planes[4];
+        let sl = planes[5];
+        let sr = planes[6];
+        for i in 0..samples {
+            let idx = start_sample + i;
+            let l = *fl.add(idx) as f64 + INV_SQRT2_F64 * (*fc.add(idx) as f64) + INV_SQRT2_F64 * (*sl.add(idx) as f64) + 0.5 * (*bc.add(idx) as f64);
+            let r = *fr.add(idx) as f64 + INV_SQRT2_F64 * (*fc.add(idx) as f64) + INV_SQRT2_F64 * (*sr.add(idx) as f64) + 0.5 * (*bc.add(idx) as f64);
+            output[i * 2] = l.round().clamp(-2147483648.0, 2147483647.0) as i32;
+            output[i * 2 + 1] = r.round().clamp(-2147483648.0, 2147483647.0) as i32;
+        }
+        return Ok(());
+    }
+
+    if channels == 8 {
+        // 7.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL, 5=BR, 6=SL, 7=SR
+        let fl = planes[0];
+        let fr = planes[1];
+        let fc = planes[2];
+        let bl = planes[4];
+        let br = planes[5];
+        let sl = planes[6];
+        let sr = planes[7];
+        for i in 0..samples {
+            let idx = start_sample + i;
+            let l = *fl.add(idx) as f64 + INV_SQRT2_F64 * (*fc.add(idx) as f64) + INV_SQRT2_F64 * (*sl.add(idx) as f64) + 0.5 * (*bl.add(idx) as f64);
+            let r = *fr.add(idx) as f64 + INV_SQRT2_F64 * (*fc.add(idx) as f64) + INV_SQRT2_F64 * (*sr.add(idx) as f64) + 0.5 * (*br.add(idx) as f64);
+            output[i * 2] = l.round().clamp(-2147483648.0, 2147483647.0) as i32;
+            output[i * 2 + 1] = r.round().clamp(-2147483648.0, 2147483647.0) as i32;
+        }
+        return Ok(());
+    }
+
+    // 通用多声道下混
+    for i in 0..samples {
+        let idx = start_sample + i;
+        let mut l = *planes[0].add(idx) as f64;
+        let mut r = *planes[1].add(idx) as f64;
+        if channels > 2 && !planes[2].is_null() {
+            let c = *planes[2].add(idx) as f64;
+            l += INV_SQRT2_F64 * c;
+            r += INV_SQRT2_F64 * c;
+        }
+        for ch in 3..channels.min(8) {
+            if !planes[ch].is_null() {
+                let s = *planes[ch].add(idx) as f64;
+                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+            }
+        }
+        output[i * 2] = l.round().clamp(-2147483648.0, 2147483647.0) as i32;
+        output[i * 2 + 1] = r.round().clamp(-2147483648.0, 2147483647.0) as i32;
+    }
+    Ok(())
+}
+
+unsafe fn downmix_float_planar_to_i32(
+    extended_data: *mut *mut u8,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i32],
+) -> Result<()> {
+    ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    let mut planes = [ptr::null::<f32>(); 8];
+    for ch in 0..channels.min(8) {
+        let p = (*extended_data.add(ch)).cast::<f32>();
+        ensure!(!p.is_null(), "Source Direct planar PCM plane 为空");
+        planes[ch] = p;
+    }
+
+    for i in 0..samples {
+        let idx = start_sample + i;
+        let mut l = *planes[0].add(idx);
+        let mut r = *planes[1].add(idx);
+        if channels > 2 && !planes[2].is_null() {
+            let c = *planes[2].add(idx);
+            l += INV_SQRT2_F32 * c;
+            r += INV_SQRT2_F32 * c;
+        }
+        for ch in 3..channels.min(8) {
+            if !planes[ch].is_null() {
+                let s = *planes[ch].add(idx);
+                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+            }
+        }
+        output[i * 2] = (l.clamp(-1.0, 1.0) * 2147483647.0).round() as i32;
+        output[i * 2 + 1] = (r.clamp(-1.0, 1.0) * 2147483647.0).round() as i32;
+    }
+    Ok(())
+}
+
+unsafe fn downmix_packed_i16(
+    ptr: *const i16,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i16],
+) -> Result<()> {
+    ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    for i in 0..samples {
+        let base = (start_sample + i) * channels;
+        let fl = *ptr.add(base) as f32;
+        let fr = *ptr.add(base + 1) as f32;
+        let fc = if channels > 2 { *ptr.add(base + 2) as f32 } else { 0.0 };
+        let mut l = fl + INV_SQRT2_F32 * fc;
+        let mut r = fr + INV_SQRT2_F32 * fc;
+        if channels == 6 {
+            // 5.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL/SL, 5=BR/SR
+            let bl = *ptr.add(base + 4) as f32;
+            let br = *ptr.add(base + 5) as f32;
+            l += INV_SQRT2_F32 * bl;
+            r += INV_SQRT2_F32 * br;
+        } else if channels == 7 {
+            // 6.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BC, 5=SL, 6=SR
+            let bc = *ptr.add(base + 4) as f32;
+            let sl = *ptr.add(base + 5) as f32;
+            let sr = *ptr.add(base + 6) as f32;
+            l += INV_SQRT2_F32 * sl + 0.5 * bc;
+            r += INV_SQRT2_F32 * sr + 0.5 * bc;
+        } else if channels == 8 {
+            // 7.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL, 5=BR, 6=SL, 7=SR
+            let bl = *ptr.add(base + 4) as f32;
+            let br = *ptr.add(base + 5) as f32;
+            let sl = *ptr.add(base + 6) as f32;
+            let sr = *ptr.add(base + 7) as f32;
+            l += INV_SQRT2_F32 * sl + 0.5 * bl;
+            r += INV_SQRT2_F32 * sr + 0.5 * br;
+        } else {
+            for ch in 3..channels.min(8) {
+                let s = *ptr.add(base + ch) as f32;
+                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+            }
+        }
+        output[i * 2] = l.round().clamp(-32768.0, 32767.0) as i16;
+        output[i * 2 + 1] = r.round().clamp(-32768.0, 32767.0) as i16;
+    }
+    Ok(())
+}
+
+unsafe fn downmix_packed_i32(
+    ptr: *const i32,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i32],
+) -> Result<()> {
+    ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    for i in 0..samples {
+        let base = (start_sample + i) * channels;
+        let fl = *ptr.add(base) as f64;
+        let fr = *ptr.add(base + 1) as f64;
+        let fc = if channels > 2 { *ptr.add(base + 2) as f64 } else { 0.0 };
+        let mut l = fl + INV_SQRT2_F64 * fc;
+        let mut r = fr + INV_SQRT2_F64 * fc;
+        if channels == 6 {
+            // 5.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL/SL, 5=BR/SR
+            let bl = *ptr.add(base + 4) as f64;
+            let br = *ptr.add(base + 5) as f64;
+            l += INV_SQRT2_F64 * bl;
+            r += INV_SQRT2_F64 * br;
+        } else if channels == 7 {
+            // 6.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BC, 5=SL, 6=SR
+            let bc = *ptr.add(base + 4) as f64;
+            let sl = *ptr.add(base + 5) as f64;
+            let sr = *ptr.add(base + 6) as f64;
+            l += INV_SQRT2_F64 * sl + 0.5 * bc;
+            r += INV_SQRT2_F64 * sr + 0.5 * bc;
+        } else if channels == 8 {
+            // 7.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL, 5=BR, 6=SL, 7=SR
+            let bl = *ptr.add(base + 4) as f64;
+            let br = *ptr.add(base + 5) as f64;
+            let sl = *ptr.add(base + 6) as f64;
+            let sr = *ptr.add(base + 7) as f64;
+            l += INV_SQRT2_F64 * sl + 0.5 * bl;
+            r += INV_SQRT2_F64 * sr + 0.5 * br;
+        } else {
+            for ch in 3..channels.min(8) {
+                let s = *ptr.add(base + ch) as f64;
+                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+            }
+        }
+        output[i * 2] = l.round().clamp(-2147483648.0, 2147483647.0) as i32;
+        output[i * 2 + 1] = r.round().clamp(-2147483648.0, 2147483647.0) as i32;
+    }
+    Ok(())
+}
+
+unsafe fn downmix_packed_float_to_i32(
+    ptr: *const f32,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i32],
+) -> Result<()> {
+    ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    for i in 0..samples {
+        let base = (start_sample + i) * channels;
+        let fl = *ptr.add(base);
+        let fr = *ptr.add(base + 1);
+        let fc = if channels > 2 { *ptr.add(base + 2) } else { 0.0 };
+        let mut l = fl + INV_SQRT2_F32 * fc;
+        let mut r = fr + INV_SQRT2_F32 * fc;
+        if channels == 6 {
+            let bl = *ptr.add(base + 4);
+            let br = *ptr.add(base + 5);
+            l += INV_SQRT2_F32 * bl;
+            r += INV_SQRT2_F32 * br;
+        } else if channels == 7 {
+            let bc = *ptr.add(base + 4);
+            let sl = *ptr.add(base + 5);
+            let sr = *ptr.add(base + 6);
+            l += INV_SQRT2_F32 * sl + 0.5 * bc;
+            r += INV_SQRT2_F32 * sr + 0.5 * bc;
+        } else if channels == 8 {
+            let bl = *ptr.add(base + 4);
+            let br = *ptr.add(base + 5);
+            let sl = *ptr.add(base + 6);
+            let sr = *ptr.add(base + 7);
+            l += INV_SQRT2_F32 * sl + 0.5 * bl;
+            r += INV_SQRT2_F32 * sr + 0.5 * br;
+        } else {
+            for ch in 3..channels.min(8) {
+                let s = *ptr.add(base + ch);
+                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+            }
+        }
+        output[i * 2] = (l.clamp(-1.0, 1.0) * 2147483647.0).round() as i32;
+        output[i * 2 + 1] = (r.clamp(-1.0, 1.0) * 2147483647.0).round() as i32;
+    }
+    Ok(())
 }
 
 unsafe fn interleave_planar<T: Copy>(
@@ -427,6 +901,9 @@ pub struct DirectPcmDecoder {
     valid_bits_hint: u8,
     flushing: bool,
     drained: bool,
+    /// 自定义 IO 输入（流式音源）；本地路径打开时为 None。
+    /// Drop 顺序必须在 avformat_close_input 之后（CUSTOM_IO 下 pb 由这里释放）。
+    avio: Option<AvioReader>,
 }
 
 impl DirectPcmDecoder {
@@ -447,7 +924,62 @@ impl DirectPcmDecoder {
         };
         ffmpeg_result(open_result, "打开 Source Direct 音源")?;
         let format_context = NonNull::new(format_context).context("FFmpeg 未返回输入上下文")?;
+        Self::finalize_open(format_context, None)
+    }
 
+    /// 以自定义 `Read + Seek` Reader 作为 FFmpeg 输入（流式在线音源）。
+    ///
+    /// Reader 的读/写位置完全由 demuxer 驱动：顺序读保持单连接流式拉取，
+    /// seek（demuxer 探测或用户 seek）触发 Reader 层的 Range 重连。
+    /// 与本地路径打开共用同一套 stream 探测/codec 初始化流程。
+    pub fn open_reader(reader: Box<dyn ReadSeek>) -> Result<Self> {
+        let avio = AvioReader::new(reader)?;
+        let open_result = unsafe {
+            let raw = sys::avformat_alloc_context();
+            let format_context =
+                NonNull::new(raw).context("分配 Source Direct format context 失败")?;
+            (*format_context.as_ptr()).pb = avio.ctx.as_ptr();
+            // 标记自定义 IO，防止 FFmpeg close 输入时双重释放 AVIOContext
+            (*format_context.as_ptr()).flags |= sys::AVFMT_FLAG_CUSTOM_IO as i32;
+            let mut ctx_ptr = format_context.as_ptr();
+            let result = sys::avformat_open_input(
+                &mut ctx_ptr,
+                b"\0".as_ptr().cast(),
+                ptr::null(),
+                ptr::null_mut(),
+            );
+            // 失败时 FFmpeg 已自行释放 context（含 CUSTOM_IO 下不释放的 pb）
+            if let Err(error) = ffmpeg_result(result, "打开 Source Direct 流式音源") {
+                drop(avio);
+                return Err(error);
+            }
+            let format_context = NonNull::new(ctx_ptr).context("FFmpeg 未返回输入上下文")?;
+            (format_context, avio)
+        };
+        let (format_context, avio) = open_result;
+        Self::finalize_open(format_context, Some(avio))
+    }
+
+    /// 输入打开后的公共流程：stream 探测、codec 初始化与 packet 分配
+    fn finalize_open(
+        format_context: NonNull<sys::AVFormatContext>,
+        avio: Option<AvioReader>,
+    ) -> Result<Self> {
+        // 自定义 IO 下 FFmpeg close 输入不会释放 pb，错误路径需随同释放 avio
+        let result = Self::finalize_open_inner(format_context);
+        match result {
+            Ok(mut decoder) => {
+                decoder.avio = avio;
+                Ok(decoder)
+            }
+            Err(error) => {
+                drop(avio);
+                Err(error)
+            }
+        }
+    }
+
+    fn finalize_open_inner(format_context: NonNull<sys::AVFormatContext>) -> Result<Self> {
         let stream_info_result =
             unsafe { sys::avformat_find_stream_info(format_context.as_ptr(), ptr::null_mut()) };
         if let Err(error) = ffmpeg_result(stream_info_result, "读取 Source Direct stream info") {
@@ -556,6 +1088,7 @@ impl DirectPcmDecoder {
             valid_bits_hint,
             flushing: false,
             drained: false,
+            avio: None,
         })
     }
 
@@ -722,7 +1255,122 @@ impl Drop for DirectPcmDecoder {
             sys::avcodec_free_context(&mut codec);
             sys::avformat_close_input(&mut format);
         }
+        // CUSTOM_IO 下 pb 由 FFmpeg 保留，最后释放自定义 AVIO 上下文
+        self.avio = None;
     }
+}
+
+/// `DirectPcmDecoder::open_reader` 接受的自定义输入
+pub trait ReadSeek: std::io::Read + std::io::Seek + Send {}
+impl<T: std::io::Read + std::io::Seek + Send> ReadSeek for T {}
+
+const AVIO_BUFFER_SIZE: usize = 32 * 1024;
+
+/// 把任意 `Read + Seek` 包装成 FFmpeg 自定义 AVIO 输入。
+///
+/// 读回调直接委托 Reader（顺序读保持单连接流式拉取，seek 触发 Reader 层
+/// Range 重连）；`AVSEEK_SIZE` 通过尾部 seek 探测总长。
+struct AvioReader {
+    ctx: NonNull<sys::AVIOContext>,
+    /// Box 双重封装：外层 Box 指针交给 AVIOContext opaque，Drop 时收回
+    opaque: *mut Box<dyn ReadSeek>,
+}
+
+unsafe impl Send for AvioReader {}
+
+impl AvioReader {
+    fn new(reader: Box<dyn ReadSeek>) -> Result<Self> {
+        let opaque = Box::into_raw(Box::new(reader));
+        let buffer = unsafe { sys::av_malloc(AVIO_BUFFER_SIZE) }.cast::<u8>();
+        if buffer.is_null() {
+            unsafe { drop(Box::from_raw(opaque)) };
+            bail!("分配 Source Direct AVIO buffer 失败");
+        }
+        let ctx = unsafe {
+            sys::avio_alloc_context(
+                buffer,
+                AVIO_BUFFER_SIZE as i32,
+                0,
+                opaque.cast::<std::ffi::c_void>(),
+                Some(avio_read_packet),
+                None,
+                Some(avio_seek),
+            )
+        };
+        let ctx = match NonNull::new(ctx) {
+            Some(value) => value,
+            None => {
+                unsafe {
+                    sys::av_freep(buffer.cast::<std::ffi::c_void>());
+                    drop(Box::from_raw(opaque));
+                }
+                bail!("分配 Source Direct AVIO context 失败");
+            }
+        };
+        Ok(Self { ctx, opaque })
+    }
+}
+
+impl Drop for AvioReader {
+    fn drop(&mut self) {
+        unsafe {
+            // avio_alloc_context 分配的内部缓冲需要显式释放
+            if !(*self.ctx.as_ptr()).buffer.is_null() {
+                let buffer_ptr = (&raw mut (*self.ctx.as_ptr()).buffer).cast::<std::ffi::c_void>();
+                sys::av_freep(buffer_ptr);
+            }
+            sys::avio_context_free((&raw mut self.ctx).cast::<*mut sys::AVIOContext>());
+            drop(Box::from_raw(self.opaque));
+        }
+    }
+}
+
+extern "C" fn avio_read_packet(
+    opaque: *mut std::ffi::c_void,
+    buf: *mut u8,
+    buf_size: i32,
+) -> i32 {
+    if opaque.is_null() || buf.is_null() || buf_size <= 0 {
+        return sys::AVERROR_EOF;
+    }
+    let reader = unsafe { &mut *opaque.cast::<Box<dyn ReadSeek>>() };
+    let slice = unsafe { std::slice::from_raw_parts_mut(buf, buf_size as usize) };
+    match reader.read(slice) {
+        Ok(0) => sys::AVERROR_EOF,
+        Ok(n) => n as i32,
+        Err(_) => sys::averror(libc::EIO),
+    }
+}
+
+extern "C" fn avio_seek(opaque: *mut std::ffi::c_void, offset: i64, whence: i32) -> i64 {
+    if opaque.is_null() {
+        return i64::from(sys::averror(libc::EINVAL));
+    }
+    let reader = unsafe { &mut *opaque.cast::<Box<dyn ReadSeek>>() };
+    use std::io::{Seek, SeekFrom};
+
+    if whence == sys::AVSEEK_SIZE.cast_signed() {
+        let Ok(current) = reader.stream_position() else {
+            return i64::from(sys::averror(libc::ENOSYS));
+        };
+        let Ok(size) = reader.seek(SeekFrom::End(0)) else {
+            return i64::from(sys::averror(libc::ENOSYS));
+        };
+        if reader.seek(SeekFrom::Start(current)).is_err() {
+            return i64::from(sys::averror(libc::EIO));
+        }
+        return size.cast_signed();
+    }
+
+    let seek_from = match whence & (!sys::AVSEEK_FORCE.cast_signed()) {
+        0 => SeekFrom::Start(offset.cast_unsigned()),
+        1 => SeekFrom::Current(offset),
+        2 => SeekFrom::End(offset),
+        _ => return i64::from(sys::averror(libc::EINVAL)),
+    };
+    reader
+        .seek(seek_from)
+        .map_or_else(|_| i64::from(sys::averror(libc::EIO)), u64::cast_signed)
 }
 
 const DIRECT_RING_DEPTH: usize = 8;
@@ -1153,7 +1801,19 @@ impl DirectPcmSource {
     }
 
     pub fn open_local_at(path: &Path, position_secs: f64) -> Result<(Self, f64)> {
-        let mut decoder = DirectPcmDecoder::open_local(path)?;
+        let decoder = DirectPcmDecoder::open_local(path)?;
+        Self::open_with_decoder(decoder, position_secs)
+    }
+
+    /// 以流式 Reader 打开（在线音源 stream 模式）。
+    /// `position_secs > 0` 由 demuxer 级 accurate seek 完成（Reader 层触发 Range 重连）。
+    pub fn open_reader_at(reader: Box<dyn ReadSeek>, position_secs: f64) -> Result<(Self, f64)> {
+        let decoder = DirectPcmDecoder::open_reader(reader)?;
+        Self::open_with_decoder(decoder, position_secs)
+    }
+
+    fn open_with_decoder(decoder: DirectPcmDecoder, position_secs: f64) -> Result<(Self, f64)> {
+        let mut decoder = decoder;
         let ring = Arc::new(DirectPcmRing::new()?);
         let first_slot = &ring.slots[0];
         first_slot.state.store(SLOT_FILLING, Ordering::Relaxed);
@@ -1544,33 +2204,39 @@ mod tests {
         }
 
         fn wav(sample_rate: u32, bits_per_sample: u16, pcm: &[u8]) -> Self {
+            let bytes = wav_bytes(sample_rate, bits_per_sample, pcm);
             let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "splayer-direct-{}-{id}.wav",
                 std::process::id()
             ));
-            let channels = 2_u16;
-            let bytes_per_sample = bits_per_sample / 8;
-            let block_align = channels * bytes_per_sample;
-            let byte_rate = sample_rate * u32::from(block_align);
-            let data_size = u32::try_from(pcm.len()).expect("fixture 太大");
-            let mut bytes = Vec::with_capacity(44 + pcm.len());
-            bytes.extend_from_slice(b"RIFF");
-            bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
-            bytes.extend_from_slice(b"WAVEfmt ");
-            bytes.extend_from_slice(&16_u32.to_le_bytes());
-            bytes.extend_from_slice(&1_u16.to_le_bytes());
-            bytes.extend_from_slice(&channels.to_le_bytes());
-            bytes.extend_from_slice(&sample_rate.to_le_bytes());
-            bytes.extend_from_slice(&byte_rate.to_le_bytes());
-            bytes.extend_from_slice(&block_align.to_le_bytes());
-            bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
-            bytes.extend_from_slice(b"data");
-            bytes.extend_from_slice(&data_size.to_le_bytes());
-            bytes.extend_from_slice(pcm);
             fs::write(&path, bytes).expect("写入测试 WAV 失败");
             Self { path }
         }
+    }
+
+    /// 构造最小 RIFF/WAVE（PCM s16/s24/s32，双声道）内存字节
+    fn wav_bytes(sample_rate: u32, bits_per_sample: u16, pcm: &[u8]) -> Vec<u8> {
+        let channels = 2_u16;
+        let bytes_per_sample = bits_per_sample / 8;
+        let block_align = channels * bytes_per_sample;
+        let byte_rate = sample_rate * u32::from(block_align);
+        let data_size = u32::try_from(pcm.len()).expect("fixture 太大");
+        let mut bytes = Vec::with_capacity(44 + pcm.len());
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&byte_rate.to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&bits_per_sample.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        bytes.extend_from_slice(pcm);
+        bytes
     }
 
     impl Drop for TempAudioFile {
@@ -1625,6 +2291,53 @@ mod tests {
         );
         assert_eq!(frame.samples_per_channel(), 4);
         assert_eq!(frame.payload_bytes().unwrap(), pcm);
+    }
+
+    /// stream 模式核心路径：AVIO 自定义 Reader 输入必须与本地文件解码逐位一致
+    #[test]
+    fn open_reader_decodes_memory_input_bit_exactly_like_local_file() {
+        let sample_rate = 44_100_u32;
+        let pcm: Vec<u8> = (0..4096_i32)
+            .map(|i| ((i * 37) % 20000 - 10000) as i16)
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let wav = wav_bytes(sample_rate, 16, &pcm);
+
+        // 参考路径：本地文件
+        let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "splayer-direct-{}-reader-ref-{id}.wav",
+            std::process::id()
+        ));
+        fs::write(&path, &wav).expect("写入参考 WAV 失败");
+        let mut local = DirectPcmDecoder::open_local(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let mut local_frame = DirectPcmFrame::new().unwrap();
+
+        // 流式路径：内存 Cursor 经 AVIO 喂给 FFmpeg
+        let mut streamed =
+            DirectPcmDecoder::open_reader(Box::new(std::io::Cursor::new(wav))).unwrap();
+        let mut streamed_frame = DirectPcmFrame::new().unwrap();
+
+        assert!(local.read_frame(&mut local_frame).unwrap());
+        assert!(streamed.read_frame(&mut streamed_frame).unwrap());
+        assert_eq!(
+            streamed_frame.format().unwrap(),
+            local_frame.format().unwrap(),
+            "AVIO 输入与本地文件的解码格式必须一致"
+        );
+        let mut local_blocks = local_frame.payload_bytes().unwrap().to_vec();
+        let mut streamed_blocks = streamed_frame.payload_bytes().unwrap().to_vec();
+
+        while local.read_frame(&mut local_frame).unwrap() {
+            local_blocks.extend_from_slice(local_frame.payload_bytes().unwrap());
+        }
+        while streamed.read_frame(&mut streamed_frame).unwrap() {
+            streamed_blocks.extend_from_slice(streamed_frame.payload_bytes().unwrap());
+        }
+
+        assert_eq!(streamed_blocks, local_blocks, "AVIO 流式解码输出必须与本地文件逐位一致");
+        assert_eq!(streamed_blocks, pcm, "s16 WAV 经 AVIO 解码后应保持位精确");
     }
 
     #[test]
@@ -2247,6 +2960,49 @@ mod tests {
     }
 
     #[test]
+    fn multichannel_downmix_planar_5_1_and_6_1_to_stereo() {
+        let mut ch_data: Vec<Vec<i16>> = (0..7)
+            .map(|ch| vec![(ch as i16 + 1) * 1000; 16])
+            .collect();
+        let mut ptrs: Vec<*mut u8> = ch_data
+            .iter_mut()
+            .map(|v| v.as_mut_ptr() as *mut u8)
+            .collect();
+
+        // 测试 5.1 (6 声道) 下混
+        let mut output_5_1 = vec![0_i16; 32];
+        unsafe {
+            downmix_planar_i16(ptrs.as_mut_ptr(), 6, 0, 16, &mut output_5_1).unwrap();
+        }
+        assert_eq!(output_5_1.len(), 32);
+        assert_eq!(output_5_1[0], 6657);
+        assert_eq!(output_5_1[1], 8364);
+
+        // 测试 6.1 (7 声道) 下混
+        let mut output_6_1 = vec![0_i16; 32];
+        unsafe {
+            downmix_planar_i16(ptrs.as_mut_ptr(), 7, 0, 16, &mut output_6_1).unwrap();
+        }
+        assert_eq!(output_6_1.len(), 32);
+        assert_eq!(output_6_1[0], 9864);
+        assert_eq!(output_6_1[1], 11571);
+
+        // 测试 packed 5.1 (6 声道) 下混
+        let mut packed_5_1 = vec![0_i16; 6 * 16];
+        for i in 0..16 {
+            for ch in 0..6 {
+                packed_5_1[i * 6 + ch] = (ch as i16 + 1) * 1000;
+            }
+        }
+        let mut output_packed_5_1 = vec![0_i16; 32];
+        unsafe {
+            downmix_packed_i16(packed_5_1.as_ptr(), 6, 0, 16, &mut output_packed_5_1).unwrap();
+        }
+        assert_eq!(output_packed_5_1[0], 6657);
+        assert_eq!(output_packed_5_1[1], 8364);
+    }
+
+    #[test]
     fn strict_direct_rejects_unsupported_pcm() {
         let mut frame = DirectPcmFrame::new().unwrap();
         let raw = unsafe { frame.raw.as_mut() };
@@ -2259,3 +3015,4 @@ mod tests {
         assert!(error.to_string().contains("不支持 FFmpeg sample format"));
     }
 }
+

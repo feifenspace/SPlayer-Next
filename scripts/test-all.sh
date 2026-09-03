@@ -48,13 +48,13 @@ show_help() {
     echo -e "${BOLD}4. 聚合/分类快捷测试:${RESET}"
     echo -e "  ${MAGENTA}engine${RESET}      - 运行所有音频底层解码与扫描测试 (1-6, 16)"
     echo -e "  ${MAGENTA}server${RESET}      - 运行所有 Headless 服务端测试 (7-12)"
-    echo -e "  ${MAGENTA}rust${RESET}        - 运行所有 Rust 后端核心测试 (1-12, 16)"
-    echo -e "  ${MAGENTA}all${RESET}         - 运行全套 16 项测试 (默认)"
+    echo -e "  ${MAGENTA}rust${RESET}        - 运行所有 Rust 后端核心测试 (1-12, 16, 17)"
+    echo -e "  ${MAGENTA}all${RESET}         - 运行全套 17 项测试 (默认)"
     echo -e ""
     echo -e "${BOLD}常用示例:${RESET}"
-    echo -e "  ./test.sh 16            # 仅测试 RAM Play 纯内存模块"
-    echo -e "  ./test.sh ram           # 仅测试 RAM Play 纯内存模块"
-    echo -e "  ./test.sh 4 16          # DSD + RAM Play 联合测试"
+    echo -e "  ./test.sh 17            # 仅测试多声道（5.1/6.1/7.1）立体声降混模块"
+    echo -e "  ./test.sh downmix       # 仅测试多声道立体声降混模块"
+    echo -e "  ./test.sh 16 17         # RAM Play + 多声道降混联合测试"
     echo -e "  ./test.sh engine        # 运行全部音频解码引擎测试"
     echo -e "  ./test.sh -i            # 打开交互式菜单"
     echo -e "${BOLD}${CYAN}================================================================${RESET}\n"
@@ -93,11 +93,11 @@ if [ $# -eq 0 ] || [ "$1" = "-i" ] || [ "$1" = "--interactive" ] || [ "$1" = "me
     if [ -z "$user_input" ] || [ "$user_input" = "A" ] || [ "$user_input" = "a" ] || [ "$user_input" = "all" ]; then
         SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14" "15" "16")
     elif [ "$user_input" = "E" ] || [ "$user_input" = "e" ] || [ "$user_input" = "engine" ]; then
-        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "16")
+        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "16" "17")
     elif [ "$user_input" = "S" ] || [ "$user_input" = "s" ] || [ "$user_input" = "server" ]; then
         SELECTED_STEPS=("7" "8" "9" "10" "11" "12")
     elif [ "$user_input" = "R" ] || [ "$user_input" = "r" ] || [ "$user_input" = "rust" ]; then
-        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "16")
+        SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "16" "17")
     else
         SELECTED_STEPS=($user_input)
     fi
@@ -120,10 +120,11 @@ else
             14|client|polyfill) SELECTED_STEPS+=("14") ;;
             15|web|frontend|vitest) SELECTED_STEPS+=("15") ;;
             16|ram|ram-play|rambuffer|memory) SELECTED_STEPS+=("16") ;;
-            engine|audio) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6" "16") ;;
+            17|downmix|multichannel|surround) SELECTED_STEPS+=("17") ;;
+            engine|audio) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6" "16" "17") ;;
             server|headless|backend) SELECTED_STEPS+=("7" "8" "9" "10" "11" "12") ;;
-            rust|rust-all|crates) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "16") ;;
-            all|a) SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14" "15" "16"); break ;;
+            rust|rust-all|crates) SELECTED_STEPS+=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "16" "17") ;;
+            all|a) SELECTED_STEPS=("1" "2" "3" "4" "5" "6" "7" "8" "9" "10" "11" "12" "13" "14" "15" "16" "17"); break ;;
             *)
                 echo -e "${RED}未知测试参数: ${arg}${RESET}"
                 show_help
@@ -265,6 +266,16 @@ fi
 if should_run "16"; then
     run_test_step 16 "纯内存 RAM Play 双缓冲 + CPU 亲和力调度测试" \
         "cargo test -p audio-engine-core --lib ram_buffer -- --nocapture && cargo test -p audio-engine-core --lib priority -- --nocapture"
+fi
+
+# 17. 多声道（5.1 / 6.1 / 7.1）工作室级立体声降混测试
+# 测试内容：
+#   - 5.1ch (6 声道) 环绕声降混至双声道立体声矩阵验证
+#   - 6.1ch (7 声道) 环绕声降混至双声道立体声矩阵验证
+#   - 降混后声级均衡、中心声道混合比例（1/√2）及削波保护验证
+if should_run "17"; then
+    run_test_step 17 "多声道（5.1 / 6.1 / 7.1）工作室级立体声降混测试" \
+        "cargo test -p audio-engine-core --lib direct_pcm::tests::multichannel_downmix_planar_5_1_and_6_1_to_stereo -- --nocapture"
 fi
 
 # ==============================================================================

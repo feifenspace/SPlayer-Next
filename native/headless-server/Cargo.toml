@@ -12,6 +12,9 @@ path = "src/main.rs"
 # 音频核心（headless 模式：纯 ALSA / Diretta 输出，免去桌面级 PipeWire 动态库依赖；关闭 FFT 频谱和 MIDI）
 audio-engine-core = { path = "../audio-engine-core", default-features = false, features = ["headless"] }
 
+# memfd_create（preload 模式纯内存流缓存）
+libc = "0.2"
+
 # HTTP 框架
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }

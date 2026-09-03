@@ -308,6 +308,42 @@ impl DirectPlayback {
         Ok(playback)
     }
 
+    /// 以流式 Reader 打开（在线音源 stream 模式）：边下边播，不做全量预下载。
+    /// 仅支持 PCM 可解码源（FLAC/MP3/AAC/WAV 等）；DSD 流请使用 preload 落盘/memfd 路径。
+    #[cfg(feature = "diretta")]
+    pub fn open_stream(
+        selector: &str,
+        source: &str,
+        reader: Box<dyn crate::direct_pcm::ReadSeek>,
+        duration: f64,
+        auto_play: bool,
+    ) -> Result<Self> {
+        let (transport, seek_base) = {
+            let (connection, actual_position) =
+                DirettaDirectConnection::open_reader_at(selector, reader, 0.0)?;
+            (DirectTransport::Pcm(connection), actual_position.max(0.0))
+        };
+        let final_duration = match &transport {
+            DirectTransport::Pcm(value) => {
+                value.set_duration(duration);
+                duration
+            }
+            DirectTransport::Dsd(_) => duration,
+        };
+        let mut playback = Self {
+            duration: final_duration,
+            seek_base,
+            seek_transition_count: 0,
+            selector: selector.to_owned(),
+            source: source.to_owned(),
+            transport,
+        };
+        if auto_play {
+            playback.play()?;
+        }
+        Ok(playback)
+    }
+
     #[cfg(feature = "diretta")]
     pub fn handoff_local_while_paused(
         &mut self,

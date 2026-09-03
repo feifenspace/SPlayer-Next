@@ -70,6 +70,7 @@ features = [
   "Win32_Foundation",
   "Win32_Media_Audio",
   "Win32_System_Com",
+  "Win32_System_Memory",
   "Win32_System_Threading",
 ]
 

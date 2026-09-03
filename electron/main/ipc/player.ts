@@ -164,6 +164,23 @@ const registerNativeEvents = (inst: InstanceType<AudioEngineModule["AudioPlayer"
         setTaskbarProgress(-1);
         break;
       }
+      case "directTrackBoundary": {
+        // Diretta Source Direct 无缝切曲边界：音频已在引擎内零间隙切换，
+        // 结算上一曲 scrobble 并把事件转发给 renderer 推进 queue/media 状态
+        lastfm.onEnded();
+        listenbrainz.onEnded();
+        neteaseScrobble.onEnded();
+        const boundaryEvent = {
+          type: "directTrackBoundary",
+          data: {
+            duration: toDisplayDurationMs(toMs(event.duration ?? 0)),
+            generation: event.generation ?? 0,
+          },
+        };
+        sendToMain("player:event", boundaryEvent);
+        wsBroadcast(boundaryEvent);
+        break;
+      }
       case "position": {
         const posMs = toDisplayPositionMs(toMs(event.position ?? 0));
         const durMs = toDisplayDurationMs(toMs(event.duration ?? 0));
@@ -408,6 +425,40 @@ export const registerPlayerIpc = (): void => {
         totalMs: toDisplayDurationMs(toMs(getPlayer().getDuration())),
         seeked: true,
       });
+      return { success: true };
+    } catch (error) {
+      return fail(ErrorCode.UNKNOWN, error);
+    }
+  });
+
+  // Diretta Source Direct 无缝预载下一曲
+  // 非 Direct runtime 时原生层返回 false（轻量探测）；在线 URL 等不可 seek 源返回错误
+  ipcMain.handle(
+    "player:stageDirectNext",
+    async (_event, source: string, durationSecs: number, generation = 0) => {
+      try {
+        const staged = await getPlayer().stageDirectNext(source, durationSecs, generation);
+        return { success: true, data: staged };
+      } catch (error) {
+        return fail(ErrorCode.UNKNOWN, error);
+      }
+    },
+  );
+
+  // 作废尚未进入音频 ring 的 Direct staged 下一音源
+  ipcMain.handle("player:cancelDirectNext", () => {
+    try {
+      getPlayer().cancelDirectNext();
+      return { success: true };
+    } catch (error) {
+      return fail(ErrorCode.UNKNOWN, error);
+    }
+  });
+
+  // directTrackBoundary 后确认 queue/media 已推进到下一曲
+  ipcMain.handle("player:commitDirectBoundary", (_event, source: string, durationSecs: number) => {
+    try {
+      getPlayer().commitDirectGaplessBoundary(source, durationSecs);
       return { success: true };
     } catch (error) {
       return fail(ErrorCode.UNKNOWN, error);

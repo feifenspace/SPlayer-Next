@@ -23,6 +23,11 @@ import {
   setRepeatMode,
   setShuffleMode,
 } from "./index";
+import {
+  advanceGaplessBoundary,
+  hasStagedDirectNext,
+  maybeStageDirectNext,
+} from "./gapless";
 
 /** 防止 ended 事件重入 */
 let endedGuard = false;
@@ -97,8 +102,16 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       abLoop.checkLoop(adjusted);
       // 推进延时缓存调度
       cacheScheduler.tick(adjusted);
+      // Diretta Source Direct 无缝 stage 检查（内部自节流）
+      maybeStageDirectNext();
       const track = useMediaStore().track;
-      if (track?.cueEndMs != null && status.isPlaying && status.duration > 0) {
+      // 已 stage 无缝下一曲时交给引擎 boundary 事件推进，避免此处提前完整重载
+      if (
+        track?.cueEndMs != null &&
+        status.isPlaying &&
+        status.duration > 0 &&
+        !hasStagedDirectNext()
+      ) {
         if (adjusted >= status.duration - 250) await finishCurrentTrack();
       }
       break;
@@ -108,6 +121,11 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       break;
     case "ended": {
       await finishCurrentTrack();
+      break;
+    }
+    case "directTrackBoundary": {
+      // 引擎已在音频回调内零间隙切入下一曲，前端推进 queue/media 并 commit
+      await advanceGaplessBoundary(event.data.duration, event.data.generation);
       break;
     }
     case "sourceError":

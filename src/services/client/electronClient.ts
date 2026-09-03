@@ -57,6 +57,22 @@ export class ElectronPlayerClient implements IPlayerClient {
     return this.api.getStatus();
   }
 
+  stageDirectNext(
+    source: string,
+    durationSecs: number,
+    generation?: number,
+  ): Promise<IpcResponse<boolean>> {
+    return this.api.stageDirectNext(source, durationSecs, generation);
+  }
+
+  cancelDirectNext(): Promise<IpcResponse> {
+    return this.api.cancelDirectNext();
+  }
+
+  commitDirectBoundary(source: string, durationSecs: number): Promise<IpcResponse> {
+    return this.api.commitDirectBoundary(source, durationSecs);
+  }
+
   setFftEnabled(enabled: boolean): Promise<IpcResponse> {
     return this.api.setFftEnabled(enabled);
   }
@@ -158,22 +174,12 @@ export class ElectronPlayerClient implements IPlayerClient {
   }
 
   async getDirettaTargetInfo(target: string): Promise<IpcResponse<any>> {
+    // 桌面模式未实现 Diretta Target 能力查询（scanDirettaTargets 恒为空列表），
+    // 返回失败以触发前端空态，避免展示伪造数据
+    void target;
     return {
-      success: true,
-      data: {
-        target_address: target,
-        pcm_max_sample_rate: 768000,
-        pcm_max_bits: 32,
-        pcm_channels: 2,
-        supports_dsd: true,
-        dsd_max_sample_rate: 22579200,
-        dsd_format_desc: "Native DSD512 (22.5792 MHz) & DoP",
-        pcm_format_desc: "PCM Up to 768 kHz / 32-bit",
-        supports_native_dsd: true,
-        mtu: 1500,
-        transmission_mode: "Auto (MS Mode 0 / Low Jitter Direct)",
-        bit_perfect_supported: true,
-      },
+      success: false,
+      error: "Diretta target capability query is only available in headless server mode",
     };
   }
 

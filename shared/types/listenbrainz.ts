@@ -29,3 +29,23 @@ export interface ListenBrainzTrackSnapshot {
   trackNumber?: number;
   listenedAt: number;
 }
+
+/** link() 结果 */
+export interface ListenBrainzLinkResult {
+  /** 是否绑定成功 */
+  ok: boolean;
+  /** 成功时的账号名 */
+  account?: string;
+  /** 失败原因 */
+  error?: string;
+}
+
+/** 渲染进程 ListenBrainz API（window.api.listenbrainz） */
+export interface ListenBrainzApi {
+  /** 查询连接状态（不包含 token） */
+  getStatus: () => Promise<ListenBrainzStatus>;
+  /** 绑定 Token */
+  link: (token: string) => Promise<ListenBrainzLinkResult>;
+  /** 解除绑定 */
+  unlink: () => Promise<void>;
+}

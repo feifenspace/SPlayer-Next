@@ -290,6 +290,7 @@ impl AudioPlayer {
                 token,
                 equalizer,
                 tempo,
+                original_sample_rate: _,
             } = take;
 
             let outcome: ReinitOutcome = tokio::task::spawn_blocking(move || {
@@ -518,7 +519,7 @@ impl AudioPlayer {
     #[napi(ts_args_type = "callback: () => void")]
     pub fn on_device_change(&self, callback: Function<(), ()>) -> Result<()> {
         let tsfn = callback.build_threadsafe_function().build()?;
-        let watcher = device_watcher::DeviceWatcher::new(Box::new(move || {
+        let watcher = device_watcher::DeviceWatcher::new(Box::new(move |_: bool| {
             tsfn.call((), ThreadsafeFunctionCallMode::NonBlocking);
         }))
         .into_napi()?;
@@ -898,6 +899,7 @@ impl AudioPlayer {
             token,
             equalizer,
             tempo,
+            original_sample_rate: _,
         } = take;
 
         let outcome: SeekOutcome = tokio::task::spawn_blocking(move || {

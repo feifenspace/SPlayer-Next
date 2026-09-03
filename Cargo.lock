@@ -1615,6 +1615,7 @@ dependencies = [
  "audio-engine-core",
  "axum",
  "futures-util",
+ "libc",
  "md5",
  "ncm-api-rs",
  "parking_lot",

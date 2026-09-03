@@ -24,6 +24,7 @@ import { HotkeyApi } from "@shared/types/hotkey";
 import { StreamingApi } from "@shared/types/streaming";
 import { RecognitionApi } from "@shared/types/recognition";
 import { LastfmApi } from "@shared/types/lastfm";
+import { ListenBrainzApi } from "@shared/types/listenbrainz";
 import { IpcResponse } from "@shared/types/player";
 import { StatsApi } from "@shared/types/stats";
 import { UpdateApi } from "@shared/types/update";
@@ -110,6 +111,7 @@ declare global {
       streaming: StreamingApi;
       recognition: RecognitionApi;
       lastfm: LastfmApi;
+      listenbrainz: ListenBrainzApi;
       externalApi: {
         restart: () => Promise<ExternalApiStatus>;
         getStatus: () => Promise<ExternalApiStatus>;

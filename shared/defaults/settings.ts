@@ -27,6 +27,7 @@ export const defaultSystemConfig: SystemConfig = {
       preamp: 0,
     },
     lyricOffsets: {},
+    onlineSourceMode: "preload",
   },
   media: {
     systemMediaControls: true,

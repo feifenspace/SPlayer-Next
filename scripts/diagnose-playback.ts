@@ -124,7 +124,6 @@ async function main() {
   }
 
   console.log(`\n[步骤 4] 测试向 SPlayer-Next-Headless 发送加载播放请求 (POST /api/v1/player/load) ...`);
-  let loadDone = false;
   for (const hUrl of [headlessUrl, "http://127.0.0.1:14558"]) {
     try {
       const loadPayload = {
@@ -147,7 +146,6 @@ async function main() {
       console.log(`  Headless 响应结果:`, JSON.stringify(loadJson, null, 2));
       if (loadRes.ok && loadJson.success) {
         console.log(`  \x1b[32m🎉 播放器加载成功！采样率: ${loadJson.data?.sample_rate || loadJson.data?.detail?.quality?.sampleRate}Hz, 声道: ${loadJson.data?.channels || loadJson.data?.detail?.quality?.channels}\x1b[0m`);
-        loadDone = true;
         break;
       } else {
         console.log(`  \x1b[31m✗ 播放器加载返回错误: ${JSON.stringify(loadJson.error || loadJson)}\x1b[0m`);

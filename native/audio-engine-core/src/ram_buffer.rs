@@ -84,8 +84,8 @@ impl RamTrackBuffer {
     /// 1. **避免动态扩容的内存碎片**：`Vec::push` / `extend` 触发 realloc 时
     ///    可能产生大量内存碎片，影响物理内存连续性；
     /// 2. **防止扩容时拷贝**：提前 reserve 足量空间，写入阶段不会触发 `memcpy`；
-    /// 3. **锁定物理内存**（未来扩展）：预留空间后可配合 `mlock` 防止换页到 swap，
-    ///    彻底消灭 swap I/O 抖动。
+    /// 3. **锁定物理内存**：预留空间后调用 [`RamTrackBuffer::lock_memory`]
+    ///    防止换页到 swap，彻底消灭 swap I/O 抖动。
     pub fn with_capacity(initial_capacity: usize) -> Self {
         let capacity = initial_capacity.min(RAM_TRACK_MAX_BYTES);
         let mut data = Vec::with_capacity(capacity);
@@ -122,6 +122,54 @@ impl RamTrackBuffer {
         }
         self.write_pos.fetch_add(write_len, Ordering::Release);
         write_len
+    }
+
+    /// 锁定缓冲区物理内存，防止播放热路径发生换页抖动（major page fault）。
+    ///
+    /// 音频 Pull 回调毫秒级取数，若数据页被换出到 swap，缺页中断的磁盘延迟
+    /// 会直接转化为爆音/卡顿。锁定后内核保证这些页常驻物理 RAM。
+    ///
+    /// # 权限要求
+    /// - Linux：需要 `CAP_IPC_LOCK` 或 `/etc/security/limits.conf` 的
+    ///   `LimitMEMLOCK=infinity`（systemd 部署建议 unit 内配置），
+    ///   否则 `mlock` 返回 EPERM，本方法返回 false（调用方应降级为普通内存）。
+    /// - Windows：需要 `SeLockMemoryPrivilege`，通常仅服务进程拥有。
+    ///
+    /// # 用量控制
+    /// 锁定的页对其他进程不可用，务必配合 [`RAM_TRACK_MAX_BYTES`] 上限与
+    /// 双缓冲释放策略使用（参考 tinyLMS：预载前先释放旧二级缓冲）。
+    /// 缓冲区 drop（unmap）时内核自动解除锁定，无需显式 unlock。
+    pub fn lock_memory(&self) -> bool {
+        let ptr = self.data.as_ptr().cast::<std::ffi::c_void>();
+        let len = self.data.len();
+        #[cfg(unix)]
+        let ok = unsafe { libc::mlock(ptr, len) } == 0;
+        #[cfg(target_os = "windows")]
+        let ok = unsafe {
+            windows::Win32::System::Memory::VirtualLock(ptr, len).is_ok()
+        };
+        #[cfg(not(any(unix, target_os = "windows")))]
+        let ok = false;
+        if ok {
+            info!(len_mib = len / 1024 / 1024, "RamTrackBuffer：物理内存锁定成功，播放热路径免疫 swap 抖动");
+        } else {
+            warn!(len_mib = len / 1024 / 1024, "RamTrackBuffer：内存锁定失败（权限不足？），降级为可换页内存");
+        }
+        ok
+    }
+
+    /// 解除内存锁定（显式管理用；缓冲区 drop 时内核亦会自动解除）。
+    pub fn unlock_memory(&self) {
+        let ptr = self.data.as_ptr().cast::<std::ffi::c_void>();
+        let len = self.data.len();
+        #[cfg(unix)]
+        unsafe {
+            libc::munlock(ptr, len);
+        }
+        #[cfg(target_os = "windows")]
+        unsafe {
+            let _ = windows::Win32::System::Memory::VirtualUnlock(ptr, len);
+        }
     }
 
     /// 标记整首曲目已 100% 加载到内存。
@@ -388,6 +436,15 @@ mod tests {
 
         // 验证未读取完毕时（剩余 5 秒）触发阈值判定（5 ≤ 30）
         assert!(manager.should_trigger_gapless(bytes_per_sec));
+    }
+
+    #[test]
+    fn test_memory_lock_roundtrip() {
+        // mlock/munlock 往返：无 CAP_IPC_LOCK 的环境允许失败（EPERM），
+        // 只验证调用不 panic 且 unlock 安全
+        let buf = RamTrackBuffer::with_capacity(4096);
+        let _ = buf.lock_memory();
+        buf.unlock_memory();
     }
 
     #[test]

@@ -43,17 +43,42 @@ export interface DirettaStatus {
 
 export interface DirettaTargetCapabilities {
   target_address: string;
+  target_name: string;
+  output_name: string;
+  firmware_version: string;
+  ipv6_addr: string;
+  full_addr: string;
+  if_idx: number;
+  pcm_format_desc: string;
+  dsd_format_desc: string;
+  transmission_mode: string;
+  mtu: number;
+  mtu_measured: number;
+  mtu_min: number;
+  mtu_req: number;
+  mtu_max: number;
+  max_packet_size: number;
+  supports_pcm: boolean;
+  pcm_min_sample_rate: number;
   pcm_max_sample_rate: number;
+  pcm_min_bits: number;
   pcm_max_bits: number;
+  pcm_min_channels: number;
+  pcm_max_channels: number;
   pcm_channels: number;
   supports_dsd: boolean;
-  dsd_max_sample_rate: number;
-  dsd_format_desc: string;
-  pcm_format_desc: string;
+  supports_dsd_lsb: boolean;
+  supports_dsd_msb: boolean;
   supports_native_dsd: boolean;
-  mtu: number;
-  transmission_mode: string;
+  dsd_min_sample_rate: number;
+  dsd_max_sample_rate: number;
+  dsd_min_bits: number;
+  dsd_max_bits: number;
+  dsd_min_channels: number;
+  dsd_max_channels: number;
+  support_ms_mode: number;
   bit_perfect_supported: boolean;
+  available: boolean;
 }
 
 export type ClientMode = "electron" | "http";

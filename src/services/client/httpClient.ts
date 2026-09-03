@@ -205,6 +205,20 @@ export class HttpPlayerClient implements IPlayerClient {
       return;
     }
 
+    if (
+      msg.type === "directTrackBoundary" ||
+      (msg.kind === "event" && msg.type === "directTrackBoundary")
+    ) {
+      this.emitEvent({
+        type: "directTrackBoundary",
+        data: {
+          duration: Math.round((msg.duration || 0) * 1000),
+          generation: Number(msg.generation ?? 0),
+        },
+      });
+      return;
+    }
+
     if (!msg || typeof msg.state !== "string") return;
 
     const currentState = this.normalizeState(msg.state);
@@ -675,6 +689,41 @@ export class HttpPlayerClient implements IPlayerClient {
         speed: data.speed ?? 1.0,
       },
     };
+  }
+
+  /**
+   * Diretta Source Direct 无缝预载下一曲。
+   * 非 Direct runtime 时后端返回 staged=false（轻量探测，不触发在线预下载）
+   */
+  async stageDirectNext(
+    source: string,
+    durationSecs: number,
+    generation = 0,
+  ): Promise<IpcResponse<boolean>> {
+    const res = await this.request<{ staged: boolean }>("/api/v1/player/direct/stage_next", {
+      method: "POST",
+      body: JSON.stringify({
+        source,
+        duration_secs: durationSecs,
+        generation,
+      }),
+    });
+    if (!res.success) return { success: false, error: res.error };
+    return { success: true, data: Boolean(res.data?.staged) };
+  }
+
+  async cancelDirectNext(): Promise<IpcResponse> {
+    return this.request("/api/v1/player/direct/cancel_next", { method: "POST" });
+  }
+
+  async commitDirectBoundary(source: string, durationSecs: number): Promise<IpcResponse> {
+    return this.request("/api/v1/player/direct/commit_boundary", {
+      method: "POST",
+      body: JSON.stringify({
+        source,
+        duration_secs: durationSecs,
+      }),
+    });
   }
 
   async setFftEnabled(_enabled: boolean): Promise<IpcResponse> {
