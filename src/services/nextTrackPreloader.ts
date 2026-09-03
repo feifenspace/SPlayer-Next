@@ -133,6 +133,18 @@ export const consumePreloadedTrack = (track: Track): NextTrackPreloadResult | nu
 };
 
 /**
+ * 非消费式读取预载结果（供 Direct 无缝 stage 查询候选曲已解析音源）
+ * @param track - 候选歌曲
+ * @returns 匹配的预载结果，未命中返回 null；不改变缓存状态
+ */
+export const peekNextTrackPreload = (track: Track): NextTrackPreloadResult | null => {
+  if (!cachedResult) return null;
+  if (cachedResult.trackId !== track.id) return null;
+  if (cachedResult.contextKey !== buildContextKey(track)) return null;
+  return cachedResult;
+};
+
+/**
  * 调度下一首预载任务
  */
 export const scheduleNextTrackPreload = (): void => {
