@@ -15,6 +15,7 @@ import {
   saveSessionCookies,
 } from "@main/database/sessions";
 import { coreLog } from "@main/utils/logger";
+import { sessionToCookieHeader } from "./credential";
 
 /** Session 字段（可能缺失则下次请求会自动补拿） */
 interface SessionCache {
@@ -62,7 +63,7 @@ export const clearQQMusicCookies = (): void => {
 /** 提取当前登录 uin（纯数字形式） */
 export const getQQMusicUin = (): string => {
   const cookies = getQQMusicCookies();
-  const raw = cookies.uin || cookies.wxuin || cookies.p_uin || "";
+  const raw = cookies.qm_str_musicid || cookies.uin || cookies.wxuin || cookies.p_uin || "";
   return raw ? raw.replace(/^o/, "") : "0";
 };
 
@@ -91,9 +92,7 @@ const postRaw = async (
   extraHeaders?: Record<string, string>,
 ): Promise<FcgResponse> => {
   const cookies = getQQMusicCookies();
-  const cookieEntries = Object.entries(cookies).filter(([_, v]) => !!v);
-  const cookieStr =
-    cookieEntries.length > 0 ? cookieEntries.map(([k, v]) => `${k}=${v}`).join("; ") : undefined;
+  const cookieStr = sessionToCookieHeader(cookies);
 
   const res = await fetch(QM_API_URL, {
     method: "POST",
@@ -245,7 +244,7 @@ export const refreshQQMusicCredential = async (): Promise<boolean> => {
     param = {
       openid: cookies.wxopenid || cookies.psrf_qqopenid || "",
       refresh_token: cookies.wxrefresh_token || cookies.psrf_qqrefresh_token || "",
-      str_musicid: cookies.euin || uin,
+      str_musicid: cookies.qm_str_musicid || uin,
       musickey,
       unionid: cookies.psrf_qqunionid || "",
       refresh_key: refreshKey,
@@ -291,12 +290,19 @@ export const refreshQQMusicCredential = async (): Promise<boolean> => {
     const refreshed: Record<string, string> = {
       qm_keyst: data.musickey,
       qqmusic_key: data.musickey,
-      euin: data.encryptUin || "",
       tmeLoginType: String(data.loginType ?? loginType),
     };
-    if (data.openid) refreshed.psrf_qqopenid = data.openid;
+    if (data.str_musicid || data.musicid) {
+      const musicId = String(data.str_musicid || data.musicid).replace(/^o/, "");
+      refreshed.qm_str_musicid = musicId;
+      refreshed.uin = musicId;
+      if (loginType === 1) refreshed.wxuin = musicId;
+    }
+    if (data.encryptUin) refreshed.euin = data.encryptUin;
+    if (data.openid) refreshed[loginType === 1 ? "wxopenid" : "psrf_qqopenid"] = data.openid;
     if (data.unionid) refreshed.psrf_qqunionid = data.unionid;
-    if (data.refresh_token) refreshed.psrf_qqrefresh_token = data.refresh_token;
+    if (data.refresh_token)
+      refreshed[loginType === 1 ? "wxrefresh_token" : "psrf_qqrefresh_token"] = data.refresh_token;
     if (data.access_token) refreshed.psrf_qqaccess_token = data.access_token;
     if (data.expired_at) refreshed.psrf_access_token_expiresAt = String(data.expired_at);
     if (data.musickeyCreateTime)

@@ -733,7 +733,6 @@
       "community": "社区与资讯",
       "update": "更新",
       "language": "语言",
-      "playback": "播放器",
       "playControl": "播放控制",
       "audioSource": "播放音源",
       "scrobble": "听歌打卡",
@@ -752,6 +751,8 @@
       "appearanceStyle": "外观风格",
       "layout": "布局",
       "font": "字体",
+      "playerBar": "播放栏",
+      "nowPlaying": "播放页",
       "media": "媒体控制",
       "device": "输出设备",
       "hotkeys": "快捷键",
@@ -1453,6 +1454,10 @@
       "description": "全屏播放器封面的呈现方式",
       "default": "默认",
       "fullscreen": "全屏封面"
+    },
+    "coverLyricRatio": {
+      "label": "封面/歌词占比",
+      "description": "播放页封面与歌词区域的宽度比例"
     },
     "themeMode": {
       "label": "主题模式",

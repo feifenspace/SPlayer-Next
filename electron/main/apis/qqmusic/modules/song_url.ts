@@ -5,6 +5,7 @@
 
 import { randomUUID } from "node:crypto";
 import { getQQMusicCookies, getQQMusicUin } from "../core/request";
+import { sessionToCookieHeader } from "../core/credential";
 import { coreLog } from "@main/utils/logger";
 import type { QMModule } from "../core/types";
 
@@ -77,8 +78,7 @@ const songUrl: QMModule = async (params) => {
   const cookies = getQQMusicCookies();
   const uin = getQQMusicUin();
   const musickey = cookies.qm_keyst || cookies.qqmusic_key || "";
-  const cookieEntries = Object.entries(cookies).filter(([_, v]) => !!v);
-  const cookieStr = cookieEntries.map(([k, v]) => `${k}=${v}`).join("; ");
+  const cookieStr = sessionToCookieHeader(cookies);
   const gtk = hash33(musickey, 5381);
   const guid = randomUUID().replace(/-/g, "");
 

@@ -745,7 +745,6 @@
       "community": "Community",
       "update": "Update",
       "language": "Language",
-      "playback": "Player",
       "playControl": "Playback Control",
       "audioSource": "Audio Source",
       "scrobble": "Scrobble",
@@ -764,6 +763,8 @@
       "appearanceStyle": "Appearance Style",
       "layout": "Layout",
       "font": "Fonts",
+      "playerBar": "Player Bar",
+      "nowPlaying": "Now Playing",
       "media": "Media Controls",
       "device": "Output Device",
       "hotkeys": "Hotkeys",
@@ -1465,6 +1466,10 @@
       "description": "Cover presentation in the full-screen player",
       "default": "Default",
       "fullscreen": "Fullscreen"
+    },
+    "coverLyricRatio": {
+      "label": "Cover/Lyrics Ratio",
+      "description": "Width ratio between cover and lyric areas in Now Playing"
     },
     "themeMode": {
       "label": "Theme Mode",
