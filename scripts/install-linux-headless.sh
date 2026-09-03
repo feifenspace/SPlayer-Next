@@ -44,7 +44,7 @@ BIN_PATH="${INSTALL_DIR}/splayer-headless"
 WEB_DIR="${INSTALL_DIR}/web"
 CONFIG_DIR="${INSTALL_DIR}/config"
 CONFIG_PATH="${CONFIG_DIR}/config.yaml"
-DATA_DIR="${SPLAYER_DATA_DIR:-/var/lib/splayer-headless}"
+DATA_DIR="${SPLAYER_DATA_DIR:-${INSTALL_DIR}/data}"
 SERVICE_NAME="splayer-headless.service"
 SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 PORT="${SPLAYER_PORT:-14558}"
@@ -604,8 +604,10 @@ install_files() {
         warn "按参数跳过 Web UI 构建与前端更新，保留现有前端文件：$WEB_DIR"
     fi
 
-    chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
+    # 先归位程序目录所有权，再单独放行数据目录（DATA_DIR 位于 INSTALL_DIR 内，
+    # 顺序颠倒会被覆盖回 root）
     chown -R root:root "$INSTALL_DIR" "$CONFIG_DIR"
+    chown -R "$RUN_USER:$RUN_GROUP" "$DATA_DIR"
     chmod 0755 "$BIN_PATH"
 }
 
@@ -687,11 +689,11 @@ smoke_test() {
     fatal "服务已启动但 HTTP 健康检查失败，请查看：journalctl -u $SERVICE_NAME"
 }
 
-# 探测曲库数据库文件：标准布局在 DATA_DIR，旧版部署可能放在程序目录内
+# 探测曲库数据库文件：标准布局在程序目录 data/ 内，旧版部署可能放在 /var/lib/splayer-headless
 detect_db_files() {
     DB_FILES=()
     local db
-    for db in "$DATA_DIR/library.db" "$INSTALL_DIR/data/library.db" "$INSTALL_DIR/library.db"; do
+    for db in "$INSTALL_DIR/data/library.db" "$DATA_DIR/library.db" "$INSTALL_DIR/library.db"; do
         # 用 if 而非 `[[ ]] &&`：set -e 下后者会让函数在末路径缺失时返回 1，中断主流程
         if [[ -f "$db" ]]; then
             DB_FILES+=("$db")

@@ -386,20 +386,22 @@ package_single_arch() {
     install -m 0755 "$server_bin" "$pkg_dir/splayer-headless"
     cp -r "$WEB_DIST" "$pkg_dir/web"
 
-    # 配置文件样例
+    # 配置文件样例（数据路径默认锚定程序目录 data/，无需显式配置）
     cat > "$pkg_dir/config/config.example.yaml" <<'EOF'
 # SPlayer Linux Headless 配置文件
 listen_addr: "0.0.0.0:14558"
 cors_origins: "*"
 api_token: null
-cover_cache_dir: "/var/lib/splayer-headless/covers"
-database_path: "/var/lib/splayer-headless/library.db"
+# 数据默认保存在程序同级 data/ 目录（<程序目录>/data/library.db 与 covers/），
+# 如需自定义可取消注释：
+# cover_cache_dir: "/opt/splayer-headless/data/covers"
+# database_path: "/opt/splayer-headless/data/library.db"
 web_root: "/opt/splayer-headless/web"
 # Diretta Target 地址可写为：fe80::xxxx%2 或 IP%ifno,port
 diretta_target: null
 EOF
 
-    # systemd 服务模板
+    # systemd 服务模板（数据目录由程序默认解析：<程序目录>/data，无需环境变量）
     cat > "$pkg_dir/splayer-headless.service" <<'EOF'
 [Unit]
 Description=SPlayer Linux Headless Music Server
@@ -412,7 +414,6 @@ User=root
 Group=root
 WorkingDirectory=/opt/splayer-headless
 Environment=RUST_LOG=headless_server=info,audio_engine_core=info
-Environment=SPLAYER_DATA_DIR=/var/lib/splayer-headless
 Environment=SPLAYER_CONFIG_PATH=/opt/splayer-headless/config/config.yaml
 ExecStart=/opt/splayer-headless/splayer-headless
 Restart=on-failure
@@ -450,7 +451,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/splayer-headless"
 CONFIG_DIR="${INSTALL_DIR}/config"
 CONFIG_PATH="${CONFIG_DIR}/config.yaml"
-DATA_DIR="/var/lib/splayer-headless"
+DATA_DIR="${INSTALL_DIR}/data"
 SERVICE_FILE="/etc/systemd/system/splayer-headless.service"
 
 [[ $EUID -eq 0 ]] || fatal "请使用 root 权限运行本脚本：sudo $0"

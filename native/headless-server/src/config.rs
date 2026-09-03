@@ -108,26 +108,18 @@ impl Config {
         Ok(config)
     }
 
-    /// 解析最终使用的数据库文件路径（默认：data/library.db）
+    /// 解析最终使用的数据库文件路径（默认：<可执行文件目录>/data/library.db）
     pub fn resolved_database_path(&self) -> PathBuf {
-        self.database_path.clone().unwrap_or_else(|| {
-            if std::path::Path::new("splayer-headless").is_file() {
-                PathBuf::from("data/library.db")
-            } else {
-                PathBuf::from("splayer-headless/data/library.db")
-            }
-        })
+        self.database_path
+            .clone()
+            .unwrap_or_else(|| default_data_dir().join("library.db"))
     }
 
-    /// 解析最终使用的封面缓存目录（默认：data/covers）
+    /// 解析最终使用的封面缓存目录（默认：<可执行文件目录>/data/covers）
     pub fn resolved_cover_cache_dir(&self) -> PathBuf {
-        self.cover_cache_dir.clone().unwrap_or_else(|| {
-            if std::path::Path::new("splayer-headless").is_file() {
-                PathBuf::from("data/covers")
-            } else {
-                PathBuf::from("splayer-headless/data/covers")
-            }
-        })
+        self.cover_cache_dir
+            .clone()
+            .unwrap_or_else(|| default_data_dir().join("covers"))
     }
 
     /// 获取 CORS 白名单列表
@@ -136,5 +128,78 @@ impl Config {
             .as_deref()
             .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or_else(|| vec!["http://localhost:5173".to_string(), "*".to_string()])
+    }
+}
+
+/// 判断是否为 cargo 构建产物目录（target/{debug,release}[/deps]）
+/// 开发运行不应把数据写入 target/（会被 cargo clean 清除）
+fn is_cargo_target_dir(dir: &std::path::Path) -> bool {
+    let comps: Vec<_> = dir.components().map(|c| c.as_os_str()).collect();
+    comps
+        .windows(2)
+        .any(|w| w[0] == std::ffi::OsStr::new("target") && (w[1] == "debug" || w[1] == "release"))
+}
+
+/// 默认数据目录：锚定可执行文件所在目录（<exe_dir>/data），
+/// 保证手动启动与 systemd 服务无论 CWD 如何都落在同一份数据上，
+/// 更新软件时只要替换二进制与 web 即可，登录态与设置不丢失。
+/// 开发运行（cargo 构建产物目录）回退 CWD 相对路径。
+fn default_data_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if !is_cargo_target_dir(dir) {
+                return dir.join("data");
+            }
+        }
+    }
+    // 开发回退：CWD 相对路径（保持历史行为）
+    if std::path::Path::new("splayer-headless").is_file() {
+        PathBuf::from("data")
+    } else {
+        PathBuf::from("splayer-headless/data")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_database_path_overrides_default() {
+        let config = Config {
+            database_path: Some(PathBuf::from("/custom/library.db")),
+            ..Config::default()
+        };
+        assert_eq!(config.resolved_database_path(), PathBuf::from("/custom/library.db"));
+    }
+
+    #[test]
+    fn explicit_cover_dir_overrides_default() {
+        let config = Config {
+            cover_cache_dir: Some(PathBuf::from("/custom/covers")),
+            ..Config::default()
+        };
+        assert_eq!(config.resolved_cover_cache_dir(), PathBuf::from("/custom/covers"));
+    }
+
+    #[test]
+    fn cargo_target_dirs_are_detected() {
+        assert!(is_cargo_target_dir(std::path::Path::new(
+            "/proj/native/headless-server/target/release"
+        )));
+        assert!(is_cargo_target_dir(std::path::Path::new(
+            "/proj/native/headless-server/target/debug/deps"
+        )));
+        assert!(!is_cargo_target_dir(std::path::Path::new("/opt/splayer-headless")));
+        assert!(!is_cargo_target_dir(std::path::Path::new(
+            "/opt/splayer-headless/data"
+        )));
+    }
+
+    #[test]
+    fn default_data_dir_skips_cargo_target() {
+        // 测试二进制位于 target/debug/deps，应回退 CWD 相对路径而非写入 target/
+        let dir = default_data_dir();
+        assert!(!is_cargo_target_dir(&dir), "数据目录不应落在 cargo target 内: {dir:?}");
     }
 }
