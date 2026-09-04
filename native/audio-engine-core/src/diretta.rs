@@ -158,6 +158,11 @@ mod imp {
     /// 查询指定 Diretta Target 的硬件解码能力（同步阻塞，约 2-3 秒）
     ///
     /// `target_id` 接受 IPv6,PORT 格式的 full address，或不含端口的 IPv6 字符串。
+    ///
+    /// # 契约
+    ///
+    /// 调用方不得持有 player 锁——内部通过网络探测同步阻塞 2-3s；
+    /// 当前调用方（select 可达性验证 / target_info handler）均在 `spawn_isolated_blocking` 中
     pub fn query_target_caps(target_id: &str) -> Result<DirettaTargetCapabilities> {
         let target = selector_target(target_id).unwrap_or(target_id);
         let c_target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
@@ -336,12 +341,12 @@ mod imp {
             self.source.seek_while_paused(position_secs)
         }
 
-        pub fn replace_local_source_while_paused(
+        pub fn replace_drained_local_source(
             &mut self,
             source: &str,
             cancel: crate::ffmpeg_audio::HttpCancelHandle,
         ) -> Result<DirectPcmFormat> {
-            self.source.replace_local_while_paused(source, cancel)
+            self.source.replace_drained_local(source, cancel)
         }
 
         pub fn failed(&self) -> bool {
@@ -473,11 +478,11 @@ mod imp {
             self.source.seek_while_paused(position_secs)
         }
 
-        pub fn replace_local_source_while_paused(
+        pub fn replace_drained_local_source(
             &mut self,
             source: &str,
         ) -> Result<DirectDsdFormat> {
-            self.source.replace_local_while_paused(source)
+            self.source.replace_drained_local(source)
         }
 
         pub fn failed(&self) -> bool {
