@@ -681,14 +681,24 @@ fn online_source_mode(state: &AppState) -> String {
     "preload".to_string()
 }
 
-/// memfd 常驻注册表：preload 模式下载到匿名内存文件，
-/// `/proc/self/fd/N` 路径交给 FFmpeg 打开；File 移入注册表保持 fd 存活，
-/// 直到被后续下载挤出（保留最近 3 个：当前播放 + gapless staged + 余量）。
-#[cfg(target_os = "linux")]
-fn memfd_registry() -> &'static std::sync::Mutex<Vec<std::fs::File>> {
-    static REGISTRY: std::sync::OnceLock<std::sync::Mutex<Vec<std::fs::File>>> =
-        std::sync::OnceLock::new();
-    REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+/// memfd 物化产物：`file` 是 fd N 的唯一持有者——`/proc/self/fd/N` 路径的解析
+/// 依赖该 fd 存活，调用方必须在通过路径打开 FFmpeg 的整个期间持有本值
+/// （fd 关闭后编号可能被复用，路径会静默指向别的文件）；FFmpeg 打开成功后
+/// 解码器持有自己的文件描述符，本值即可释放
+enum DirectInput {
+    #[cfg(target_os = "linux")]
+    Memfd { file: std::fs::File, path: String },
+    Path(String),
+}
+
+impl DirectInput {
+    fn path(&self) -> &str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Memfd { path, .. } => path,
+            Self::Path(path) => path,
+        }
+    }
 }
 
 /// preload 物化大小上限：防失控响应打爆内存（memfd 映射的就是 RAM），
@@ -729,9 +739,9 @@ fn write_response_to_memfd(
     Ok(())
 }
 
-/// 将远端 HTTP(S) 音频流下载并固化到本地缓存（preload 模式：优先 memfd 纯内存，
-/// 失败回退磁盘缓存），以便 Diretta Source Direct 模式进行精确解码与传输
-fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
+/// 将远端 HTTP(S) 音频流物化到本地可解码输入（preload 模式：优先 memfd 纯内存，
+/// memfd 不可用时回退磁盘缓存），以便 Diretta Source Direct 模式进行精确解码与传输
+fn materialize_direct_input(url: &str) -> anyhow::Result<DirectInput> {
     use std::fs::{self, File};
     use std::io::Read;
 
@@ -759,7 +769,7 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     if !ext.is_empty() {
         let target_file = cache_dir.join(format!("{}.{}", hash, ext));
         if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
-            return Ok(target_file.to_string_lossy().to_string());
+            return Ok(DirectInput::Path(target_file.to_string_lossy().to_string()));
         }
     }
 
@@ -800,7 +810,7 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
 
     let target_file = cache_dir.join(format!("{}.{}", hash, ext));
     if target_file.exists() && fs::metadata(&target_file).map(|m| m.len() > 0).unwrap_or(false) {
-        return Ok(target_file.to_string_lossy().to_string());
+        return Ok(DirectInput::Path(target_file.to_string_lossy().to_string()));
     }
 
     // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO，与 header 嗅探共用
@@ -811,16 +821,8 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
         match create_memfd_file() {
             Ok((mut file, path)) => {
                 write_response_to_memfd(&mut file, &mut response)?;
-                {
-                    let mut registry = memfd_registry().lock().expect("memfd registry poisoned");
-                    registry.push(file);
-                    if registry.len() > 3 {
-                        let drain = registry.len() - 3;
-                        registry.drain(0..drain);
-                    }
-                }
                 tracing::info!(url = %url, path = %path, "在线音源已下载至 memfd 纯内存缓存");
-                return Ok(path);
+                return Ok(DirectInput::Memfd { file, path });
             }
             Err(error) => {
                 tracing::warn!(url = %url, %error, "memfd 不可用，回退磁盘缓存");
@@ -842,7 +844,7 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     }
 
     fs::rename(&part_file, &target_file)?;
-    Ok(target_file.to_string_lossy().to_string())
+    Ok(DirectInput::Path(target_file.to_string_lossy().to_string()))
 }
 
 /// Direct 载入成功后的统一响应体
@@ -1009,9 +1011,9 @@ async fn load_handler(
             } else if is_http {
                 Some(materialize_direct_input(&source_for_direct)?)
             } else {
-                Some(source_for_direct.clone())
+                Some(DirectInput::Path(source_for_direct.clone()))
             };
-            let mut metadata = match physical_source.as_deref() {
+            let mut metadata = match physical_source.as_ref().map(DirectInput::path) {
                 Some(path) => {
                     let meta = audio_engine_core::decoder::probe_metadata(
                         path,
@@ -1140,12 +1142,15 @@ async fn load_handler(
                     auto_play,
                 )?
             } else {
-                let physical = physical_source.expect("非 stream 模式必然已有物理源路径");
+                let physical = physical_source
+                    .as_ref()
+                    .map(DirectInput::path)
+                    .expect("非 stream 模式必然已有物理源路径");
                 // 启动验证（对齐桌面端）：首块消费前失败/提前结束/被取代立即报错，
                 // 超时优雅暂停回退，避免把"从未出声的连接"当成播放成功
                 audio_engine_core::direct_runtime::DirectPlayback::open_verified_local(
                     &selector,
-                    &physical,
+                    physical,
                     metadata.duration_secs,
                     auto_play,
                     &load_token_for_direct,
@@ -1535,11 +1540,13 @@ async fn direct_stage_next_handler(
         .map_err(|e| ApiError::internal(format!("Stage preload error: {e}")))?
         .map_err(|e| ApiError::bad_request(format!("Failed to preload stream to RAM: {e}")))?
     } else {
-        source.clone()
+        DirectInput::Path(source.clone())
     };
 
     let result = spawn_isolated_blocking("direct-stage-next-worker", move || {
-        handle.stage_local(&physical_source, duration, generation)
+        // DirectInput（含 memfd 的 File）随闭包存活整个 stage 过程：
+        // producer 在此期间同步打开解码器，路径解析始终有 fd 支撑
+        handle.stage_local(physical_source.path(), duration, generation)
     })
     .await
     .map_err(|e| ApiError::internal(format!("Stage next worker error: {e}")))?;
