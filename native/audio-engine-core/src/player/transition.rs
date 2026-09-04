@@ -573,7 +573,14 @@ impl InnerPlayer {
             .direct_playback
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("[Direct] 无活跃 Direct 连接可复用"))?;
-        let format = playback.handoff_local_while_paused(source, duration)?;
+        // handoff 前置必然是 take_threads_only(handle)：pending_load_handle 即本次
+        // load 的取消句柄——被更新的 load supersede 时 cancel 它，即可即时掐断
+        // producer 正在打开的 HTTP 连接（否则 join 最坏等满 256s 网络退避）
+        let cancel = self
+            .pending_load_handle
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("[Direct] handoff 前缺少 load 取消句柄"))?;
+        let format = playback.handoff_local_while_paused(source, duration, cancel)?;
         self.current_source = Some(source.to_owned());
         self.audio_duration = if duration > 0.0 {
             duration

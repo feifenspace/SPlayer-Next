@@ -445,6 +445,7 @@ impl DirectPlayback {
         &mut self,
         source: &str,
         duration: f64,
+        cancel: crate::ffmpeg_audio::HttpCancelHandle,
     ) -> Result<DirectFormat> {
         let (path_str, _cue_start, cue_dur) =
             if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
@@ -486,7 +487,7 @@ impl DirectPlayback {
                 if is_dsd {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_local_source_while_paused(&path_str)?;
+                let format = value.replace_local_source_while_paused(&path_str, cancel)?;
                 value.set_duration(cue_dur);
                 DirectFormat::Pcm(format)
             }
@@ -684,8 +685,13 @@ impl DirectPlayback {
 
     /// fake 传输的换源：仅更新时长，返回 fake PCM 格式（供 player 层 handoff 单测使用）
     #[cfg(all(test, not(feature = "diretta")))]
-    pub fn handoff_local_while_paused(&mut self, source: &str, duration: f64) -> Result<DirectFormat> {
-        let _ = source;
+    pub fn handoff_local_while_paused(
+        &mut self,
+        source: &str,
+        duration: f64,
+        cancel: crate::ffmpeg_audio::HttpCancelHandle,
+    ) -> Result<DirectFormat> {
+        let _ = (source, cancel);
         self.duration = duration;
         self.seek_base = 0.0;
         Ok(DirectFormat::Pcm(DirectPcmFormat {

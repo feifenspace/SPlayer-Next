@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
+use ffmpeg_audio::HttpCancelHandle;
 use ffmpeg_audio::sys;
 use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
 
@@ -984,18 +985,8 @@ pub struct DirectPcmDecoder {
 
 impl DirectPcmDecoder {
     pub fn open_local(path: &Path) -> Result<Self> {
-        Self::open_source(&path.to_string_lossy())
-    }
-
-    /// 同时支持本地路径与 http(s):// URL；URL 走自定义 AVIO（与 DirectPcmSource::open_stream 一致）。
-    /// 用于同连接 handoff 路径，让 producer 能在不重建 Diretta 连接的情况下切换音源。
-    pub fn open_source(source: &str) -> Result<Self> {
-        if source.starts_with("http://") || source.starts_with("https://") {
-            let http = crate::ffmpeg_audio::HttpAudioSource::new(source)
-                .context("构造 Source Direct HTTP 流式音源失败")?;
-            return Self::open_reader(Box::new(http));
-        }
-        let path = CString::new(source).context("Source Direct 路径包含 NUL")?;
+        let path = CString::new(path.to_string_lossy().as_bytes())
+            .context("Source Direct 路径包含 NUL")?;
 
         let mut format_context = ptr::null_mut();
         let open_result = unsafe {
@@ -1009,6 +1000,26 @@ impl DirectPcmDecoder {
         ffmpeg_result(open_result, "打开 Source Direct 音源")?;
         let format_context = NonNull::new(format_context).context("FFmpeg 未返回输入上下文")?;
         Self::finalize_open(format_context, None)
+    }
+
+    /// 同时支持本地路径与 http(s):// URL；URL 走自定义 AVIO（与 DirectPcmSource::open_stream 一致）。
+    /// 用于同连接 handoff 路径，让 producer 能在不重建 Diretta 连接的情况下切换音源。
+    pub fn open_source(source: &str) -> Result<Self> {
+        Self::open_source_with_cancel(source, &crate::ffmpeg_audio::HttpCancelHandle::new())
+    }
+
+    /// open_source 的可取消版本：supersede/替换时 cancel 句柄即可即时掐断
+    /// HTTP 连接，producer 从最坏 256s 网络退避等待变成即时返回
+    pub fn open_source_with_cancel(source: &str, cancel: &HttpCancelHandle) -> Result<Self> {
+        if source.starts_with("http://") || source.starts_with("https://") {
+            let http = crate::ffmpeg_audio::HttpAudioSource::new_with_cancel_handle(
+                source,
+                cancel,
+            )
+            .context("构造 Source Direct HTTP 流式音源失败")?;
+            return Self::open_reader(Box::new(http));
+        }
+        Self::open_local(Path::new(source))
     }
 
     /// 以自定义 `Read + Seek` Reader 作为 FFmpeg 输入（流式在线音源）。
@@ -1521,6 +1532,7 @@ enum DirectPcmCommand {
     },
     ReplaceLocal {
         source: String,
+        cancel: HttpCancelHandle,
         response: mpsc::SyncSender<Result<DirectPcmFormat>>,
     },
     StageLocal {
@@ -1962,6 +1974,7 @@ fn replace_pcm_ring(
     source: &str,
     ring: &DirectPcmRing,
     current_format: DirectPcmFormat,
+    cancel: &HttpCancelHandle,
 ) -> Result<(DirectPcmDecoder, DirectPcmFormat)> {
     debug!(
         target: "diretta_handoff",
@@ -1969,7 +1982,7 @@ fn replace_pcm_ring(
         source = %source,
         "replace_pcm_ring open source"
     );
-    let mut decoder = DirectPcmDecoder::open_source(source)?;
+    let mut decoder = DirectPcmDecoder::open_source_with_cancel(source, cancel)?;
     let mut prepared = DirectPcmFrame::new()?;
     ensure!(
         decoder.read_frame(&mut prepared)?,
@@ -2266,8 +2279,13 @@ impl DirectPcmSource {
                             next_slot = 1 % producer_ring.slots.len();
                             continue;
                         }
-                        Ok(DirectPcmCommand::ReplaceLocal { source, response }) => {
-                            let result = replace_pcm_ring(&source, &producer_ring, active_format);
+                        Ok(DirectPcmCommand::ReplaceLocal {
+                            source,
+                            cancel,
+                            response,
+                        }) => {
+                            let result =
+                                replace_pcm_ring(&source, &producer_ring, active_format, &cancel);
                             match result {
                                 Ok((new_decoder, new_format)) => {
                                     decoder = new_decoder;
@@ -2622,7 +2640,11 @@ impl DirectPcmSource {
             .wait_for(|ring| ring.fade.drained(min_blocks), timeout)
     }
 
-    pub fn replace_local_while_paused(&mut self, source: &str) -> Result<DirectPcmFormat> {
+    pub fn replace_local_while_paused(
+        &mut self,
+        source: &str,
+        cancel: HttpCancelHandle,
+    ) -> Result<DirectPcmFormat> {
         debug!(
             target: "diretta_handoff",
             phase = "pcm_api_send",
@@ -2633,6 +2655,7 @@ impl DirectPcmSource {
         self.control_tx
             .send(DirectPcmCommand::ReplaceLocal {
                 source: source.to_owned(),
+                cancel,
                 response: response_tx,
             })
             .context("提交 Source Direct PCM handoff 失败")?;
@@ -3499,7 +3522,10 @@ mod tests {
             DirectPcmMemoryPath::ZeroCopyPacked
         );
         let new_format = source
-            .replace_local_while_paused(&replacement.path.to_string_lossy())
+            .replace_local_while_paused(
+                &replacement.path.to_string_lossy(),
+                HttpCancelHandle::new(),
+            )
             .unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(new_format.sample_rate, 44_100);
@@ -3526,7 +3552,10 @@ mod tests {
         let format = source.format();
 
         let error = source
-            .replace_local_while_paused(&incompatible.path.to_string_lossy())
+            .replace_local_while_paused(
+                &incompatible.path.to_string_lossy(),
+                HttpCancelHandle::new(),
+            )
             .unwrap_err();
         assert!(error.to_string().contains("wire format"));
         assert_eq!(source.callback_context(), context);
@@ -3850,7 +3879,9 @@ mod tests {
 
         // 同格式 handoff
         source.set_duration(2.0);
-        let new_format = source.replace_local_while_paused(&fixture_b.path.to_string_lossy()).unwrap();
+        let new_format = source
+            .replace_local_while_paused(&fixture_b.path.to_string_lossy(), HttpCancelHandle::new())
+            .unwrap();
 
         // 断言 1：新格式与原格式完全兼容
         assert_eq!(new_format.sample_rate, 44_100);
@@ -3895,7 +3926,8 @@ mod tests {
 
         let mut source = DirectPcmSource::open_local(&fixture_a.path).unwrap();
 
-        let result = source.replace_local_while_paused(&fixture_b.path.to_string_lossy());
+        let result = source
+            .replace_local_while_paused(&fixture_b.path.to_string_lossy(), HttpCancelHandle::new());
 
         assert!(
             result.is_err(),

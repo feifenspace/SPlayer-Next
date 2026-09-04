@@ -339,8 +339,9 @@ mod imp {
         pub fn replace_local_source_while_paused(
             &mut self,
             source: &str,
+            cancel: crate::ffmpeg_audio::HttpCancelHandle,
         ) -> Result<DirectPcmFormat> {
-            self.source.replace_local_while_paused(source)
+            self.source.replace_local_while_paused(source, cancel)
         }
 
         pub fn failed(&self) -> bool {
