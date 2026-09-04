@@ -57,6 +57,13 @@ pub struct ScanProgressMessage {
     pub current: Option<String>,
 }
 
+/// 下一曲自动连播候选（B 层单槽：后写覆盖，曲终加载后即消费）
+#[derive(Debug, Clone)]
+pub struct PendingNext {
+    pub source: String,
+    pub duration_hint: Option<f64>,
+}
+
 /// 应用全局状态
 #[derive(Clone)]
 pub struct AppState {
@@ -71,6 +78,10 @@ pub struct AppState {
     /// 输出停滞/失败恢复请求（最后一次请求的 Unix 毫秒时间戳，0 = 无请求）。
     /// 事件回调置位，由输出恢复看门狗消费——回调线程禁止锁 player 或触发 async
     pub output_recovery_requested: Arc<std::sync::atomic::AtomicU64>,
+    /// 曲终自动连播请求（Ended 事件置位，输出恢复看门狗消费）
+    pub auto_advance_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// 下一曲候选（B 层自动连播单槽；None = 未注册）
+    pub pending_next: Arc<Mutex<Option<PendingNext>>>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
     snapshot: Arc<RwLock<Option<WsState>>>,
 }
@@ -98,12 +109,15 @@ impl AppState {
         let is_scanning = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scan_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let output_recovery_requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let auto_advance_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_next = Arc::new(Mutex::new(None));
 
         // 回调可能在播放器内部线程触发，不能在这里再次 lock player。
         let callback: EventEmitter = {
             let ws_tx = ws_tx.clone();
             let snapshot = Arc::clone(&snapshot);
             let output_recovery_requested = Arc::clone(&output_recovery_requested);
+            let auto_advance_requested = Arc::clone(&auto_advance_requested);
             Arc::new(move |event: PlayerEvent| {
                 // 先 clone 一份当前快照，避免持有读锁跨越后续写锁操作
                 let current: Option<WsState> = snapshot.read().clone();
@@ -143,6 +157,8 @@ impl AppState {
                             state: PlayerState::Stopped,
                         };
                         *snapshot.write() = Some(ws_state);
+                        // 置自动连播标志：有注册候选时看门狗会在曲终自动接续
+                        auto_advance_requested.store(true, std::sync::atomic::Ordering::Release);
                         let _ = ws_tx.send(serde_json::json!({ "type": "ended", "data": {} }));
                     }
                     PlayerEvent::SourceError => {
@@ -196,6 +212,8 @@ impl AppState {
             is_scanning,
             scan_cancel,
             output_recovery_requested,
+            auto_advance_requested,
+            pending_next,
             snapshot,
         })
     }

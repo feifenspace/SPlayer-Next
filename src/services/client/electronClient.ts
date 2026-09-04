@@ -186,4 +186,13 @@ export class ElectronPlayerClient implements IPlayerClient {
   async browseFs(_path?: string): Promise<IpcResponse<any>> {
     return { success: false, error: "browseFs is only available in headless server mode" };
   }
+
+  async registerNextCandidate(): Promise<IpcResponse> {
+    // 桌面端队列由渲染进程驱动，无需服务端自动连播
+    return { success: true };
+  }
+
+  async clearNextCandidate(): Promise<IpcResponse> {
+    return { success: true };
+  }
 }

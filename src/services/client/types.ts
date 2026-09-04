@@ -89,6 +89,10 @@ export interface IPlayerClient extends PlayerApi {
   selectDirettaTarget(target: string | null): Promise<IpcResponse<any>>;
   getDirettaTargetInfo(target: string): Promise<IpcResponse<DirettaTargetCapabilities>>;
   browseFs(path?: string): Promise<IpcResponse<any>>;
+  /** 注册下一曲候选（headless 自动连播；浏览器关闭后服务端仍可在曲终接续） */
+  registerNextCandidate(source: string, durationHintSecs?: number): Promise<IpcResponse>;
+  /** 清除下一曲候选 */
+  clearNextCandidate(): Promise<IpcResponse>;
 }
 
 export interface IAppClient {

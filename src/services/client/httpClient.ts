@@ -569,6 +569,21 @@ export class HttpPlayerClient implements IPlayerClient {
     });
   }
 
+  // -------------------------------------------------------------
+  // 下一曲候选预注册（B 层自动连播）
+  // -------------------------------------------------------------
+
+  async registerNextCandidate(source: string, durationHintSecs?: number): Promise<IpcResponse> {
+    return this.request("/api/v1/player/queue/next-candidate", {
+      method: "POST",
+      body: JSON.stringify({ source, duration_hint: durationHintSecs ?? null }),
+    });
+  }
+
+  async clearNextCandidate(): Promise<IpcResponse> {
+    return this.request("/api/v1/player/queue/next-candidate", { method: "DELETE" });
+  }
+
   private emitEvent(event: PlayerEvent): void {
     for (const listener of this.eventListeners) {
       try {

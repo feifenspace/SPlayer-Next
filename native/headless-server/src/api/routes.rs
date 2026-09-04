@@ -102,6 +102,35 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
         loop {
             interval.tick().await;
 
+            // B 层自动连播：曲终（Ended 置位）且有候选 → 服务端直接加载播放，
+            // 浏览器（遥控器）离场不影响接续。加载即消费候选
+            if state
+                .auto_advance_requested
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                let candidate = state.pending_next.lock().take();
+                if let Some(next) = candidate {
+                    tracing::info!(source = %next.source, "曲终自动连播：加载下一曲候选");
+                    let load_result = load_handler(
+                        State(state.clone()),
+                        Query(LoadQuery {}),
+                        Json(LoadRequest {
+                            source: next.source.clone(),
+                            auto_play: Some(true),
+                            meta: None,
+                        }),
+                    )
+                    .await;
+                    if !matches!(&load_result, Ok(response) if response.success) {
+                        tracing::warn!(source = %next.source, "自动连播加载失败");
+                        let _ = state.ws_tx.send(serde_json::json!({
+                            "type": "autoAdvanceFailed",
+                            "data": { "source": next.source },
+                        }));
+                    }
+                }
+            }
+
             if state
                 .output_recovery_requested
                 .swap(0, std::sync::atomic::Ordering::AcqRel)
@@ -281,6 +310,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/player/volume", axum::routing::post(volume_handler))
         .route("/api/v1/player/load", axum::routing::post(load_handler))
         .route("/api/v1/player/seek", axum::routing::post(seek_handler))
+        // 下一曲候选预注册（B 层自动连播：浏览器关闭后服务端仍可接续）
+        .route(
+            "/api/v1/player/queue/next-candidate",
+            axum::routing::post(queue_next_candidate_handler)
+                .delete(queue_next_candidate_cancel_handler),
+        )
         // 媒体库操作
         .route(
             "/api/v1/library/tracks",
@@ -874,6 +909,46 @@ fn direct_load_response(
 
 /// 播放中同格式 handoff 编排已下沉 core（InnerPlayer::try_direct_handoff），
 /// headless 与桌面 NAPI 共用同一实现
+
+#[derive(Debug, Deserialize)]
+pub struct NextCandidateRequest {
+    /// 下一曲音源（本地路径 / 物化后的 URL）
+    pub source: String,
+    /// 时长提示（秒，可选）
+    pub duration_hint: Option<f64>,
+}
+
+/// 注册下一曲候选（B 层自动连播）：浏览器关闭后服务端仍能在曲终自动接续。
+/// 单槽后写覆盖；曲终加载完成后候选即被消费
+async fn queue_next_candidate_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<NextCandidateRequest>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    *state.pending_next.lock() = Some(crate::state::PendingNext {
+        source: payload.source.clone(),
+        duration_hint: payload.duration_hint,
+    });
+    let _ = state.ws_tx.send(serde_json::json!({
+        "type": "nextCandidateChanged",
+        "data": { "source": payload.source },
+    }));
+    Ok(Json(PlayerResponse::ok(json!({
+        "registered": true,
+        "source": payload.source,
+    }))))
+}
+
+/// 取消下一曲候选
+async fn queue_next_candidate_cancel_handler(
+    State(state): State<AppState>,
+) -> Json<PlayerResponse> {
+    *state.pending_next.lock() = None;
+    let _ = state.ws_tx.send(serde_json::json!({
+        "type": "nextCandidateChanged",
+        "data": null,
+    }));
+    Json(PlayerResponse::ok(json!({ "registered": false })))
+}
 
 /// 加载音轨（完整三段式异步 IO 闭环）
 async fn load_handler(
