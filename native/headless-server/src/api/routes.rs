@@ -686,27 +686,14 @@ fn memfd_registry() -> &'static std::sync::Mutex<Vec<std::fs::File>> {
     REGISTRY.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// 下载在线音源到 memfd 匿名内存文件（preload 模式纯内存播放）
-#[cfg(target_os = "linux")]
-fn download_to_memfd(
-    url: &str,
-    client: &reqwest::blocking::Client,
-) -> anyhow::Result<String> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
+/// preload 物化大小上限：防失控响应打爆内存（memfd 映射的就是 RAM），
+/// 覆盖 DSD128 整轨约 2.5GB/h 的量级
+const DIRECT_PRELOAD_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-    let mut response = client
-        .get(url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        )
-        .header("Accept", "*/*")
-        .header("Accept-Encoding", "identity")
-        .send()?;
-    if !response.status().is_success() {
-        anyhow::bail!("下载在线流媒体音频失败: HTTP {}", response.status());
-    }
+/// 创建 memfd 匿名内存文件（仅创建、不读取响应；失败即 memfd 不可用，响应可安全回退磁盘）
+#[cfg(target_os = "linux")]
+fn create_memfd_file() -> anyhow::Result<(std::fs::File, String)> {
+    use std::os::fd::FromRawFd;
 
     let name = c"splayer-stream-cache";
     let fd = unsafe { libc::memfd_create(name.as_ptr() as *const _, libc::MFD_CLOEXEC) };
@@ -714,27 +701,34 @@ fn download_to_memfd(
         anyhow::bail!("memfd_create 失败: {}", std::io::Error::last_os_error());
     }
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut file = file;
-    std::io::copy(&mut response, &mut file)?;
-    file.flush()?;
     // memfd 无需落盘 sync；路径必须在 File 移入注册表前用 fd 值构造
-    let path = format!("/proc/self/fd/{fd}");
-    {
-        let mut registry = memfd_registry().lock().expect("memfd registry poisoned");
-        registry.push(file);
-        if registry.len() > 3 {
-            let drain = registry.len() - 3;
-            registry.drain(0..drain);
-        }
-    }
-    tracing::info!(url = %url, path = %path, "在线音源已下载至 memfd 纯内存缓存");
-    Ok(path)
+    Ok((file, format!("/proc/self/fd/{fd}")))
+}
+
+/// 把已建立的响应写入 memfd 文件，超过 DIRECT_PRELOAD_MAX_BYTES 即失败。
+/// 响应体自此被消费，调用方不得再将其用于磁盘回退
+#[cfg(target_os = "linux")]
+fn write_response_to_memfd(
+    file: &mut std::fs::File,
+    response: &mut reqwest::blocking::Response,
+) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut limited = response.take(DIRECT_PRELOAD_MAX_BYTES);
+    std::io::copy(&mut limited, file)?;
+    anyhow::ensure!(
+        limited.limit() > 0,
+        "在线音源超过 preload 大小上限 {DIRECT_PRELOAD_MAX_BYTES} 字节"
+    );
+    file.flush()?;
+    Ok(())
 }
 
 /// 将远端 HTTP(S) 音频流下载并固化到本地缓存（preload 模式：优先 memfd 纯内存，
 /// 失败回退磁盘缓存），以便 Diretta Source Direct 模式进行精确解码与传输
 fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     use std::fs::{self, File};
+    use std::io::Read;
 
     let cache_dir = get_stream_cache_dir();
     let _ = fs::create_dir_all(&cache_dir);
@@ -804,26 +798,43 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
         return Ok(target_file.to_string_lossy().to_string());
     }
 
-    // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO），
-    // memfd 不可用（非 Linux/创建失败）时回退传统磁盘缓存
+    // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO，与 header 嗅探共用
+    // 同一次 GET）。仅 memfd 不可用（创建失败/非 Linux）时回退磁盘——一旦开始写
+    // memfd，响应体已被消费，磁盘回退只能拿到不完整内容，中途失败直接报错
     #[cfg(target_os = "linux")]
     {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()?;
-        match download_to_memfd(url, &client) {
-            Ok(path) => return Ok(path),
+        match create_memfd_file() {
+            Ok((mut file, path)) => {
+                write_response_to_memfd(&mut file, &mut response)?;
+                {
+                    let mut registry = memfd_registry().lock().expect("memfd registry poisoned");
+                    registry.push(file);
+                    if registry.len() > 3 {
+                        let drain = registry.len() - 3;
+                        registry.drain(0..drain);
+                    }
+                }
+                tracing::info!(url = %url, path = %path, "在线音源已下载至 memfd 纯内存缓存");
+                return Ok(path);
+            }
             Err(error) => {
-                tracing::warn!(url = %url, %error, "memfd 下载失败，回退磁盘缓存");
+                tracing::warn!(url = %url, %error, "memfd 不可用，回退磁盘缓存");
             }
         }
     }
 
     let part_file = cache_dir.join(format!("{}.{}.part", hash, ext));
     let mut file = File::create(&part_file)?;
-    std::io::copy(&mut response, &mut file)?;
+    let mut limited = response.take(DIRECT_PRELOAD_MAX_BYTES);
+    std::io::copy(&mut limited, &mut file)?;
+    let exceeded = limited.limit() == 0;
     file.sync_all()?;
     drop(file);
+
+    if exceeded {
+        let _ = fs::remove_file(&part_file);
+        anyhow::bail!("在线音源超过 preload 大小上限 {DIRECT_PRELOAD_MAX_BYTES} 字节");
+    }
 
     fs::rename(&part_file, &target_file)?;
     Ok(target_file.to_string_lossy().to_string())

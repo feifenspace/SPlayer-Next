@@ -932,9 +932,20 @@ fn replace_dsd_ring(
         .round()
         .clamp(0.0, u64::MAX as f64) as u64;
     ring.reset_for_transition();
-    ring.duration_micros.store(duration_micros, Ordering::Release);
     ring.ensure_capacity(reader.max_output_len());
-    fill_slot(&mut reader, &ring.slots[0], wire_bit_order)?
+    // 对齐 staged 安装语义：boundary 元数据在 slot 发布（READY）前写好，
+    // duration/generation 随新源首块被消费时才原子切换——ReplaceLocal 瞬间
+    // 不再直接覆盖 duration_micros，时间显示与位置同步翻转不跳变
+    let first_slot = &ring.slots[0];
+    first_slot
+        .boundary_duration_micros
+        .store(duration_micros, Ordering::Relaxed);
+    first_slot.boundary_generation.store(
+        ring.boundary_generation.load(Ordering::Relaxed) + 1,
+        Ordering::Relaxed,
+    );
+    first_slot.boundary.store(true, Ordering::Relaxed);
+    fill_slot(&mut reader, first_slot, wire_bit_order)?
         .context("Native DSD handoff 后没有可播放 payload")?;
     Ok((reader, new_format))
 }
@@ -1808,6 +1819,13 @@ mod tests {
         });
         assert_eq!(unsafe { std::slice::from_raw_parts(data, len) }, expected);
         unsafe { direct_dsd_release_block(source.callback_context()) };
+
+        // ReplaceLocal 与 staged 同语义：boundary 随新源首块消费生效，
+        // duration/generation 原子切换而非 replace 瞬间覆盖
+        let monitor = source.monitor();
+        assert_eq!(monitor.transition_count(), 1);
+        assert_eq!(monitor.boundary_generation(), 1);
+        assert!((monitor.duration() - 64.0 / 2_822_400.0).abs() < 0.000_001);
     }
 
     #[test]
@@ -1838,6 +1856,11 @@ mod tests {
             logical_dsd_bits(actual, DirectDsdBitOrder::LsbFirst)
         );
         unsafe { direct_dsd_release_block(source.callback_context()) };
+
+        // 跨容器（DSF→DFF）同速率换源同样带 boundary 标记
+        let monitor = source.monitor();
+        assert_eq!(monitor.transition_count(), 1);
+        assert_eq!(monitor.boundary_generation(), 1);
     }
 
     #[test]
