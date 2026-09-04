@@ -439,7 +439,7 @@ impl InnerPlayer {
     /// 不触碰 Direct 连接 / 播放线程 —— 旧曲目在 probe / 淡出期间继续出声。
     /// probe 或格式预检失败后，调用方再用 take_for_async_load 做全量回收。
     #[cfg(any(feature = "diretta", test))]
-    pub fn take_threads_only(&mut self, handle: HttpCancelHandle) -> u64 {
+    pub fn reserve_direct_handoff_token(&mut self, handle: HttpCancelHandle) -> u64 {
         let token = self.load_token.fetch_add(1, Ordering::AcqRel) + 1;
         if let Some(previous) = self.pending_load_handle.replace(handle) {
             previous.cancel();

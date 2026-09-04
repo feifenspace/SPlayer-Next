@@ -31,12 +31,9 @@ use audio_engine_core::LoadSuperseded;
 use crate::error::ApiError;
 use crate::state::{AppState, PlayerSnapshot};
 
-/// 查询参数：加载音轨所需的可选 cancel_handle_id
+/// 查询参数占位：历史上承载可选 cancel_handle_id，现为空结构（保留以兼容既有请求）
 #[derive(Debug, Deserialize)]
-pub struct LoadQuery {
-    #[serde(rename = "cancel_handle_id")]
-    cancel_handle_id: Option<String>,
-}
+pub struct LoadQuery {}
 
 /// 扫描查询参数
 #[derive(Debug, Deserialize)]
@@ -169,9 +166,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
 
             let load_result = load_handler(
                 State(state.clone()),
-                Query(LoadQuery {
-                    cancel_handle_id: None,
-                }),
+                Query(LoadQuery {}),
                 Json(LoadRequest {
                     source: source.clone(),
                     auto_play: Some(true),
@@ -501,7 +496,14 @@ fn build_cors_layer(state: &AppState) -> CorsLayer {
     let allow_origin = if origins.iter().any(|o| o == "*") {
         AllowOrigin::any()
     } else {
-        AllowOrigin::list(origins.into_iter().map(|o| o.parse().unwrap()))
+        let mut valid_origins = Vec::new();
+        for origin in origins {
+            match origin.parse() {
+                Ok(parsed) => valid_origins.push(parsed),
+                Err(_) => tracing::warn!(origin = %origin, "CORS 配置含非法 origin，已忽略"),
+            }
+        }
+        AllowOrigin::list(valid_origins)
     };
     CorsLayer::new()
         .allow_origin(allow_origin)
@@ -612,8 +614,6 @@ async fn volume_handler(
 
 /// 获取流媒体音频 RAM 内存缓冲目录（优先 Linux /dev/shm 内存文件系统，彻底规避磁盘写入磨损与物理磁盘空间占用）
 fn get_stream_cache_dir() -> std::path::PathBuf {
-    use std::path::PathBuf;
-
     let candidate_dirs = [
         PathBuf::from("/dev/shm/splayer-headless-ram/streams"),
         std::env::temp_dir().join("splayer-stream-cache"),
@@ -746,7 +746,6 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<DirectInput> {
     use std::io::Read;
 
     let cache_dir = get_stream_cache_dir();
-    let _ = fs::create_dir_all(&cache_dir);
     clean_old_stream_cache(&cache_dir);
 
     let hash = format!("{:x}", md5::compute(url.as_bytes()));
@@ -879,10 +878,9 @@ fn direct_load_response(
 /// 加载音轨（完整三段式异步 IO 闭环）
 async fn load_handler(
     State(state): State<AppState>,
-    Query(query): Query<LoadQuery>,
+    Query(_query): Query<LoadQuery>,
     Json(payload): Json<LoadRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
-    let _ = query.cancel_handle_id;
     let auto_play = payload.auto_play.unwrap_or(true);
     let source = payload.source;
 
@@ -932,7 +930,7 @@ async fn load_handler(
         let direct_active = direct_selector.is_some() && player.direct_active();
         let current_direct_format = player.direct_format();
         let (direct_initial_take, token) = if direct_active {
-            (None, player.take_threads_only(handle.clone()))
+            (None, player.reserve_direct_handoff_token(handle.clone()))
         } else {
             let (old_threads, token) = player.take_for_async_load(handle.clone());
             (Some(old_threads), token)
@@ -1475,9 +1473,7 @@ async fn seek_handler(
                     auto_play: Some(was_playing),
                     meta: None,
                 };
-                let load_query = LoadQuery {
-                    cancel_handle_id: None,
-                };
+                let load_query = LoadQuery {};
                 load_handler(State(state), Query(load_query), Json(load_req)).await
             } else {
                 Ok(Json(PlayerResponse::ok(json!({
@@ -2549,7 +2545,6 @@ async fn diretta_target_info_handler(
         "dsd_max_bits": caps.dsd_max_bits,
         "dsd_min_channels": caps.dsd_min_channels,
         "dsd_max_channels": caps.dsd_max_channels,
-        "dsd_max_sample_rate": caps.dsd_max_sample_rate,
         "support_ms_mode": caps.support_ms_mode,
         "bit_perfect_supported": caps.supports_pcm || caps.supports_dsd,
         "available": true,

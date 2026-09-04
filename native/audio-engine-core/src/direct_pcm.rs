@@ -2250,12 +2250,13 @@ impl DirectPcmSource {
             .name("diretta-direct-decode".into())
             .spawn(move || {
                 // 绑定到 CPU 性能核心（ARM 大核 / x86 独立物理核）并设置 SCHED_FIFO 实时调度，
-                // 防止 PCM 解码推流线程被调度到效率核或超线程虚拟核造成推流抗跟　2
+                // 防止 PCM 解码推流线程被调度到效率核或超线程虚拟核，
+                // 避免推流跟不上实时时钟产生抖动（Jitter）
                 bind_current_thread_to_performance_cores("diretta-direct-decode");
                 boost_current_audio_thread("diretta-direct-decode");
                 let mut active_format = format;
                 let mut staged: Option<StagedPcmSource> = None;
-                let mut next_slot = 1 % producer_ring.slots.len();
+                let mut next_slot = 1; // slot 0 已被首帧占用
                 while !producer_ring.stopped.load(Ordering::Acquire) {
                     // 消费命令前清提示位：此后发送方的新命令会重新置位并唤醒
                     producer_ring
@@ -2276,7 +2277,7 @@ impl DirectPcmSource {
                                 producer_ring.failed.store(true, Ordering::Release);
                             }
                             let _ = response.send(result);
-                            next_slot = 1 % producer_ring.slots.len();
+                            next_slot = 1;
                             continue;
                         }
                         Ok(DirectPcmCommand::ReplaceLocal {
@@ -2292,7 +2293,7 @@ impl DirectPcmSource {
                                     active_format = new_format;
                                     staged = None;
                                     let _ = response.send(Ok(new_format));
-                                    next_slot = 1 % producer_ring.slots.len();
+                                    next_slot = 1;
                                 }
                                 Err(error) => {
                                     let _ = response.send(Err(error));
