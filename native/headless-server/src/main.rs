@@ -10,15 +10,13 @@ use headless_server::api::routes::build_router;
 use headless_server::config::Config;
 use headless_server::state::AppState;
 
-/// 服务默认监听地址 (默认绑定 0.0.0.0 允许局域网访问)
-const DEFAULT_ADDR: &str = "0.0.0.0:14558";
-
 /// 启动 HTTP 服务
 pub async fn start_server(config: Config) -> Result<SocketAddr> {
-    let addr = config
+    // 解析失败直接报错退出：静默回退默认地址会让写错的配置静默绑定全网卡
+    let addr: SocketAddr = config
         .listen_addr
         .parse()
-        .unwrap_or_else(|_| DEFAULT_ADDR.parse().expect("Invalid default address"));
+        .map_err(|e| anyhow::anyhow!("listen_addr 配置无效 '{}': {e}", config.listen_addr))?;
 
     let state = AppState::new(&config)?;
 

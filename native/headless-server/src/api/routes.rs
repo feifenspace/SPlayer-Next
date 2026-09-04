@@ -2162,81 +2162,95 @@ pub struct FilePathQuery {
     pub path: Option<String>,
 }
 
-/// 根据 ID 或缓存文件名获取封面流
+/// 根据 ID 或缓存文件名获取封面流（文件读取为阻塞 IO，隔离到独立线程）
 async fn cover_get_handler(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
     let cover_dir = state.config.resolved_cover_cache_dir();
-    let possible_paths = [
-        cover_dir.join(&id),
-        cover_dir.join(format!("{}.jpg", id)),
-        cover_dir.join(format!("{}.png", id)),
-    ];
+    spawn_isolated_blocking("cover-file-read", move || {
+        let possible_paths = [
+            cover_dir.join(&id),
+            cover_dir.join(format!("{}.jpg", id)),
+            cover_dir.join(format!("{}.png", id)),
+        ];
 
-    for p in &possible_paths {
-        if p.is_file() {
-            if let Ok(bytes) = std::fs::read(p) {
-                let content_type = if p.extension().map_or(false, |ext| ext == "png") {
-                    "image/png"
-                } else {
-                    "image/jpeg"
-                };
-                return (
-                    axum::http::StatusCode::OK,
-                    [
-                        (axum::http::header::CONTENT_TYPE, content_type),
-                        (
-                            axum::http::header::CACHE_CONTROL,
-                            "public, max-age=31536000, immutable",
-                        ),
-                    ],
-                    bytes,
-                )
-                    .into_response();
+        for p in &possible_paths {
+            if p.is_file() {
+                if let Ok(bytes) = std::fs::read(p) {
+                    let content_type = if p.extension().map_or(false, |ext| ext == "png") {
+                        "image/png"
+                    } else {
+                        "image/jpeg"
+                    };
+                    return (
+                        axum::http::StatusCode::OK,
+                        [
+                            (axum::http::header::CONTENT_TYPE, content_type),
+                            (
+                                axum::http::header::CACHE_CONTROL,
+                                "public, max-age=31536000, immutable",
+                            ),
+                        ],
+                        bytes,
+                    )
+                        .into_response();
+                }
             }
         }
-    }
 
-    axum::http::StatusCode::NOT_FOUND.into_response()
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(%e, "封面读取任务失败");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
 }
 
-/// 动态从本地音频文件提取内嵌封面流
+/// 动态从本地音频文件提取内嵌封面流（FFmpeg 探测为阻塞 IO，隔离到独立线程）
 async fn cover_file_handler(Query(query): Query<FilePathQuery>) -> axum::response::Response {
     let Some(path) = query.path else {
         return axum::http::StatusCode::BAD_REQUEST.into_response();
     };
 
-    let p = std::path::Path::new(&path);
-    if !p.is_file() {
-        return axum::http::StatusCode::NOT_FOUND.into_response();
-    }
+    spawn_isolated_blocking("cover-embed-read", move || {
+        let p = std::path::Path::new(&path);
+        if !p.is_file() {
+            return axum::http::StatusCode::NOT_FOUND.into_response();
+        }
 
-    if let Ok(file) = std::fs::File::open(&path) {
-        if let Ok(reader) = audio_engine_core::ffmpeg_audio::AudioReader::new(file) {
-            if let Some(pic_bytes) = audio_engine_core::metadata::read_attached_pic(&reader) {
-                let content_type = if pic_bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
-                    "image/png"
-                } else {
-                    "image/jpeg"
-                };
-                return (
-                    axum::http::StatusCode::OK,
-                    [
-                        (axum::http::header::CONTENT_TYPE, content_type),
-                        (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
-                    ],
-                    pic_bytes,
-                )
-                    .into_response();
+        if let Ok(file) = std::fs::File::open(&path) {
+            if let Ok(reader) = audio_engine_core::ffmpeg_audio::AudioReader::new(file) {
+                if let Some(pic_bytes) = audio_engine_core::metadata::read_attached_pic(&reader) {
+                    let content_type = if pic_bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                        "image/png"
+                    } else {
+                        "image/jpeg"
+                    };
+                    return (
+                        axum::http::StatusCode::OK,
+                        [
+                            (axum::http::header::CONTENT_TYPE, content_type),
+                            (axum::http::header::CACHE_CONTROL, "public, max-age=86400"),
+                        ],
+                        pic_bytes,
+                    )
+                        .into_response();
+                }
             }
         }
-    }
 
-    axum::http::StatusCode::NOT_FOUND.into_response()
+        axum::http::StatusCode::NOT_FOUND.into_response()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(%e, "内嵌封面提取任务失败");
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
 }
 
-/// 获取本地音频的内嵌歌词及同目录外部 .lrc 歌词
+/// 获取本地音频的内嵌歌词及同目录外部 .lrc 歌词（标签读取为阻塞 IO，隔离到独立线程）
 async fn lyric_file_handler(
     Query(query): Query<FilePathQuery>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
@@ -2244,32 +2258,36 @@ async fn lyric_file_handler(
         .path
         .ok_or_else(|| ApiError::bad_request("Missing path parameter"))?;
 
-    let p = std::path::Path::new(&path);
-    if !p.is_file() {
-        return Err(ApiError::not_found(&format!("File at {}", path)));
-    }
+    spawn_isolated_blocking("lyric-file-read", move || {
+        let p = std::path::Path::new(&path);
+        if !p.is_file() {
+            return Err(ApiError::not_found(&format!("File at {}", path)));
+        }
 
-    let embedded = audio_engine_core::metadata::read_tags(&path)
-        .ok()
-        .and_then(|t| t.lyrics);
+        let embedded = audio_engine_core::metadata::read_tags(&path)
+            .ok()
+            .and_then(|t| t.lyrics);
 
-    let external = audio_engine_core::metadata::find_all_external_lyrics(&path);
-    let external_json: Vec<Value> = external
-        .into_iter()
-        .map(|l| {
-            let content = std::fs::read_to_string(&l.path).unwrap_or_default();
-            json!({
-                "format": l.format,
-                "path": l.path,
-                "content": content,
+        let external = audio_engine_core::metadata::find_all_external_lyrics(&path);
+        let external_json: Vec<Value> = external
+            .into_iter()
+            .map(|l| {
+                let content = std::fs::read_to_string(&l.path).unwrap_or_default();
+                json!({
+                    "format": l.format,
+                    "path": l.path,
+                    "content": content,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    Ok(Json(PlayerResponse::ok(json!({
-        "embedded": embedded,
-        "external": external_json,
-    }))))
+        Ok(Json(PlayerResponse::ok(json!({
+            "embedded": embedded,
+            "external": external_json,
+        }))))
+    })
+    .await
+    .map_err(|e| ApiError::internal(e))?
 }
 
 /// 统一在线音源调用 Handler
@@ -2380,12 +2398,15 @@ async fn diretta_status_handler(
     }))))
 }
 
-/// 切换音频输出到指定的 Diretta Target 设备（或传入 null/空 恢复默认声卡）
+/// 切换音频输出到指定的 Diretta Target 设备（或传入 null/空 恢复默认声卡）。
+///
+/// 设备选择在**下一次 load 时生效**（当前曲目不受影响）；携带 target 时会做一次
+/// 可达性探测（隔离线程，最长 2-3s），结果仅写入响应不阻断登记——目标可能暂时
+/// 离线，用户可先登记待其上线
 async fn diretta_select_handler(
     State(state): State<AppState>,
     Json(payload): Json<DirettaSelectRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
-    let mut player = state.player.lock();
     let dev_name = payload.target.as_ref().and_then(|t| {
         let trimmed = t.trim();
         if trimmed.is_empty()
@@ -2403,11 +2424,26 @@ async fn diretta_select_handler(
         }
     });
 
+    let reachable = match &dev_name {
+        Some(target) => {
+            let target = target.clone();
+            spawn_isolated_blocking("diretta-select-verify", move || {
+                audio_engine_core::diretta::query_target_caps(&target).is_ok()
+            })
+            .await
+            .map_err(|e| ApiError::internal(e))?
+        }
+        None => true,
+    };
+
+    let mut player = state.player.lock();
     player.set_output_device(dev_name);
 
     Ok(Json(PlayerResponse::ok(json!({
         "status": "output_device_updated",
         "selected_device": player.selected_device(),
+        "takes_effect": "next_load",
+        "reachable": reachable,
     }))))
 }
 

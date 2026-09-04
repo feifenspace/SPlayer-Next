@@ -23,6 +23,16 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_default()
 });
 
+/// 流式音频代理专用 client：只限制连接建立超时，不设总超时——
+/// 慢速上游拉取 30-60MB FLAC 时总超时会在 10s 处硬截断音频流
+static STREAM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(4)
+        .build()
+        .unwrap_or_default()
+});
+
 /// 单例全局 ncm-api-rs Router
 static NCM_ROUTER: LazyLock<axum::Router> = LazyLock::new(|| {
     let client = ApiClient::new(None);
@@ -798,7 +808,7 @@ pub async fn stream_proxy_handler(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<StreamProxyQuery>,
 ) -> Response {
-    let mut req_builder = HTTP_CLIENT.get(&query.url);
+    let mut req_builder = STREAM_CLIENT.get(&query.url);
 
     if let Some(range) = headers.get(header::RANGE) {
         req_builder = req_builder.header(header::RANGE, range);

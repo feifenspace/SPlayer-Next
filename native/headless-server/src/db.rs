@@ -243,9 +243,14 @@ pub fn add_scan_dir(conn: &Connection, path: &str) -> Result<()> {
 /// 删除扫描目录及目录下所有关联歌曲
 pub fn remove_scan_dir(conn: &Connection, path: &str) -> Result<()> {
     conn.execute("DELETE FROM scan_dirs WHERE path = ?1", params![path])?;
-    let pattern = format!("{}%", path);
+    // LIKE 通配符转义：路径中的 %/_ 按字面匹配，防止越界删除其它目录的曲目
+    let escaped = path
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("{escaped}%");
     conn.execute(
-        "DELETE FROM tracks WHERE path LIKE ?1 OR path = ?2",
+        "DELETE FROM tracks WHERE path LIKE ?1 ESCAPE '\\' OR path = ?2",
         params![pattern, path],
     )?;
     Ok(())
@@ -1254,6 +1259,12 @@ pub fn record_play_history(
         VALUES (?1, ?2, ?3, ?4, ?5)
         "#,
         params![track_id, source, started_at, listened_ms, track_json],
+    )?;
+    // 7×24 常驻防膨胀：每次插入后裁剪，只保留最近 5000 条
+    conn.execute(
+        "DELETE FROM play_history WHERE rowid NOT IN \
+         (SELECT rowid FROM play_history ORDER BY started_at DESC LIMIT 5000)",
+        [],
     )?;
     Ok(())
 }
