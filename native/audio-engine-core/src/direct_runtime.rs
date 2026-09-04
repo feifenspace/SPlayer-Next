@@ -54,6 +54,16 @@ impl DirectMonitor {
         }
     }
 
+    /// 等待设备消费的数据块数（READY + IN_FLIGHT）。Fake 监视器无 ring，恒为 0
+    pub fn pending_blocks(&self) -> usize {
+        match self {
+            Self::Pcm(value) => value.pending_blocks(),
+            Self::Dsd(value) => value.pending_blocks(),
+            #[cfg(test)]
+            Self::Fake(_) => 0,
+        }
+    }
+
     pub fn finished(&self) -> bool {
         match self {
             Self::Pcm(value) => value.finished(),

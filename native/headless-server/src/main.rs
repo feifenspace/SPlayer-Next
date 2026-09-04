@@ -22,6 +22,8 @@ pub async fn start_server(config: Config) -> Result<SocketAddr> {
 
     let state = AppState::new(&config)?;
 
+    headless_server::api::routes::spawn_output_recovery_watchdog(state.clone());
+
     let app = build_router(state);
 
     let listener = TcpListener::bind(&addr)

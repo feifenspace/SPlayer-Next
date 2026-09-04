@@ -102,6 +102,13 @@ impl InnerPlayer {
             };
             let handle = thread::spawn(move || {
                 let mut last_transition_count = initial_transition_count;
+                // 停滞检测：消费位置连续 STALL_THRESHOLD_TICKS 次未动且仍有待消费
+                // 数据 → 设备端不再拉流（链路停滞）；待消费为零是 SDK 等解码补数
+                // 据，不视为停滞。首块消费前不计（Direct 启动握手可能慢于 1.2s）
+                const STALL_THRESHOLD_TICKS: u32 = 6; // 6 * 200ms = 1.2s
+                let mut last_consumed = 0.0_f64;
+                let mut first_consumed_seen = false;
+                let mut stall_ticks: u32 = 0;
                 while !stop_flag.load(Ordering::Relaxed) {
                     let transition_count = monitor.transition_count();
                     if transition_count != last_transition_count {
@@ -134,6 +141,26 @@ impl InnerPlayer {
                         });
                         break;
                     }
+
+                    let consumed = monitor.consumed_position();
+                    if consumed > 0.0 {
+                        first_consumed_seen = true;
+                    }
+                    if first_consumed_seen
+                        && consumed == last_consumed
+                        && monitor.pending_blocks() > 0
+                    {
+                        stall_ticks += 1;
+                        if stall_ticks >= STALL_THRESHOLD_TICKS {
+                            cb(PlayerEvent::OutputStalled);
+                            // 发完归零，由恢复方冷却防抖
+                            stall_ticks = 0;
+                        }
+                    } else {
+                        stall_ticks = 0;
+                    }
+                    last_consumed = consumed;
+
                     sleep_unless_stopped(&stop_flag, Duration::from_millis(200));
                 }
             });

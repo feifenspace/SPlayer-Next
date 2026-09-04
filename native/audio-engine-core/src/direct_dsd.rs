@@ -957,6 +957,22 @@ impl DirectDsdMonitor {
         self.ring.failed.load(Ordering::Acquire)
     }
 
+    /// 等待设备消费的数据块数（READY + IN_FLIGHT）。
+    /// 停滞检测用：消费冻结且仍有待消费数据 = 链路不取数；
+    /// 待消费为零的冻结 = SDK 等解码补数据，不算链路故障
+    pub fn pending_blocks(&self) -> usize {
+        self.ring
+            .slots
+            .iter()
+            .filter(|slot| {
+                matches!(
+                    slot.state.load(Ordering::Acquire),
+                    SLOT_READY | SLOT_IN_FLIGHT
+                )
+            })
+            .count()
+    }
+
     pub fn finished(&self) -> bool {
         self.ring.finished.load(Ordering::Acquire)
             && self.ring.in_flight.load(Ordering::Acquire) == NO_SLOT

@@ -68,6 +68,9 @@ pub struct AppState {
     pub scan_tx: broadcast::Sender<ScanProgressMessage>,
     pub is_scanning: Arc<std::sync::atomic::AtomicBool>,
     pub scan_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// 输出停滞/失败恢复请求（最后一次请求的 Unix 毫秒时间戳，0 = 无请求）。
+    /// 事件回调置位，由输出恢复看门狗消费——回调线程禁止锁 player 或触发 async
+    pub output_recovery_requested: Arc<std::sync::atomic::AtomicU64>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
     snapshot: Arc<RwLock<Option<WsState>>>,
 }
@@ -94,11 +97,13 @@ impl AppState {
         let snapshot: Arc<RwLock<Option<WsState>>> = Arc::new(RwLock::new(None));
         let is_scanning = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scan_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let output_recovery_requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // 回调可能在播放器内部线程触发，不能在这里再次 lock player。
         let callback: EventEmitter = {
             let ws_tx = ws_tx.clone();
             let snapshot = Arc::clone(&snapshot);
+            let output_recovery_requested = Arc::clone(&output_recovery_requested);
             Arc::new(move |event: PlayerEvent| {
                 // 先 clone 一份当前快照，避免持有读锁跨越后续写锁操作
                 let current: Option<WsState> = snapshot.read().clone();
@@ -164,8 +169,18 @@ impl AppState {
                             "generation": generation,
                         }));
                     }
-                    // 输出停滞/失败：InnerPlayer 已通过 failure 回调异步重建输出流，WS 侧无需动作
-                    PlayerEvent::OutputStalled | PlayerEvent::OutputFailed => {}
+                    // 输出停滞/失败：置恢复请求标志交由输出恢复看门狗全量重载，
+                    // 并向 WS 转发供客户端感知（InnerPlayer 核心不会自行重建输出）
+                    PlayerEvent::OutputStalled | PlayerEvent::OutputFailed => {
+                        let kind = if matches!(event, PlayerEvent::OutputFailed) {
+                            "outputFailed"
+                        } else {
+                            "outputStalled"
+                        };
+                        output_recovery_requested
+                            .store(unix_millis(), std::sync::atomic::Ordering::Release);
+                        let _ = ws_tx.send(serde_json::json!({ "type": kind }));
+                    }
                     #[allow(unreachable_patterns)]
                     _ => {}
                 }
@@ -181,6 +196,7 @@ impl AppState {
             scan_tx,
             is_scanning,
             scan_cancel,
+            output_recovery_requested,
             snapshot,
         })
     }
@@ -205,4 +221,12 @@ impl AppState {
             current_source: player.current_source().map(String::from),
         }
     }
+}
+
+/// 当前 Unix 毫秒时间戳
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
