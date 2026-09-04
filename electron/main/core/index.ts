@@ -19,7 +19,6 @@ import { initDatabase, closeDatabase } from "@main/database";
 import { init as initSongCache } from "@main/services/songCache";
 import { init as initDownload } from "@main/services/downloadManager";
 import { pluginRegistry } from "@main/plugins/registry";
-import { isHeadless } from "./mode";
 import {
   init as initPlaybackBridge,
   dispose as disposePlaybackBridge,
@@ -42,12 +41,6 @@ import { extractAudioFiles, captureAudioFiles } from "@main/services/externalFil
 const configureMemoryOptimizations = (): void => {
   // 禁止预热备用渲染进程
   app.commandLine.appendSwitch("disable-features", "SpareRendererForSitePerProcess");
-  if (isHeadless()) {
-    // 真正的无窗口运行不应依赖 X11/Wayland，也不需要 GPU 辅助进程。
-    app.commandLine.appendSwitch("headless");
-    app.commandLine.appendSwitch("disable-gpu");
-    app.disableHardwareAcceleration();
-  }
 };
 
 /** 内存指标采样间隔 */
@@ -141,16 +134,13 @@ export const initApp = (): void => {
     if (coldOrpheusUrl) captureOrpheusUrl(coldOrpheusUrl);
     const coldAudioFiles = extractAudioFiles(process.argv);
     if (coldAudioFiles.length > 0) captureAudioFiles(coldAudioFiles);
-    // 仅在非无头模式创建主窗口
-    if (!isHeadless()) {
-      createMainWindow();
-      // 恢复歌词相关窗口
-      restoreLyricWindows();
-      // 注册全局快捷键
-      initGlobalHotkey();
-    }
+    createMainWindow();
+    // 恢复歌词相关窗口
+    restoreLyricWindows();
+    // 注册全局快捷键
+    initGlobalHotkey();
 
-    // 启动外部 API 服务（无论是否无头均启动）
+    // 启动外部 API 服务
     void startServer();
     // 启动 AI 集成 MCP 服务
     void startMcpServer();
