@@ -109,5 +109,59 @@ describe("Client Adaptation Layer", () => {
 
       client.destroy();
     });
+
+    it("should parse v2 envelope messages (snapshot / state / ended)", () => {
+      const client = new HttpPlayerClient("http://127.0.0.1:14558", "ws://127.0.0.1:14558/ws");
+      const events: PlayerEvent[] = [];
+      client.onEvent((e) => events.push(e));
+
+      // snapshot 信封（ws 500ms tick）
+      (client as any).handleWsMessage({
+        type: "snapshot",
+        data: { state: "playing", position: 1.5, duration: 200.0, volume: 0.8, speed: 1.0 },
+      });
+      const positionEvents = events.filter((e) => e.type === "position");
+      const statusEvents = events.filter((e) => e.type === "status");
+      expect(positionEvents).toHaveLength(1);
+      expect((positionEvents[0] as any).data).toEqual({ position: 1500, duration: 200000 });
+      expect((statusEvents[0] as any).data).toEqual({
+        state: "playing",
+        position: 1500,
+        duration: 200000,
+        volume: 0.8,
+        isFinished: false,
+        speed: 1.0,
+      });
+
+      // state 信封（事件触发的状态更新）
+      (client as any).handleWsMessage({
+        type: "state",
+        data: { state: "paused", position: 2, duration: 200, volume: 1.0 },
+      });
+      expect(events.filter((e) => e.type === "status")).toHaveLength(2);
+      const lastStatus = (events.filter((e) => e.type === "status").pop() as any).data;
+      expect(lastStatus.state).toBe("paused");
+
+      // ended 信封
+      (client as any).handleWsMessage({ type: "ended", data: {} });
+      expect(events.filter((e) => e.type === "ended")).toHaveLength(1);
+
+      // outputFailed 信封（服务端自恢复，客户端不产生事件）
+      (client as any).handleWsMessage({ type: "outputFailed", data: {} });
+      expect(events.filter((e) => e.type === "ended")).toHaveLength(1);
+
+      client.destroy();
+    });
+
+    it("should keep legacy bare-format parsing working alongside the v2 envelope", () => {
+      const client = new HttpPlayerClient("http://127.0.0.1:14558", "ws://127.0.0.1:14558/ws");
+      const events: PlayerEvent[] = [];
+      client.onEvent((e) => events.push(e));
+
+      (client as any).handleWsMessage({ state: "playing", position: 0.5, duration: 10 });
+      expect(events.filter((e) => e.type === "position")).toHaveLength(1);
+
+      client.destroy();
+    });
   });
 });

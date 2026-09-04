@@ -199,7 +199,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                 state.player.lock().enter_paused_for_recovery();
                 let _ = state.ws_tx.send(serde_json::json!({
                     "type": "outputRecoveryFailed",
-                    "source": source,
+                    "data": { "source": source },
                 }));
                 suppressed_since = Some(std::time::Instant::now());
                 episode_active = false;
@@ -2321,7 +2321,7 @@ async fn ws_run(mut socket: WebSocket, state: AppState) {
             _ = interval.tick() => {
                 // 定时推送当前播放器快照
                 let snapshot = state.snapshot();
-                let payload = serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into());
+                let payload = serde_json::json!({ "type": "snapshot", "data": snapshot }).to_string();
                 if socket.send(Message::Text(payload.into())).await.is_err() {
                     break;
                 }
@@ -2335,10 +2335,11 @@ async fn ws_run(mut socket: WebSocket, state: AppState) {
             }
             Ok(scan_msg) = rx_scan.recv() => {
                 // 推送扫描进度与完成事件
-                let payload = serde_json::to_string(&json!({
-                    "event": "scan_progress",
+                let payload = serde_json::json!({
+                    "type": "scanProgress",
                     "data": scan_msg,
-                })).unwrap_or_else(|_| "{}".into());
+                })
+                .to_string();
                 if socket.send(Message::Text(payload.into())).await.is_err() {
                     break;
                 }

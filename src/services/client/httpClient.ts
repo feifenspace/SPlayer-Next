@@ -176,6 +176,53 @@ export class HttpPlayerClient implements IPlayerClient {
   private scanProgressListeners = new Set<(event: any) => void>();
 
   private handleWsMessage(msg: any): void {
+    // v2 统一信封：{type, data}（headless-server ws 协议）
+    if (msg && typeof msg.type === "string" && "data" in msg && !("event" in msg)) {
+      switch (msg.type) {
+        case "snapshot":
+        case "state":
+          if (msg.data && typeof msg.data.state === "string") {
+            this.emitStatusAndPosition(msg.data);
+          }
+          break;
+        case "ended":
+          this.emitEvent({ type: "ended" });
+          break;
+        case "sourceError":
+          this.emitEvent({ type: "sourceError" });
+          break;
+        case "directTrackBoundary":
+          if (msg.data?.duration != null) {
+            // 服务端时长为秒，桌面协议为毫秒，此处对齐
+            this.emitEvent({
+              type: "directTrackBoundary",
+              data: {
+                duration: Math.round(msg.data.duration * 1000),
+                generation: Number(msg.data.generation ?? 0),
+              },
+            });
+          }
+          break;
+        case "scanProgress":
+          if (msg.data) {
+            for (const listener of this.scanProgressListeners) {
+              try {
+                listener(msg.data);
+              } catch (e) {
+                console.error("[HttpClient] Error in scan listener", e);
+              }
+            }
+          }
+          break;
+        // outputFailed / outputStalled / outputRecoveryFailed / nextCandidateChanged：
+        // 服务端自行恢复与记录，客户端暂无消费方
+        default:
+          break;
+      }
+      return;
+    }
+
+    // v1 兼容（旧服务端裸格式）
     if (msg.event === "scan_progress" && msg.data) {
       for (const listener of this.scanProgressListeners) {
         try {
@@ -220,10 +267,21 @@ export class HttpPlayerClient implements IPlayerClient {
     }
 
     if (!msg || typeof msg.state !== "string") return;
+    this.emitStatusAndPosition(msg);
+  }
 
-    const currentState = this.normalizeState(msg.state);
-    const posMs = Math.round((msg.position || 0) * 1000);
-    const durMs = Math.round((msg.duration || 0) * 1000);
+  /** 状态数据（秒）→ position + status 事件（毫秒，对齐桌面协议） */
+  private emitStatusAndPosition(data: {
+    state: string;
+    position?: number;
+    duration?: number;
+    volume?: number;
+    is_finished?: boolean;
+    speed?: number;
+  }): void {
+    const currentState = this.normalizeState(data.state);
+    const posMs = Math.round((data.position || 0) * 1000);
+    const durMs = Math.round((data.duration || 0) * 1000);
 
     // 1. 推送位置
     this.emitEvent({
@@ -241,9 +299,9 @@ export class HttpPlayerClient implements IPlayerClient {
         state: currentState,
         position: posMs,
         duration: durMs,
-        volume: msg.volume ?? 1.0,
-        isFinished: Boolean(msg.is_finished),
-        speed: Number(msg.speed ?? 1.0),
+        volume: data.volume ?? 1.0,
+        isFinished: Boolean(data.is_finished),
+        speed: Number(data.speed ?? 1.0),
       },
     });
   }

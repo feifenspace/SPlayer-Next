@@ -116,8 +116,8 @@ impl AppState {
                             state,
                         };
                         *snapshot.write() = Some(ws_state.clone());
-                        if let Ok(val) = serde_json::to_value(&ws_state) {
-                            let _ = ws_tx.send(val);
+                        if let Ok(data) = serde_json::to_value(&ws_state) {
+                            let _ = ws_tx.send(serde_json::json!({ "type": "state", "data": data }));
                         }
                     }
                     PlayerEvent::Position { position, duration } => {
@@ -131,8 +131,8 @@ impl AppState {
                                 .unwrap_or(PlayerState::Idle),
                         };
                         *snapshot.write() = Some(ws_state.clone());
-                        if let Ok(val) = serde_json::to_value(&ws_state) {
-                            let _ = ws_tx.send(val);
+                        if let Ok(data) = serde_json::to_value(&ws_state) {
+                            let _ = ws_tx.send(serde_json::json!({ "type": "state", "data": data }));
                         }
                     }
                     PlayerEvent::Ended => {
@@ -143,7 +143,7 @@ impl AppState {
                             state: PlayerState::Stopped,
                         };
                         *snapshot.write() = Some(ws_state);
-                        let _ = ws_tx.send(serde_json::json!({ "type": "ended" }));
+                        let _ = ws_tx.send(serde_json::json!({ "type": "ended", "data": {} }));
                     }
                     PlayerEvent::SourceError => {
                         let ws_state = WsState {
@@ -153,7 +153,7 @@ impl AppState {
                             state: PlayerState::Idle,
                         };
                         *snapshot.write() = Some(ws_state);
-                        let _ = ws_tx.send(serde_json::json!({ "type": "sourceError" }));
+                        let _ = ws_tx.send(serde_json::json!({ "type": "sourceError", "data": {} }));
                     }
                     PlayerEvent::DirectTrackBoundary { duration, generation } => {
                         let ws_state = WsState {
@@ -165,8 +165,7 @@ impl AppState {
                         *snapshot.write() = Some(ws_state);
                         let _ = ws_tx.send(serde_json::json!({
                             "type": "directTrackBoundary",
-                            "duration": duration,
-                            "generation": generation,
+                            "data": { "duration": duration, "generation": generation },
                         }));
                     }
                     // 输出停滞/失败：置恢复请求标志交由输出恢复看门狗全量重载，
@@ -179,7 +178,7 @@ impl AppState {
                         };
                         output_recovery_requested
                             .store(unix_millis(), std::sync::atomic::Ordering::Release);
-                        let _ = ws_tx.send(serde_json::json!({ "type": kind }));
+                        let _ = ws_tx.send(serde_json::json!({ "type": kind, "data": {} }));
                     }
                     #[allow(unreachable_patterns)]
                     _ => {}
