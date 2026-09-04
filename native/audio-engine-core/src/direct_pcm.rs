@@ -2120,6 +2120,13 @@ impl DirectPcmMonitor {
     pub fn boundary_generation(&self) -> u64 {
         self.ring.boundary_generation.load(Ordering::Acquire)
     }
+
+    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
+    /// 句柄持有 ring 的 Arc 引用，供调用方在 player 锁外排空
+    pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        self.ring
+            .wait_for(|ring| ring.fade.drained(min_blocks), timeout)
+    }
 }
 
 #[derive(Clone)]

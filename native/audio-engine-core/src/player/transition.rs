@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use crate::audio_output::AudioOutput;
 use crate::decoder;
 #[cfg(any(feature = "diretta", test))]
-use crate::direct_runtime::{DirectFormat, DirectPlayback};
+use crate::direct_runtime::{DirectFormat, DirectMonitor, DirectPlayback};
 use crate::equalizer::Equalizer;
 use crate::metadata::AudioMetadata;
 use crate::playback::PlaybackHandle;
@@ -15,6 +15,7 @@ use crate::tempo::StretchProcessor;
 use anyhow::Result;
 use ffmpeg_audio::HttpCancelHandle;
 use parking_lot::Mutex;
+use tracing::debug;
 
 use super::{InnerPlayer, PlayerEvent, PlayerState};
 
@@ -475,17 +476,79 @@ impl InnerPlayer {
         }
     }
 
-    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
-    /// 无连接 / 非播放态立即返回 true（暂停态 handoff 无需排空）。
+    /// 取 Direct 排空等待句柄：None = 无需排空（无连接/非播放态）。
+    /// 句柄持有 ring 的 Arc 引用——排空最长可等 600ms，
+    /// 调用方必须在释放 player 锁之后用它等待
     #[cfg(any(feature = "diretta", test))]
-    pub fn direct_wait_fade_drained(&self, min_blocks: u32, timeout: std::time::Duration) -> bool {
-        match &self.direct_playback {
-            None => true,
-            Some(playback) => {
-                self.state != PlayerState::Playing
-                    || playback.wait_fade_drained(min_blocks, timeout)
+    pub fn direct_drain_handle(&self) -> Option<DirectMonitor> {
+        if self.state != PlayerState::Playing {
+            return None;
+        }
+        self.direct_playback.as_ref().map(DirectPlayback::monitor)
+    }
+
+    /// Direct 载入编排（headless 与 NAPI 两侧调用方共用）：
+    /// 淡出旧源 → 锁外排空 → 块边界原子换源。
+    ///
+    /// 返回：
+    /// - `Ok(Some(format))`：已切到新源，连接复用成功
+    /// - `Ok(None)`：token 被更新的 load/stop 抢占（LoadSuperseded）
+    /// - `Err`：换源失败（典型 wire 格式不一致），连接保持原状（可能已淡出静音），
+    ///   调用方应回退 take_for_async_load 全量重连
+    ///
+    /// 淡出与提交分段持锁；最长 600ms 的排空等待在 player 锁外进行
+    #[cfg(any(feature = "diretta", test))]
+    pub fn try_direct_handoff(
+        player: &Mutex<InnerPlayer>,
+        token: u64,
+        source: &str,
+        duration_secs: f64,
+        auto_play: bool,
+        current_format: DirectFormat,
+        metadata: &AudioMetadata,
+        is_dsd: bool,
+    ) -> Result<Option<DirectFormat>> {
+        // 格式预检：家族（PCM/DSD）+ 采样率 + 声道一致才值得做淡出换源。
+        // stream 模式元数据为占位 0 值：跳过对应粗检，由换源时的权威校验兜底
+        let family_matches = match current_format {
+            DirectFormat::Pcm(cur) => {
+                !is_dsd
+                    && (metadata.original_sample_rate == 0
+                        || cur.sample_rate == metadata.original_sample_rate)
+                    && (metadata.channels == 0 || cur.channels == metadata.channels)
+            }
+            DirectFormat::Dsd(cur) => {
+                is_dsd && (metadata.channels == 0 || cur.channels == metadata.channels)
+            }
+        };
+        anyhow::ensure!(
+            family_matches,
+            "[Direct] handoff 格式预检不通过，回退全量重连"
+        );
+
+        // 1) 源级淡出（暂停态为无害 no-op）；短锁取排空句柄
+        let drain = {
+            let mut player = player.lock();
+            let _ = player.begin_direct_fade_out();
+            player.direct_drain_handle()
+        };
+        // 2) 锁外事件驱动排空：渐零完成 + 交付足量数字静音块（顶掉设备端
+        //    缓冲里的旧音频尾巴）；暂停态/无连接时句柄为 None 瞬时通过
+        if let Some(monitor) = &drain {
+            if !monitor.wait_fade_drained(
+                crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                crate::direct_runtime::DIRECT_FADE_DRAIN_TIMEOUT,
+            ) {
+                debug!(
+                    target: "diretta_handoff",
+                    phase = "handoff_fade_drain_timeout",
+                    "淡出排空等待超时，仍尝试 commit（块边界校验兜底）"
+                );
             }
         }
+        // 3) 块边界原子换源（格式不一致时 Err，旧连接保持静音原状）
+        let mut player = player.lock();
+        player.commit_direct_handoff(token, source, duration_secs, auto_play)
     }
 
     /// 同格式 Direct handoff 提交：保留 Diretta 连接，生产者线程在块边界原子换源。

@@ -99,10 +99,10 @@ const _: fn() = || {
 
 /// Direct 关流排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
 #[cfg(any(feature = "diretta", test))]
-const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
+pub const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
 /// Direct 关流排空的事件等待上限（超时兜底，正常远快于此值）
 #[cfg(any(feature = "diretta", test))]
-const DIRECT_FADE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+pub const DIRECT_FADE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl InnerPlayer {
     /// 未初始化时通过 `AudioOutput::new` 懒构造音频输出。
@@ -513,29 +513,37 @@ impl InnerPlayer {
     }
 
     fn stop_internal(&mut self) {
-        #[cfg(any(feature = "diretta", test))]
         // 0. Direct 连接关流前先源级淡出 + 事件驱动排空：
         //    等待渐零完成并交付足量静音块（顶掉设备端缓冲里的旧音频），
         //    DAC 端在数字静音中收到流结束，避免关流瞬间的爆音。
-        //    无固定 sleep：静音块由 SDK 回调逐块交付并逐块唤醒（fake/暂停态瞬时通过）
-        if self.state == PlayerState::Playing {
-            if let Some(playback) = self.direct_playback.as_ref() {
+        //    排空（最长 600ms）与 SDK 关流（disconnectWait 无上界）都不占用
+        //    全局 player 锁：移交独立线程按"先排空后 drop"顺序执行，stop 立即返回；
+        //    spawn 失败时闭包就地 drop，退化为同步关闭
+        #[cfg(any(feature = "diretta", test))]
+        if let Some(playback) = self.direct_playback.take() {
+            self.output = None;
+            let was_playing = self.state == PlayerState::Playing;
+            if was_playing {
                 playback.begin_fade_out();
-                let _ = playback.wait_fade_drained(
-                    DIRECT_FADE_DRAIN_MIN_BLOCKS,
-                    DIRECT_FADE_DRAIN_TIMEOUT,
-                );
             }
+            let drain = was_playing.then(|| playback.monitor());
+            let _ = std::thread::Builder::new()
+                .name("direct-playback-close".into())
+                .spawn(move || {
+                    if let Some(monitor) = drain {
+                        monitor.wait_fade_drained(
+                            DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                            DIRECT_FADE_DRAIN_TIMEOUT,
+                        );
+                    }
+                    drop(playback);
+                });
         }
         // 1. 取消渐变并等待渐变线程退出（释放 Arc<Sink>）
         self.cancel_fade();
         // 2. 停止定时器并等待线程退出（释放 Arc<Shared> 和 Arc<EventEmitter>）
         self.stop_position_timer();
         self.stop_fft_timer();
-        #[cfg(any(feature = "diretta", test))]
-        if self.direct_playback.take().is_some() {
-            self.output = None;
-        }
         // 3. 通知解码线程停止
         if let Some(ref shared) = self.shared {
             shared.stop();

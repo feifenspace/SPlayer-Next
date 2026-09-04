@@ -23,6 +23,11 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
+use audio_engine_core::direct_runtime::{
+    is_native_dsd_source, DirectLoadOutcome, DIRECT_FADE_DRAIN_MIN_BLOCKS,
+    DIRECT_FADE_DRAIN_TIMEOUT, DIRECT_FULL_RECONNECT_STABILIZATION,
+};
+use audio_engine_core::LoadSuperseded;
 use crate::error::ApiError;
 use crate::state::{AppState, PlayerSnapshot};
 
@@ -840,23 +845,6 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
     Ok(target_file.to_string_lossy().to_string())
 }
 
-const LOAD_SUPERSEDED_REASON: &str = "Load superseded by a newer request";
-
-/// Direct handoff/拆连接前排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
-const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
-/// Direct 排空的事件等待上限（超时兜底，正常远快于此值）
-const DIRECT_FADE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
-
-/// Direct 载入结果：handoff（连接复用，已在任务内 commit）或全量重连（待 commit）
-enum DirectLoadOutcome {
-    Handoff(Box<audio_engine_core::AudioMetadata>),
-    FullReconnect {
-        metadata: Box<audio_engine_core::AudioMetadata>,
-        playback: audio_engine_core::direct_runtime::DirectPlayback,
-        token: u64,
-    },
-}
-
 /// Direct 载入成功后的统一响应体
 fn direct_load_response(
     source: &str,
@@ -883,74 +871,8 @@ fn direct_load_response(
     })))
 }
 
-/// 源扩展名判断是否 DSD 原生流（DSF/DFF/SACD ISO）
-fn is_native_dsd_source(source: &str) -> bool {
-    let lowered = source.to_lowercase();
-    [".dsf", ".dff"].iter().any(|ext| lowered.contains(ext))
-        || source.contains(".iso|")
-        || source.contains(".ISO|")
-}
-
-/// 播放中同格式 handoff：淡出旧源 → 静音预填 → 块边界原子换源。
-/// 返回 Ok(format) 表示已 commit；Err 表示应回退全量重连。
-#[allow(clippy::too_many_arguments)]
-fn try_direct_handoff_sequence(
-    state: &AppState,
-    token: u64,
-    source: &str,
-    duration_secs: f64,
-    auto_play: bool,
-    current_format: audio_engine_core::direct_runtime::DirectFormat,
-    metadata: &audio_engine_core::AudioMetadata,
-    is_dsd: bool,
-) -> Result<
-    audio_engine_core::direct_runtime::DirectFormat,
-    anyhow::Error,
-> {
-    // 格式预检：家族（PCM/DSD）+ 采样率 + 声道一致才值得做淡出换源。
-    // stream 模式无法廉价探测时元数据为 0 值：跳过对应粗检，
-    // 由 replace_pcm_ring 的 same_pcm_transport 做权威校验（storage_bits/sample_format），失败即回退
-    let family_matches = match current_format {
-        audio_engine_core::direct_runtime::DirectFormat::Pcm(cur) => {
-            !is_dsd
-                && (metadata.original_sample_rate == 0
-                    || cur.sample_rate == metadata.original_sample_rate)
-                && (metadata.channels == 0 || cur.channels == metadata.channels)
-        }
-        audio_engine_core::direct_runtime::DirectFormat::Dsd(cur) => {
-            is_dsd && (metadata.channels == 0 || cur.channels == metadata.channels)
-        }
-    };
-    anyhow::ensure!(
-        family_matches,
-        "[Direct] handoff 格式预检不通过，回退全量重连"
-    );
-
-    // 1) 源级淡出（暂停态为无害 no-op）
-    {
-        let mut player = state.player.lock();
-        let _ = player.begin_direct_fade_out();
-    }
-    // 2) 事件驱动排空：渐零完成 + 交付足量数字静音块（顶掉设备端缓冲里的旧音频尾巴）。
-    //    SDK 回调逐块交付并逐块唤醒，无固定 sleep；暂停态/无连接瞬时通过
-    if !state
-        .player
-        .lock()
-        .direct_wait_fade_drained(DIRECT_FADE_DRAIN_MIN_BLOCKS, DIRECT_FADE_DRAIN_TIMEOUT)
-    {
-        tracing::warn!(
-            target: "diretta_handoff",
-            phase = "handoff_fade_drain_timeout",
-            "淡出排空等待超时，仍尝试 commit（块边界校验兜底）"
-        );
-    }
-    // 3) 块边界原子换源（格式不一致时 Err，旧连接保持静音原状）
-    let mut player = state.player.lock();
-    match player.commit_direct_handoff(token, source, duration_secs, auto_play)? {
-        Some(format) => Ok(format),
-        None => anyhow::bail!(LOAD_SUPERSEDED_REASON),
-    }
-}
+/// 播放中同格式 handoff 编排已下沉 core（InnerPlayer::try_direct_handoff），
+/// headless 与桌面 NAPI 共用同一实现
 
 /// 加载音轨（完整三段式异步 IO 闭环）
 async fn load_handler(
@@ -1077,13 +999,8 @@ async fn load_handler(
                 || source_for_direct.starts_with("https://");
             // DSD 原生流（DSF/DFF/SACD ISO）需要 seekable 输入做 chunk 定位，
             // stream 模式下强制走 preload（memfd/磁盘缓存）
-            let is_dsd_stream = [".dsf", ".dff"]
-                .iter()
-                .any(|ext| source_for_direct.to_lowercase().contains(ext))
-                || source_for_direct.contains(".iso|")
-                || source_for_direct.contains(".ISO|");
-            let stream_mode = is_http && source_mode == "stream" && !is_dsd_stream;
-            let is_dsd = is_dsd_stream || is_native_dsd_source(&source_for_direct);
+            let is_dsd = is_native_dsd_source(&source_for_direct);
+            let stream_mode = is_http && source_mode == "stream" && !is_dsd;
 
             // ---- 阶段 1：探测新源元数据（handoff 粗检需要 sample_rate/channels）----
             // stream 模式无法廉价探测：占位元数据 + 换源时的权威校验兜底
@@ -1102,7 +1019,7 @@ async fn load_handler(
                         handle.clone(),
                     )?;
                     if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
-                        anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                        anyhow::bail!(LoadSuperseded);
                     }
                     meta
                 }
@@ -1117,8 +1034,8 @@ async fn load_handler(
             if direct_active {
                 let current_format = direct_format_snapshot
                     .expect("direct_active 时必须携带当前连接格式快照");
-                match try_direct_handoff_sequence(
-                    &state_for_task,
+                match audio_engine_core::InnerPlayer::try_direct_handoff(
+                    &state_for_task.player,
                     token,
                     &source_for_direct,
                     metadata.duration_secs,
@@ -1127,7 +1044,7 @@ async fn load_handler(
                     &metadata,
                     is_dsd,
                 ) {
-                    Ok(format) => {
+                    Ok(Some(format)) => {
                         match format {
                             audio_engine_core::direct_runtime::DirectFormat::Pcm(format) => {
                                 metadata.sample_rate = format.sample_rate;
@@ -1150,8 +1067,9 @@ async fn load_handler(
                         );
                         return Ok(DirectLoadOutcome::Handoff(Box::new(metadata)));
                     }
+                    Ok(None) => anyhow::bail!(LoadSuperseded),
                     Err(err) => {
-                        if format!("{err:#}").contains(LOAD_SUPERSEDED_REASON) {
+                        if err.is::<LoadSuperseded>() {
                             return Err(err);
                         }
                         tracing::warn!(
@@ -1174,25 +1092,25 @@ async fn load_handler(
                         let mut player = state_for_task.player.lock();
                         let _ = player.begin_direct_fade_out();
                     }
-                    if !state_for_task
-                        .player
-                        .lock()
-                        .direct_wait_fade_drained(
+                    // 排空等待最长 600ms：短锁取句柄，在锁外等待不占全局 player 锁
+                    let drain = state_for_task.player.lock().direct_drain_handle();
+                    if let Some(monitor) = &drain {
+                        if !monitor.wait_fade_drained(
                             DIRECT_FADE_DRAIN_MIN_BLOCKS,
                             DIRECT_FADE_DRAIN_TIMEOUT,
-                        )
-                    {
-                        tracing::warn!(
-                            target: "diretta_handoff",
-                            phase = "reconnect_fade_drain_timeout",
-                            "全量重连前排空等待超时，仍继续拆连接"
-                        );
+                        ) {
+                            tracing::warn!(
+                                target: "diretta_handoff",
+                                phase = "reconnect_fade_drain_timeout",
+                                "全量重连前排空等待超时，仍继续拆连接"
+                            );
+                        }
                     }
                     // 校验 + 拆连接必须同一把锁内完成，防止与更新的 load 竞态抢跑
                     let (threads, token) = {
                         let mut player = state_for_task.player.lock();
                         if !player.is_load_token_current(token) {
-                            anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                            anyhow::bail!(LoadSuperseded);
                         }
                         player.take_for_async_load(handle.clone())
                     };
@@ -1205,7 +1123,8 @@ async fn load_handler(
                 let _ = h.join();
             }
             if replacing_direct_playback {
-                std::thread::sleep(std::time::Duration::from_millis(800));
+                // 替换现存连接后给 Target/DAC 一个格式稳定窗口（非 stream 模式的启动验证也依赖它）
+                std::thread::sleep(DIRECT_FULL_RECONNECT_STABILIZATION);
             }
 
             let playback = if stream_mode {
@@ -1222,12 +1141,15 @@ async fn load_handler(
                 )?
             } else {
                 let physical = physical_source.expect("非 stream 模式必然已有物理源路径");
-                audio_engine_core::direct_runtime::DirectPlayback::open_local(
+                // 启动验证（对齐桌面端）：首块消费前失败/提前结束/被取代立即报错，
+                // 超时优雅暂停回退，避免把"从未出声的连接"当成播放成功
+                audio_engine_core::direct_runtime::DirectPlayback::open_verified_local(
                     &selector,
                     &physical,
                     metadata.duration_secs,
-                    0.0,
                     auto_play,
+                    &load_token_for_direct,
+                    token,
                 )?
             };
             match playback.format() {
@@ -1246,7 +1168,7 @@ async fn load_handler(
             }
             metadata.duration_secs = playback.duration();
             if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
-                anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                anyhow::bail!(LoadSuperseded);
             }
             Ok(DirectLoadOutcome::FullReconnect {
                 metadata: Box::new(metadata),
@@ -1281,13 +1203,13 @@ async fn load_handler(
                 }
             }
             Err(err) => {
-                let err_text = format!("{err:#}");
-                if err_text.contains(LOAD_SUPERSEDED_REASON) {
+                if err.is::<LoadSuperseded>() {
                     return Ok(Json(PlayerResponse::ok(json!({
                         "status": "superseded",
                         "source": source,
                     }))));
                 }
+                let err_text = format!("{err:#}");
                 let mut player = state.player.lock();
                 // 仅当本请求仍持有最后登记的 token 时才报错并清理；
                 // 否则已被更新的 load 抢占，静默让位（连接归新请求管理）
@@ -1317,7 +1239,7 @@ async fn load_handler(
             handle,
         )?;
         if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
-            anyhow::bail!(LOAD_SUPERSEDED_REASON);
+            anyhow::bail!(LoadSuperseded);
         }
         // 输出采样率协商：音源原始采样率被设备支持时按精确采样率打开
         let output = audio_engine_core::audio_output::AudioOutput::new(

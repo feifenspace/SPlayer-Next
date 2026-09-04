@@ -1,6 +1,4 @@
-use anyhow::Result;
-#[cfg(feature = "diretta")]
-use anyhow::bail;
+use anyhow::{bail, Result};
 
 use std::time::Duration;
 
@@ -22,6 +20,40 @@ use crate::diretta::{DirettaDirectConnection, DirettaDirectDsdConnection};
 pub enum DirectFormat {
     Pcm(DirectPcmFormat),
     Dsd(DirectDsdFormat),
+}
+
+/// load 被更新的 load/stop 取代：调用方按"让位"处理而非作为故障上报。
+/// Display 保留 `[Cancelled]` 前缀——NAPI 错误分类 is_cancelled_napi_error 依赖它
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("[Cancelled] load 已被更新的请求取代")]
+pub struct LoadSuperseded;
+
+/// Direct handoff/拆连接前排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
+pub const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
+
+/// Direct 排空的事件等待上限（超时兜底，正常远快于此值）
+pub const DIRECT_FADE_DRAIN_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Diretta full reconnect 后的 Target/DAC 格式稳定窗口。
+/// 仅替换现存 DirectPlayback（全量重连）时使用；同格式 staged/handoff 不经过此路径
+pub const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(800);
+
+/// 源扩展名判断是否 DSD 原生流（DSF/DFF/SACD ISO）
+pub fn is_native_dsd_source(source: &str) -> bool {
+    let lowered = source.to_lowercase();
+    [".dsf", ".dff"].iter().any(|ext| lowered.contains(ext))
+        || source.contains(".iso|")
+        || source.contains(".ISO|")
+}
+
+/// Direct 载入结果：handoff（连接复用，已在任务内 commit）或全量重连（待 commit）
+pub enum DirectLoadOutcome<M> {
+    Handoff(M),
+    FullReconnect {
+        metadata: M,
+        playback: DirectPlayback,
+        token: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -61,6 +93,18 @@ impl DirectMonitor {
             Self::Dsd(value) => value.pending_blocks(),
             #[cfg(test)]
             Self::Fake(_) => 0,
+        }
+    }
+
+    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
+    /// DSD 无淡出通道恒 true；Fake 无音频流恒 true。
+    /// 句柄持有 ring 的 Arc 引用，供调用方在 player 锁外排空
+    pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        match self {
+            Self::Pcm(value) => value.wait_fade_drained(min_blocks, timeout),
+            Self::Dsd(_) => true,
+            #[cfg(test)]
+            Self::Fake(_) => true,
         }
     }
 
@@ -575,6 +619,66 @@ impl DirectPlayback {
         {
             let _ = (min_blocks, timeout);
             unreachable!("Direct 淡出排空仅在 diretta/test 配置下可用")
+        }
+    }
+
+    /// open 后启动验证：等待首块被设备真正消费。
+    /// 首块消费前失败/提前结束/被新 load 取代即报错；超时返回 Ok(false)，
+    /// 由调用方决定回退方式。事件驱动等待，单次 100ms 上限保证 load 取消的响应性
+    pub fn wait_for_direct_start(
+        &self,
+        load_token: &std::sync::atomic::AtomicU64,
+        token: u64,
+    ) -> Result<bool> {
+        /// 启动验证总超时：Target 时钟锁定通常亚秒级，2s 已覆盖慢启动
+        const DIRECT_START_TIMEOUT: Duration = Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + DIRECT_START_TIMEOUT;
+        loop {
+            if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
+                return Err(LoadSuperseded.into());
+            }
+            if self.failed() {
+                bail!("[Direct] Diretta 音源在首块消费前失败");
+            }
+            if self.position() > self.seek_base() {
+                return Ok(true);
+            }
+            if self.finished() {
+                bail!("[Direct] Diretta 音源在首块消费前结束");
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            // 事件等待：首块消费 / 失败 / 提前结束任一发生即唤醒
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let _ = self.wait_first_consumed(remaining.min(Duration::from_millis(100)));
+        }
+    }
+
+    /// open_local + 启动验证：auto_play 时等待首块被消费，失败/超时先优雅暂停
+    /// 再报错（连接随本值 drop 关闭）。非播放加载（auto_play=false）跳过验证
+    pub fn open_verified_local(
+        selector: &str,
+        source: &str,
+        duration_secs: f64,
+        auto_play: bool,
+        load_token: &std::sync::atomic::AtomicU64,
+        token: u64,
+    ) -> Result<Self> {
+        let mut playback = Self::open_local(selector, source, duration_secs, 0.0, auto_play)?;
+        if !auto_play {
+            return Ok(playback);
+        }
+        match playback.wait_for_direct_start(load_token, token) {
+            Ok(true) => Ok(playback),
+            Ok(false) => {
+                let _ = playback.pause();
+                bail!("[Device] Diretta 连接未开始消费音频");
+            }
+            Err(error) => {
+                let _ = playback.pause();
+                Err(error)
+            }
         }
     }
 
