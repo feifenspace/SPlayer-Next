@@ -1366,7 +1366,7 @@ impl DirectDsdSource {
             .context("等待 Native DSD seek 结果失败")?
     }
 
-    pub fn replace_local_while_paused(&mut self, source: &str) -> Result<DirectDsdFormat> {
+    pub fn replace_drained_local(&mut self, source: &str) -> Result<DirectDsdFormat> {
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
             .send(DirectDsdCommand::ReplaceLocal {
@@ -1806,7 +1806,7 @@ mod tests {
         let mut source = DirectDsdSource::open_local(&first.path).unwrap();
         let context = source.callback_context();
 
-        let format = source.replace_local_while_paused(&second.path.to_string_lossy()).unwrap();
+        let format = source.replace_drained_local(&second.path.to_string_lossy()).unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(format.bit_rate, 2_822_400);
         assert_eq!(format.channels, 2);
@@ -1837,7 +1837,7 @@ mod tests {
         let mut source = DirectDsdSource::open_local(&dsf.path).unwrap();
         let context = source.callback_context();
 
-        let format = source.replace_local_while_paused(&dff.path.to_string_lossy()).unwrap();
+        let format = source.replace_drained_local(&dff.path.to_string_lossy()).unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(format.bit_order, DirectDsdBitOrder::MsbFirst);
         assert!(!source.failed());

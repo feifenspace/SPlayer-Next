@@ -580,7 +580,7 @@ impl InnerPlayer {
             .pending_load_handle
             .clone()
             .ok_or_else(|| anyhow::anyhow!("[Direct] handoff 前缺少 load 取消句柄"))?;
-        let format = playback.handoff_local_while_paused(source, duration, cancel)?;
+        let format = playback.handoff_drained_source(source, duration, cancel)?;
         self.current_source = Some(source.to_owned());
         self.audio_duration = if duration > 0.0 {
             duration

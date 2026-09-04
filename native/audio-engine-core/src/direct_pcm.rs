@@ -2641,7 +2641,7 @@ impl DirectPcmSource {
             .wait_for(|ring| ring.fade.drained(min_blocks), timeout)
     }
 
-    pub fn replace_local_while_paused(
+    pub fn replace_drained_local(
         &mut self,
         source: &str,
         cancel: HttpCancelHandle,
@@ -2650,7 +2650,7 @@ impl DirectPcmSource {
             target: "diretta_handoff",
             phase = "pcm_api_send",
             source = %source,
-            "DirectPcmSource::replace_local_while_paused send command"
+            "DirectPcmSource::replace_drained_local send command"
         );
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
@@ -2670,7 +2670,7 @@ impl DirectPcmSource {
             phase = "pcm_api_recv",
             sample_rate = %format.sample_rate,
             channels = %format.channels,
-            "DirectPcmSource::replace_local_while_paused received format"
+            "DirectPcmSource::replace_drained_local received format"
         );
         Ok(format)
     }
@@ -3523,7 +3523,7 @@ mod tests {
             DirectPcmMemoryPath::ZeroCopyPacked
         );
         let new_format = source
-            .replace_local_while_paused(
+            .replace_drained_local(
                 &replacement.path.to_string_lossy(),
                 HttpCancelHandle::new(),
             )
@@ -3553,7 +3553,7 @@ mod tests {
         let format = source.format();
 
         let error = source
-            .replace_local_while_paused(
+            .replace_drained_local(
                 &incompatible.path.to_string_lossy(),
                 HttpCancelHandle::new(),
             )
@@ -3857,7 +3857,7 @@ mod tests {
         assert!(result.is_err(), "HTTP URL 应该走 HTTP 分支并被 FFmpeg 拒绝");
     }
 
-    /// replace_local_while_paused：同格式切换后 silence_blocks 归零、消费新 slot 后 transition_count +1
+    /// replace_drained_local：同格式切换后 silence_blocks 归零、消费新 slot 后 transition_count +1
     #[test]
     fn replace_local_clears_silence_blocks_and_increments_transition_count() {
         let samples_a = (0i16..8192i16).flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
@@ -3881,7 +3881,7 @@ mod tests {
         // 同格式 handoff
         source.set_duration(2.0);
         let new_format = source
-            .replace_local_while_paused(&fixture_b.path.to_string_lossy(), HttpCancelHandle::new())
+            .replace_drained_local(&fixture_b.path.to_string_lossy(), HttpCancelHandle::new())
             .unwrap();
 
         // 断言 1：新格式与原格式完全兼容
@@ -3916,7 +3916,7 @@ mod tests {
         );
     }
 
-    /// replace_local_while_paused：不同格式应该返回错误（不 panic、不泄漏连接状态）
+    /// replace_drained_local：不同格式应该返回错误（不 panic、不泄漏连接状态）
     #[test]
     fn replace_local_rejects_different_format_gracefully() {
         // fixture_a: 44.1kHz; fixture_b: 48kHz（不同 sample_rate → 不兼容）
@@ -3928,7 +3928,7 @@ mod tests {
         let mut source = DirectPcmSource::open_local(&fixture_a.path).unwrap();
 
         let result = source
-            .replace_local_while_paused(&fixture_b.path.to_string_lossy(), HttpCancelHandle::new());
+            .replace_drained_local(&fixture_b.path.to_string_lossy(), HttpCancelHandle::new());
 
         assert!(
             result.is_err(),

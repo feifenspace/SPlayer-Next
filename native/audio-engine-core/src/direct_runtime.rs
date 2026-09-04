@@ -441,7 +441,7 @@ impl DirectPlayback {
     }
 
     #[cfg(feature = "diretta")]
-    pub fn handoff_local_while_paused(
+    pub fn handoff_drained_source(
         &mut self,
         source: &str,
         duration: f64,
@@ -487,7 +487,7 @@ impl DirectPlayback {
                 if is_dsd {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_local_source_while_paused(&path_str, cancel)?;
+                let format = value.replace_drained_local_source(&path_str, cancel)?;
                 value.set_duration(cue_dur);
                 DirectFormat::Pcm(format)
             }
@@ -495,7 +495,7 @@ impl DirectPlayback {
                 if !is_dsd {
                     bail!("[Direct] Native DSD → PCM 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_local_source_while_paused(&path_str)?;
+                let format = value.replace_drained_local_source(&path_str)?;
                 DirectFormat::Dsd(format)
             }
         };
@@ -685,7 +685,7 @@ impl DirectPlayback {
 
     /// fake 传输的换源：仅更新时长，返回 fake PCM 格式（供 player 层 handoff 单测使用）
     #[cfg(all(test, not(feature = "diretta")))]
-    pub fn handoff_local_while_paused(
+    pub fn handoff_drained_source(
         &mut self,
         source: &str,
         duration: f64,
