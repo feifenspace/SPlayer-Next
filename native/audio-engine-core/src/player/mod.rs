@@ -97,6 +97,13 @@ const _: fn() = || {
     assert_send::<InnerPlayer>();
 };
 
+/// Direct 关流排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
+#[cfg(any(feature = "diretta", test))]
+const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
+/// Direct 关流排空的事件等待上限（超时兜底，正常远快于此值）
+#[cfg(any(feature = "diretta", test))]
+const DIRECT_FADE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+
 impl InnerPlayer {
     /// 未初始化时通过 `AudioOutput::new` 懒构造音频输出。
     /// 设备失效时的重建由 `reinit_output` 显式处理，不在此函数内自动恢复
@@ -506,6 +513,20 @@ impl InnerPlayer {
     }
 
     fn stop_internal(&mut self) {
+        #[cfg(any(feature = "diretta", test))]
+        // 0. Direct 连接关流前先源级淡出 + 事件驱动排空：
+        //    等待渐零完成并交付足量静音块（顶掉设备端缓冲里的旧音频），
+        //    DAC 端在数字静音中收到流结束，避免关流瞬间的爆音。
+        //    无固定 sleep：静音块由 SDK 回调逐块交付并逐块唤醒（fake/暂停态瞬时通过）
+        if self.state == PlayerState::Playing {
+            if let Some(playback) = self.direct_playback.as_ref() {
+                playback.begin_fade_out();
+                let _ = playback.wait_fade_drained(
+                    DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                    DIRECT_FADE_DRAIN_TIMEOUT,
+                );
+            }
+        }
         // 1. 取消渐变并等待渐变线程退出（释放 Arc<Sink>）
         self.cancel_fade();
         // 2. 停止定时器并等待线程退出（释放 Arc<Shared> 和 Arc<EventEmitter>）
@@ -941,5 +962,145 @@ mod tests {
         player.reserve_output_generation();
         callback();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[cfg(not(feature = "diretta"))]
+    fn direct_test_metadata(duration_secs: f64) -> crate::metadata::AudioMetadata {
+        crate::metadata::AudioMetadata {
+            duration_secs,
+            sample_rate: 44_100,
+            original_sample_rate: 44_100,
+            channels: 2,
+            bits_per_sample: 16,
+            codec: "flac".into(),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(not(feature = "diretta"))]
+    #[test]
+    fn direct_handoff_commits_new_source_and_keeps_connection() {
+        let mut player = InnerPlayer::new().unwrap();
+        let (_old, token) = player.take_for_async_load(HttpCancelHandle::new());
+        player
+            .commit_direct_loaded(
+                token,
+                "direct-test-a.flac",
+                false,
+                direct_test_metadata(120.0),
+                DirectPlayback::fake(120.0, false),
+            )
+            .unwrap();
+        assert!(player.direct_active());
+
+        // 新请求：只登记 token，保留连接
+        let token2 = player.take_threads_only(HttpCancelHandle::new());
+        assert_ne!(token, token2);
+        assert!(player.direct_active());
+
+        let format = player
+            .commit_direct_handoff(token2, "direct-test-b.flac", 90.0, false)
+            .unwrap()
+            .expect("handoff 应成功提交");
+        assert!(matches!(
+            format,
+            crate::direct_runtime::DirectFormat::Pcm(_)
+        ));
+        // 连接复用：playback 未被替换，source/duration 已更新，状态保持 Paused
+        assert!(player.direct_playback.is_some());
+        assert_eq!(player.current_source.as_deref(), Some("direct-test-b.flac"));
+        assert_eq!(player.audio_duration, 90.0);
+        assert_eq!(player.state(), PlayerState::Paused);
+    }
+
+    #[cfg(not(feature = "diretta"))]
+    #[test]
+    fn direct_handoff_with_auto_play_resumes_playback() {
+        let mut player = InnerPlayer::new().unwrap();
+        let (_old, token) = player.take_for_async_load(HttpCancelHandle::new());
+        let playback = DirectPlayback::fake(120.0, false);
+        let fake_state = playback.fake_state();
+        player
+            .commit_direct_loaded(
+                token,
+                "direct-test-a.flac",
+                false,
+                direct_test_metadata(120.0),
+                playback,
+            )
+            .unwrap();
+        assert!(!fake_state.playing());
+
+        let token2 = player.take_threads_only(HttpCancelHandle::new());
+        player
+            .commit_direct_handoff(token2, "direct-test-b.flac", 90.0, true)
+            .unwrap()
+            .expect("handoff 应成功提交");
+        assert!(fake_state.playing());
+        assert_eq!(player.state(), PlayerState::Playing);
+    }
+
+    #[cfg(not(feature = "diretta"))]
+    #[test]
+    fn direct_handoff_superseded_when_token_advances() {
+        let mut player = InnerPlayer::new().unwrap();
+        let (_old, token) = player.take_for_async_load(HttpCancelHandle::new());
+        player
+            .commit_direct_loaded(
+                token,
+                "direct-test-a.flac",
+                false,
+                direct_test_metadata(120.0),
+                DirectPlayback::fake(120.0, false),
+            )
+            .unwrap();
+
+        let token2 = player.take_threads_only(HttpCancelHandle::new());
+        // 更新的请求再次推进 token，token2 已过期
+        let _token3 = player.take_threads_only(HttpCancelHandle::new());
+
+        let result = player
+            .commit_direct_handoff(token2, "direct-test-b.flac", 90.0, false)
+            .unwrap();
+        assert!(result.is_none(), "过期 token 的 handoff 应被拒绝");
+        // 连接与 source 保持原状，未被过期请求篡改
+        assert!(player.direct_playback.is_some());
+        assert_eq!(player.current_source.as_deref(), Some("direct-test-a.flac"));
+    }
+
+    #[cfg(not(feature = "diretta"))]
+    #[test]
+    fn direct_handoff_errors_without_active_connection() {
+        let mut player = InnerPlayer::new().unwrap();
+        let (_old, token) = player.take_for_async_load(HttpCancelHandle::new());
+        let error = player
+            .commit_direct_handoff(token, "direct-test-b.flac", 90.0, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("[Direct]"));
+    }
+
+    #[cfg(not(feature = "diretta"))]
+    #[test]
+    fn direct_stop_fades_out_before_teardown() {
+        let mut player = InnerPlayer::new().unwrap();
+        let (_old, token) = player.take_for_async_load(HttpCancelHandle::new());
+        let playback = DirectPlayback::fake(120.0, true);
+        let fake_state = playback.fake_state();
+        player
+            .commit_direct_loaded(
+                token,
+                "direct-test-a.flac",
+                true,
+                direct_test_metadata(120.0),
+                playback,
+            )
+            .unwrap();
+        assert!(fake_state.playing());
+
+        player.stop();
+        assert_eq!(player.state(), PlayerState::Stopped);
+        assert!(player.direct_playback.is_none());
+        // stop 推进了 token，在途 commit 将被拒绝
+        assert!(!player.is_load_token_current(token));
     }
 }

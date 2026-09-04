@@ -56,6 +56,14 @@ const DIRECT_START_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(feature = "diretta")]
 const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(800);
 
+/// Direct 排空谓词下限：淡出完成后至少交付的静音块数
+#[cfg(feature = "diretta")]
+const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
+
+/// Direct 排空的事件等待上限（超时兜底，正常远快于此值）
+#[cfg(feature = "diretta")]
+const DIRECT_FADE_DRAIN_TIMEOUT: Duration = Duration::from_millis(600);
+
 #[cfg(feature = "diretta")]
 fn wait_for_direct_start(
     playback: &DirectPlayback,
@@ -79,7 +87,10 @@ fn wait_for_direct_start(
         if Instant::now() >= deadline {
             return Ok(false);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        // 事件等待：首块消费 / 失败 / 提前结束任一发生即唤醒；
+        // 100ms 上限保证 load 取消（token 变更）的响应性
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let _ = playback.wait_first_consumed(remaining.min(Duration::from_millis(100)));
     }
 }
 
@@ -108,6 +119,82 @@ fn open_verified_direct_playback(
             drop(playback);
             Err(error)
         }
+    }
+}
+
+/// Direct 载入结果：handoff（连接复用，已在任务内 commit）或全量重连（待 commit）
+#[cfg(feature = "diretta")]
+enum DirectLoadOutcome {
+    Handoff(crate::metadata::AudioMetadata),
+    FullReconnect {
+        metadata: crate::metadata::AudioMetadata,
+        playback: DirectPlayback,
+        token: u64,
+    },
+}
+
+/// 源扩展名判断是否 DSD 原生流（DSF/DFF/SACD ISO）
+#[cfg(feature = "diretta")]
+fn is_native_dsd_source(source: &str) -> bool {
+    let lowered = source.to_lowercase();
+    [".dsf", ".dff"].iter().any(|ext| lowered.contains(ext))
+        || source.contains(".iso|")
+        || source.contains(".ISO|")
+}
+
+/// 播放中同格式 handoff：淡出旧源 → 静音预填 → 块边界原子换源。
+/// 返回 Ok(format) 表示已 commit；Err 表示应回退全量重连。
+#[cfg(feature = "diretta")]
+#[allow(clippy::too_many_arguments)]
+fn try_direct_handoff_commit(
+    inner: &Arc<Mutex<InnerPlayer>>,
+    token: u64,
+    source: &str,
+    duration_secs: f64,
+    auto_play: bool,
+    current_format: DirectFormat,
+    metadata: &crate::metadata::AudioMetadata,
+    is_dsd: bool,
+) -> anyhow::Result<DirectFormat> {
+    // 格式预检：家族（PCM/DSD）+ 采样率 + 声道一致才值得做淡出换源
+    let family_matches = match current_format {
+        DirectFormat::Pcm(cur) => {
+            !is_dsd
+                && (metadata.original_sample_rate == 0
+                    || cur.sample_rate == metadata.original_sample_rate)
+                && (metadata.channels == 0 || cur.channels == metadata.channels)
+        }
+        DirectFormat::Dsd(cur) => {
+            is_dsd && (metadata.channels == 0 || cur.channels == metadata.channels)
+        }
+    };
+    anyhow::ensure!(
+        family_matches,
+        "[Direct] handoff 格式预检不通过，回退全量重连"
+    );
+
+    // 1) 源级淡出（暂停态为无害 no-op）
+    {
+        let mut player = inner.lock();
+        let _ = player.begin_direct_fade_out();
+    }
+    // 2) 等待淡出 + 静音排空（事件驱动；暂停态/无连接瞬时通过），
+    //    排空即已交付若干块数字静音，顶掉设备端缓冲里的旧音频尾巴
+    if !inner.lock().direct_wait_fade_drained(
+        DIRECT_FADE_DRAIN_MIN_BLOCKS,
+        DIRECT_FADE_DRAIN_TIMEOUT,
+    ) {
+        warn!(
+            target: "diretta_handoff",
+            phase = "handoff_fade_drain_timeout",
+            "淡出排空等待超时，仍尝试 commit（块边界校验兜底）"
+        );
+    }
+    // 3) 块边界原子换源（格式不一致时 Err，旧连接保持静音原状）
+    let mut player = inner.lock();
+    match player.commit_direct_handoff(token, source, duration_secs, auto_play)? {
+        Some(format) => Ok(format),
+        None => anyhow::bail!(LOAD_SUPERSEDED_REASON),
     }
 }
 
@@ -558,7 +645,9 @@ impl AudioPlayer {
 
         let handle = HttpCancelHandle::new();
         let (
-            old_threads,
+            direct_initial_take,
+            direct_active,
+            current_direct_format,
             token,
             load_token,
             cover_dir,
@@ -583,11 +672,26 @@ impl AudioPlayer {
                     "[Direct] 当前 audio-engine 未编译 Diretta Host SDK 支持".to_string(),
                 ));
             }
-            let (old_threads, token) = player.take_for_async_load(handle.clone());
+            // handoff 尝试：Direct 连接存活且新请求仍指向 Diretta 时只登记 load token，
+            // 保留连接——旧曲目在 probe / 淡出期间继续出声；失败后在任务内做全量回收。
+            // 设备已切离 Diretta（direct_selector 为 None）时必须全量拆线，否则旧连接泄漏
+            let direct_active = direct_selector.is_some() && player.direct_active();
+            #[cfg(feature = "diretta")]
+            let current_direct_format = player.direct_format();
+            #[cfg(not(feature = "diretta"))]
+            let current_direct_format: Option<crate::direct_runtime::DirectFormat> = None;
+            let (direct_initial_take, token) = if direct_active {
+                (None, player.take_threads_only(handle.clone()))
+            } else {
+                let (old_threads, token) = player.take_for_async_load(handle.clone());
+                (Some(old_threads), token)
+            };
             let output_generation = player.reserve_output_generation();
             let failure_callback = player.make_failure_callback(output_generation);
             (
-                old_threads,
+                direct_initial_take,
+                direct_active,
+                current_direct_format,
                 token,
                 player.load_token_handle(),
                 player.cover_cache_dir().map(String::from),
@@ -602,20 +706,19 @@ impl AudioPlayer {
         };
 
         #[cfg(not(feature = "diretta"))]
-        let _ = &direct_selector;
+        let _ = (&direct_selector, &direct_active, &current_direct_format);
 
         #[cfg(feature = "diretta")]
         if let Some(selector) = direct_selector {
             let source_for_direct = source.clone();
             let load_token_for_direct = Arc::clone(&load_token);
+            let inner_for_direct = Arc::clone(&self.inner);
+            let direct_format_snapshot = current_direct_format;
+            // 任务结束前本请求最后持有的 token（handoff 失败回退重拆时会推进一次）
+            let task_final_token = Arc::new(std::sync::atomic::AtomicU64::new(token));
+            let task_final_token_writer = Arc::clone(&task_final_token);
+
             let result = tokio::task::spawn_blocking(move || {
-                let replacing_direct_playback = old_threads.direct_playback.is_some();
-                if let Some(h) = old_threads.join_aux() {
-                    let _ = h.join();
-                }
-                if replacing_direct_playback {
-                    std::thread::sleep(DIRECT_FULL_RECONNECT_STABILIZATION);
-                }
                 if source_for_direct.starts_with("http://")
                     || source_for_direct.starts_with("https://")
                 {
@@ -623,10 +726,108 @@ impl AudioPlayer {
                         "[Direct] 当前 Direct Lifecycle Gate 仅支持本地 seekable 音源"
                     );
                 }
-                let mut metadata =
-                    decoder::probe_metadata(&source_for_direct, cover_dir.as_deref(), handle)?;
+                let is_dsd = is_native_dsd_source(&source_for_direct);
+
+                // ---- 阶段 1：探测新源元数据（handoff 粗检需要 sample_rate/channels）----
+                let mut metadata = decoder::probe_metadata(
+                    &source_for_direct,
+                    cover_dir.as_deref(),
+                    handle.clone(),
+                )?;
                 if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
                     anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                }
+
+                // ---- 阶段 2：handoff-first——保留 Diretta 连接，块边界原子换源 ----
+                if direct_active {
+                    let current_format = direct_format_snapshot
+                        .expect("direct_active 时必须携带当前连接格式快照");
+                    match try_direct_handoff_commit(
+                        &inner_for_direct,
+                        token,
+                        &source_for_direct,
+                        metadata.duration_secs,
+                        auto_play,
+                        current_format,
+                        &metadata,
+                        is_dsd,
+                    ) {
+                        Ok(format) => {
+                            match format {
+                                DirectFormat::Pcm(format) => {
+                                    metadata.sample_rate = format.sample_rate;
+                                    metadata.original_sample_rate = format.sample_rate;
+                                    metadata.channels = format.channels;
+                                    metadata.bits_per_sample = u32::from(format.valid_bits);
+                                }
+                                DirectFormat::Dsd(format) => {
+                                    metadata.sample_rate = format.bit_rate;
+                                    metadata.original_sample_rate = format.bit_rate;
+                                    metadata.channels = format.channels;
+                                    metadata.bits_per_sample = 1;
+                                }
+                            }
+                            info!(
+                                target: "diretta_handoff",
+                                phase = "load_handoff_ok",
+                                source = %source_for_direct,
+                                "handoff 提交成功，Diretta 连接已复用"
+                            );
+                            return Ok(DirectLoadOutcome::Handoff(metadata));
+                        }
+                        Err(err) => {
+                            if format!("{err:#}").contains(LOAD_SUPERSEDED_REASON) {
+                                return Err(err);
+                            }
+                            warn!(
+                                target: "diretta_handoff",
+                                phase = "load_handoff_fallback",
+                                error = %err,
+                                "handoff 失败，回退全量重连"
+                            );
+                        }
+                    }
+                }
+
+                // ---- 阶段 3：全量重连（淡出拆旧连接 → 重新协商 Diretta endpoint）----
+                let (old_threads, token) = match direct_initial_take {
+                    Some(threads) => (threads, token),
+                    None => {
+                        // handoff 尝试失败：确保旧源静音后再拆（sequence 中可能已淡出）。
+                        // 事件驱动等待，无固定 sleep；暂停态/无连接瞬时通过
+                        {
+                            let mut player = inner_for_direct.lock();
+                            let _ = player.begin_direct_fade_out();
+                        }
+                        if !inner_for_direct.lock().direct_wait_fade_drained(
+                            DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                            DIRECT_FADE_DRAIN_TIMEOUT,
+                        ) {
+                            warn!(
+                                target: "diretta_handoff",
+                                phase = "reconnect_fade_drain_timeout",
+                                "全量重连前排空等待超时，仍继续拆连接"
+                            );
+                        }
+                        // 校验 + 拆连接必须同一把锁内完成，防止与更新的 load 竞态抢跑
+                        let (threads, token) = {
+                            let mut player = inner_for_direct.lock();
+                            if !player.is_load_token_current(token) {
+                                anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                            }
+                            player.take_for_async_load(handle)
+                        };
+                        task_final_token_writer
+                            .store(token, std::sync::atomic::Ordering::Release);
+                        (threads, token)
+                    }
+                };
+                let replacing_direct_playback = old_threads.direct_playback.is_some();
+                if let Some(h) = old_threads.join_aux() {
+                    let _ = h.join();
+                }
+                if replacing_direct_playback {
+                    std::thread::sleep(DIRECT_FULL_RECONNECT_STABILIZATION);
                 }
                 let playback = open_verified_direct_playback(
                     &selector,
@@ -654,40 +855,60 @@ impl AudioPlayer {
                 if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
                     anyhow::bail!(LOAD_SUPERSEDED_REASON);
                 }
-                Ok::<_, anyhow::Error>((metadata, playback))
+                Ok::<_, anyhow::Error>(DirectLoadOutcome::FullReconnect {
+                    metadata,
+                    playback,
+                    token,
+                })
             })
             .await
             .map_err(|e| Error::from_reason(format!("direct load task join error: {e}")))?;
 
-            let (metadata, playback) = match result {
-                Ok(value) => value,
+            return match result {
+                Ok(DirectLoadOutcome::Handoff(metadata)) => Ok(Self::meta_to_js(metadata)),
+                Ok(DirectLoadOutcome::FullReconnect {
+                    metadata,
+                    playback,
+                    token,
+                }) => {
+                    let returned_meta = {
+                        let mut player = self.inner.lock();
+                        player
+                            .commit_direct_loaded(token, &source, auto_play, metadata, playback)
+                            .into_napi()?
+                    };
+                    match returned_meta {
+                        Some(meta) => Ok(Self::meta_to_js(meta)),
+                        None => Err(Error::from_reason(LOAD_SUPERSEDED_REASON)),
+                    }
+                }
                 Err(error) => {
+                    let err_text = format!("{error:#}");
+                    if err_text.contains(LOAD_SUPERSEDED_REASON) {
+                        return Err(Error::from_reason(LOAD_SUPERSEDED_REASON));
+                    }
                     let mut player = self.inner.lock();
-                    if !player.is_load_token_current(token) {
+                    // 仅当本请求仍持有最后登记的 token 时才报错并清理；
+                    // 否则已被更新的 load 抢占，静默让位（连接归新请求管理）
+                    if !player.is_load_token_current(
+                        task_final_token.load(std::sync::atomic::Ordering::Acquire),
+                    ) {
                         return Err(Error::from_reason(LOAD_SUPERSEDED_REASON));
                     }
                     player.stop();
-                    return Err(error).into_napi();
+                    Err(error).into_napi()
                 }
-            };
-
-            let returned_meta = {
-                let mut player = self.inner.lock();
-                player
-                    .commit_direct_loaded(token, &source, auto_play, metadata, playback)
-                    .into_napi()?
-            };
-            return match returned_meta {
-                Some(meta) => Ok(Self::meta_to_js(meta)),
-                None => Err(Error::from_reason(LOAD_SUPERSEDED_REASON)),
             };
         }
 
         let source_for_decoder = source.clone();
 
         let result = tokio::task::spawn_blocking(move || {
-            if let Some(h) = old_threads.join_aux() {
-                let _ = h.join();
+            // 非 Direct 选择器路径：direct_initial_take 必为 Some（进入时已在锁内拆线）
+            if let Some(threads) = direct_initial_take {
+                if let Some(h) = threads.join_aux() {
+                    let _ = h.join();
+                }
             }
             let prepared =
                 decoder::prepare_decode(&source_for_decoder, cover_dir.as_deref(), handle)?;

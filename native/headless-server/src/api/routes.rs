@@ -695,6 +695,116 @@ fn materialize_direct_input(url: &str) -> anyhow::Result<String> {
 
 const LOAD_SUPERSEDED_REASON: &str = "Load superseded by a newer request";
 
+/// Direct handoff/拆连接前排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
+const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
+/// Direct 排空的事件等待上限（超时兜底，正常远快于此值）
+const DIRECT_FADE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Direct 载入结果：handoff（连接复用，已在任务内 commit）或全量重连（待 commit）
+enum DirectLoadOutcome {
+    Handoff(Box<audio_engine_core::AudioMetadata>),
+    FullReconnect {
+        metadata: Box<audio_engine_core::AudioMetadata>,
+        playback: audio_engine_core::direct_runtime::DirectPlayback,
+        token: u64,
+    },
+}
+
+/// Direct 载入成功后的统一响应体
+fn direct_load_response(
+    source: &str,
+    auto_play: bool,
+    meta: audio_engine_core::AudioMetadata,
+) -> Json<PlayerResponse> {
+    let has_cover = meta.cover_raw.is_some() || meta.cover.is_some();
+    Json(PlayerResponse::ok(json!({
+        "status": if auto_play { "playing" } else { "paused" },
+        "source": source,
+        "title": meta.title,
+        "artist": meta.artist,
+        "album": meta.album,
+        "duration": meta.duration_secs,
+        "sample_rate": meta.sample_rate,
+        "original_sample_rate": meta.original_sample_rate,
+        "channels": meta.channels,
+        "bits_per_sample": meta.bits_per_sample,
+        "bit_rate": meta.bit_rate,
+        "codec": meta.codec,
+        "cover": meta.cover,
+        "has_cover": has_cover,
+        "has_embedded_lyric": meta.embedded_lyric.is_some(),
+    })))
+}
+
+/// 源扩展名判断是否 DSD 原生流（DSF/DFF/SACD ISO）
+fn is_native_dsd_source(source: &str) -> bool {
+    let lowered = source.to_lowercase();
+    [".dsf", ".dff"].iter().any(|ext| lowered.contains(ext))
+        || source.contains(".iso|")
+        || source.contains(".ISO|")
+}
+
+/// 播放中同格式 handoff：淡出旧源 → 静音预填 → 块边界原子换源。
+/// 返回 Ok(format) 表示已 commit；Err 表示应回退全量重连。
+#[allow(clippy::too_many_arguments)]
+fn try_direct_handoff_sequence(
+    state: &AppState,
+    token: u64,
+    source: &str,
+    duration_secs: f64,
+    auto_play: bool,
+    current_format: audio_engine_core::direct_runtime::DirectFormat,
+    metadata: &audio_engine_core::AudioMetadata,
+    is_dsd: bool,
+) -> Result<
+    audio_engine_core::direct_runtime::DirectFormat,
+    anyhow::Error,
+> {
+    // 格式预检：家族（PCM/DSD）+ 采样率 + 声道一致才值得做淡出换源。
+    // stream 模式无法廉价探测时元数据为 0 值：跳过对应粗检，
+    // 由 replace_pcm_ring 的 same_pcm_transport 做权威校验（storage_bits/sample_format），失败即回退
+    let family_matches = match current_format {
+        audio_engine_core::direct_runtime::DirectFormat::Pcm(cur) => {
+            !is_dsd
+                && (metadata.original_sample_rate == 0
+                    || cur.sample_rate == metadata.original_sample_rate)
+                && (metadata.channels == 0 || cur.channels == metadata.channels)
+        }
+        audio_engine_core::direct_runtime::DirectFormat::Dsd(cur) => {
+            is_dsd && (metadata.channels == 0 || cur.channels == metadata.channels)
+        }
+    };
+    anyhow::ensure!(
+        family_matches,
+        "[Direct] handoff 格式预检不通过，回退全量重连"
+    );
+
+    // 1) 源级淡出（暂停态为无害 no-op）
+    {
+        let mut player = state.player.lock();
+        let _ = player.begin_direct_fade_out();
+    }
+    // 2) 事件驱动排空：渐零完成 + 交付足量数字静音块（顶掉设备端缓冲里的旧音频尾巴）。
+    //    SDK 回调逐块交付并逐块唤醒，无固定 sleep；暂停态/无连接瞬时通过
+    if !state
+        .player
+        .lock()
+        .direct_wait_fade_drained(DIRECT_FADE_DRAIN_MIN_BLOCKS, DIRECT_FADE_DRAIN_TIMEOUT)
+    {
+        tracing::warn!(
+            target: "diretta_handoff",
+            phase = "handoff_fade_drain_timeout",
+            "淡出排空等待超时，仍尝试 commit（块边界校验兜底）"
+        );
+    }
+    // 3) 块边界原子换源（格式不一致时 Err，旧连接保持静音原状）
+    let mut player = state.player.lock();
+    match player.commit_direct_handoff(token, source, duration_secs, auto_play)? {
+        Some(format) => Ok(format),
+        None => anyhow::bail!(LOAD_SUPERSEDED_REASON),
+    }
+}
+
 /// 加载音轨（完整三段式异步 IO 闭环）
 async fn load_handler(
     State(state): State<AppState>,
@@ -720,7 +830,9 @@ async fn load_handler(
     let handle = audio_engine_core::HttpCancelHandle::new();
 
     let (
-        old_threads,
+        direct_initial_take,
+        direct_active,
+        current_direct_format,
         token,
         load_token,
         cover_dir,
@@ -743,11 +855,23 @@ async fn load_handler(
                 return Err(ApiError::bad_request(e.to_string()));
             }
         }
-        let (old_threads, token) = player.take_for_async_load(handle.clone());
+        // handoff 尝试：Direct 连接存活且新请求仍指向 Diretta 时只登记 load token，
+        // 保留连接——旧曲目在 probe / 淡出期间继续出声；失败后在任务内做全量回收。
+        // 设备已切离 Diretta（direct_selector 为 None）时必须全量拆线，否则旧连接泄漏
+        let direct_active = direct_selector.is_some() && player.direct_active();
+        let current_direct_format = player.direct_format();
+        let (direct_initial_take, token) = if direct_active {
+            (None, player.take_threads_only(handle.clone()))
+        } else {
+            let (old_threads, token) = player.take_for_async_load(handle.clone());
+            (Some(old_threads), token)
+        };
         let output_generation = player.reserve_output_generation();
         let failure_callback = player.make_failure_callback(output_generation);
         (
-            old_threads,
+            direct_initial_take,
+            direct_active,
+            current_direct_format,
             token,
             player.load_token_handle(),
             player.cover_cache_dir().map(String::from),
@@ -793,14 +917,15 @@ async fn load_handler(
             .as_ref()
             .and_then(|m| m.duration)
             .map(|ms| ms as f64 / 1000.0);
+        let direct_format_snapshot = current_direct_format;
+        // 任务结束前本请求最后持有的 token（handoff 失败回退重拆时会推进一次）
+        let task_final_token = Arc::new(std::sync::atomic::AtomicU64::new(token));
+        let task_final_token_writer = Arc::clone(&task_final_token);
+
+        // worker 闭包用克隆：state 在本 handler 后续（commit / 错误清理）仍需使用
+        let state_for_task = state.clone();
+
         let result = spawn_isolated_blocking("player-direct-load-worker", move || {
-            let replacing_direct_playback = old_threads.direct_playback.is_some();
-            if let Some(h) = old_threads.join_aux() {
-                let _ = h.join();
-            }
-            if replacing_direct_playback {
-                std::thread::sleep(std::time::Duration::from_millis(800));
-            }
             let is_http = source_for_direct.starts_with("http://")
                 || source_for_direct.starts_with("https://");
             // DSD 原生流（DSF/DFF/SACD ISO）需要 seekable 输入做 chunk 定位，
@@ -811,62 +936,153 @@ async fn load_handler(
                 || source_for_direct.contains(".iso|")
                 || source_for_direct.contains(".ISO|");
             let stream_mode = is_http && source_mode == "stream" && !is_dsd_stream;
+            let is_dsd = is_dsd_stream || is_native_dsd_source(&source_for_direct);
 
-            if stream_mode {
-                // stream 模式：HttpAudioSource Range 流式拉取，demuxer 驱动读进度，
-                // 不做全量预下载；元数据由前端 payload + 解码格式回填
-                let http = audio_engine_core::ffmpeg_audio::HttpAudioSource::new_with_cancel_handle(
-                    &source_for_direct, &handle,
-                )?;
-                if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
-                    anyhow::bail!(LOAD_SUPERSEDED_REASON);
+            // ---- 阶段 1：探测新源元数据（handoff 粗检需要 sample_rate/channels）----
+            // stream 模式无法廉价探测：占位元数据 + 换源时的权威校验兜底
+            let physical_source = if stream_mode {
+                None
+            } else if is_http {
+                Some(materialize_direct_input(&source_for_direct)?)
+            } else {
+                Some(source_for_direct.clone())
+            };
+            let mut metadata = match physical_source.as_deref() {
+                Some(path) => {
+                    let meta = audio_engine_core::decoder::probe_metadata(
+                        path,
+                        cover_dir.as_deref(),
+                        handle.clone(),
+                    )?;
+                    if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
+                        anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                    }
+                    meta
                 }
-                let playback = audio_engine_core::direct_runtime::DirectPlayback::open_stream(
+                None => audio_engine_core::AudioMetadata {
+                    duration_secs: meta_duration_secs.unwrap_or(0.0),
+                    codec: "stream".to_string(),
+                    ..Default::default()
+                },
+            };
+
+            // ---- 阶段 2：handoff-first——保留 Diretta 连接，块边界原子换源 ----
+            if direct_active {
+                let current_format = direct_format_snapshot
+                    .expect("direct_active 时必须携带当前连接格式快照");
+                match try_direct_handoff_sequence(
+                    &state_for_task,
+                    token,
+                    &source_for_direct,
+                    metadata.duration_secs,
+                    auto_play,
+                    current_format,
+                    &metadata,
+                    is_dsd,
+                ) {
+                    Ok(format) => {
+                        match format {
+                            audio_engine_core::direct_runtime::DirectFormat::Pcm(format) => {
+                                metadata.sample_rate = format.sample_rate;
+                                metadata.original_sample_rate = format.sample_rate;
+                                metadata.channels = format.channels;
+                                metadata.bits_per_sample = u32::from(format.valid_bits);
+                            }
+                            audio_engine_core::direct_runtime::DirectFormat::Dsd(format) => {
+                                metadata.sample_rate = format.bit_rate;
+                                metadata.original_sample_rate = format.bit_rate;
+                                metadata.channels = format.channels;
+                                metadata.bits_per_sample = 1;
+                            }
+                        }
+                        tracing::info!(
+                            target: "diretta_handoff",
+                            phase = "load_handoff_ok",
+                            source = %source_for_direct,
+                            "handoff 提交成功，Diretta 连接已复用"
+                        );
+                        return Ok(DirectLoadOutcome::Handoff(Box::new(metadata)));
+                    }
+                    Err(err) => {
+                        if format!("{err:#}").contains(LOAD_SUPERSEDED_REASON) {
+                            return Err(err);
+                        }
+                        tracing::warn!(
+                            target: "diretta_handoff",
+                            phase = "load_handoff_fallback",
+                            error = %err,
+                            "handoff 失败，回退全量重连"
+                        );
+                    }
+                }
+            }
+
+            // ---- 阶段 3：全量重连（淡出拆旧连接 → 重新协商 Diretta endpoint）----
+            let (old_threads, token) = match direct_initial_take {
+                Some(threads) => (threads, token),
+                None => {
+                    // handoff 尝试失败：确保旧源排空后再拆（sequence 中可能已淡出）。
+                    // 事件驱动等待，无固定 sleep；暂停态/无连接瞬时通过
+                    {
+                        let mut player = state_for_task.player.lock();
+                        let _ = player.begin_direct_fade_out();
+                    }
+                    if !state_for_task
+                        .player
+                        .lock()
+                        .direct_wait_fade_drained(
+                            DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                            DIRECT_FADE_DRAIN_TIMEOUT,
+                        )
+                    {
+                        tracing::warn!(
+                            target: "diretta_handoff",
+                            phase = "reconnect_fade_drain_timeout",
+                            "全量重连前排空等待超时，仍继续拆连接"
+                        );
+                    }
+                    // 校验 + 拆连接必须同一把锁内完成，防止与更新的 load 竞态抢跑
+                    let (threads, token) = {
+                        let mut player = state_for_task.player.lock();
+                        if !player.is_load_token_current(token) {
+                            anyhow::bail!(LOAD_SUPERSEDED_REASON);
+                        }
+                        player.take_for_async_load(handle.clone())
+                    };
+                    task_final_token_writer.store(token, std::sync::atomic::Ordering::Release);
+                    (threads, token)
+                }
+            };
+            let replacing_direct_playback = old_threads.direct_playback.is_some();
+            if let Some(h) = old_threads.join_aux() {
+                let _ = h.join();
+            }
+            if replacing_direct_playback {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+
+            let playback = if stream_mode {
+                let http = audio_engine_core::ffmpeg_audio::HttpAudioSource::new_with_cancel_handle(
+                    &source_for_direct,
+                    &handle,
+                )?;
+                audio_engine_core::direct_runtime::DirectPlayback::open_stream(
                     &selector,
                     &source_for_direct,
                     Box::new(http),
                     meta_duration_secs.unwrap_or(0.0),
                     auto_play,
-                )?;
-                let mut metadata = audio_engine_core::AudioMetadata {
-                    duration_secs: meta_duration_secs.unwrap_or(0.0),
-                    channels: 2,
-                    codec: "stream".to_string(),
-                    ..Default::default()
-                };
-                if let audio_engine_core::direct_runtime::DirectFormat::Pcm(format) = playback.format() {
-                    metadata.sample_rate = format.sample_rate;
-                    metadata.original_sample_rate = format.sample_rate;
-                    metadata.channels = format.channels;
-                    metadata.bits_per_sample = u32::from(format.valid_bits);
-                }
-                metadata.duration_secs = playback.duration();
-                if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
-                    anyhow::bail!(LOAD_SUPERSEDED_REASON);
-                }
-                return Ok::<_, anyhow::Error>((metadata, playback));
-            }
-
-            let physical_source = if is_http {
-                materialize_direct_input(&source_for_direct)?
+                )?
             } else {
-                source_for_direct
+                let physical = physical_source.expect("非 stream 模式必然已有物理源路径");
+                audio_engine_core::direct_runtime::DirectPlayback::open_local(
+                    &selector,
+                    &physical,
+                    metadata.duration_secs,
+                    0.0,
+                    auto_play,
+                )?
             };
-            let mut metadata = audio_engine_core::decoder::probe_metadata(
-                &physical_source,
-                cover_dir.as_deref(),
-                handle,
-            )?;
-            if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
-                anyhow::bail!(LOAD_SUPERSEDED_REASON);
-            }
-            let playback = audio_engine_core::direct_runtime::DirectPlayback::open_local(
-                &selector,
-                &physical_source,
-                metadata.duration_secs,
-                0.0,
-                auto_play,
-            )?;
             match playback.format() {
                 audio_engine_core::direct_runtime::DirectFormat::Pcm(format) => {
                     metadata.sample_rate = format.sample_rate;
@@ -885,61 +1101,68 @@ async fn load_handler(
             if load_token_for_direct.load(std::sync::atomic::Ordering::Acquire) != token {
                 anyhow::bail!(LOAD_SUPERSEDED_REASON);
             }
-            Ok::<_, anyhow::Error>((metadata, playback))
+            Ok(DirectLoadOutcome::FullReconnect {
+                metadata: Box::new(metadata),
+                playback,
+                token,
+            })
         })
         .await
         .map_err(|e| ApiError::internal(format!("Direct load task join error: {e}")))?;
 
-        let (metadata, playback) = match result {
-            Ok(val) => val,
+        return match result {
+            Ok(DirectLoadOutcome::Handoff(meta)) => {
+                Ok(direct_load_response(&source, auto_play, *meta))
+            }
+            Ok(DirectLoadOutcome::FullReconnect {
+                metadata,
+                playback,
+                token,
+            }) => {
+                let committed_meta = {
+                    let mut player = state.player.lock();
+                    player
+                        .commit_direct_loaded(token, &source, auto_play, *metadata, playback)
+                        .map_err(|e| ApiError::internal(e.to_string()))?
+                };
+                match committed_meta {
+                    Some(meta) => Ok(direct_load_response(&source, auto_play, meta)),
+                    None => Ok(Json(PlayerResponse::ok(json!({
+                        "status": "superseded",
+                        "source": source,
+                    })))),
+                }
+            }
             Err(err) => {
-                let mut player = state.player.lock();
-                if !player.is_load_token_current(token) {
+                let err_text = format!("{err:#}");
+                if err_text.contains(LOAD_SUPERSEDED_REASON) {
                     return Ok(Json(PlayerResponse::ok(json!({
                         "status": "superseded",
                         "source": source,
                     }))));
                 }
-                player.stop();
-                return Err(ApiError::bad_request(format!("{err:#}")));
+                let mut player = state.player.lock();
+                // 仅当本请求仍持有最后登记的 token 时才报错并清理；
+                // 否则已被更新的 load 抢占，静默让位（连接归新请求管理）
+                if player.is_load_token_current(task_final_token.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    player.stop();
+                    return Err(ApiError::bad_request(err_text));
+                }
+                Ok(Json(PlayerResponse::ok(json!({
+                    "status": "superseded",
+                    "source": source,
+                }))))
             }
-        };
-
-        let committed_meta = {
-            let mut player = state.player.lock();
-            player
-                .commit_direct_loaded(token, &source, auto_play, metadata, playback)
-                .map_err(|e| ApiError::internal(e.to_string()))?
-        };
-
-        return match committed_meta {
-            Some(meta) => Ok(Json(PlayerResponse::ok(json!({
-                "status": if auto_play { "playing" } else { "paused" },
-                "source": source,
-                "title": meta.title,
-                "artist": meta.artist,
-                "album": meta.album,
-                "duration": meta.duration_secs,
-                "sample_rate": meta.sample_rate,
-                "original_sample_rate": meta.original_sample_rate,
-                "channels": meta.channels,
-                "bits_per_sample": meta.bits_per_sample,
-                "bit_rate": meta.bit_rate,
-                "codec": meta.codec,
-                "cover": meta.cover,
-                "has_cover": meta.cover_raw.is_some() || meta.cover.is_some(),
-                "has_embedded_lyric": meta.embedded_lyric.is_some(),
-            })))),
-            None => Ok(Json(PlayerResponse::ok(json!({
-                "status": "superseded",
-                "source": source,
-            })))),
         };
     }
 
     let result = spawn_isolated_blocking("player-load-worker", move || {
-        if let Some(h) = old_threads.join_aux() {
-            let _ = h.join();
+        // 非 Direct 选择器路径：direct_initial_take 必为 Some（进入时已在锁内拆线）
+        if let Some(threads) = direct_initial_take {
+            if let Some(h) = threads.join_aux() {
+                let _ = h.join();
+            }
         }
         let prepared = audio_engine_core::decoder::prepare_decode(
             &source_for_decoder,

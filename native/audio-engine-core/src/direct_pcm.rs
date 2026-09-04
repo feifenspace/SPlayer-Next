@@ -3,10 +3,11 @@ use std::ffi::{c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
 use std::slice;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::{debug, warn};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use ffmpeg_audio::sys;
@@ -908,10 +909,18 @@ pub struct DirectPcmDecoder {
 
 impl DirectPcmDecoder {
     pub fn open_local(path: &Path) -> Result<Self> {
-        let path = path
-            .to_str()
-            .context("Source Direct 当前只接受 UTF-8 本地路径")?;
-        let path = CString::new(path).context("Source Direct 本地路径包含 NUL")?;
+        Self::open_source(&path.to_string_lossy())
+    }
+
+    /// 同时支持本地路径与 http(s):// URL；URL 走自定义 AVIO（与 DirectPcmSource::open_stream 一致）。
+    /// 用于同连接 handoff 路径，让 producer 能在不重建 Diretta 连接的情况下切换音源。
+    pub fn open_source(source: &str) -> Result<Self> {
+        if source.starts_with("http://") || source.starts_with("https://") {
+            let http = crate::ffmpeg_audio::HttpAudioSource::new(source)
+                .context("构造 Source Direct HTTP 流式音源失败")?;
+            return Self::open_reader(Box::new(http));
+        }
+        let path = CString::new(source).context("Source Direct 路径包含 NUL")?;
 
         let mut format_context = ptr::null_mut();
         let open_result = unsafe {
@@ -1379,6 +1388,9 @@ const SLOT_FILLING: u8 = 1;
 const SLOT_READY: u8 = 2;
 const SLOT_IN_FLIGHT: u8 = 3;
 const NO_SLOT: usize = usize::MAX;
+/// producer 条件等待上限：所有关键事件（slot 释放/命令/淡出激活）都有 notify，
+/// 超时仅作为漏报兜底；到期后回到循环顶保持命令响应性
+const PRODUCER_WAIT_CEILING: Duration = Duration::from_millis(100);
 
 struct DirectPcmSlot {
     state: AtomicU8,
@@ -1415,7 +1427,7 @@ enum DirectPcmCommand {
         response: mpsc::SyncSender<Result<f64>>,
     },
     ReplaceLocal {
-        path: PathBuf,
+        source: String,
         response: mpsc::SyncSender<Result<DirectPcmFormat>>,
     },
     StageLocal {
@@ -1425,6 +1437,76 @@ enum DirectPcmCommand {
         response: mpsc::SyncSender<Result<()>>,
     },
     CancelStaged,
+}
+
+/// 消费端源级淡出状态：手动切歌/停止关流前，把输出线性渐零到静音，消除
+/// mid-sample 硬切爆音。增益以 1e-6 定点表示（1_000_000 = 1.0）；
+/// 稳态（ramping=false 且未静音）完全不触碰样本，保持位精确。
+struct DirectPcmFadeState {
+    /// 淡出窗内起始增益
+    gain_start_micro: AtomicU32,
+    /// 淡出窗内结束增益
+    gain_end_micro: AtomicU32,
+    /// 待应用：下一块交付时套用窗内包络并自动清除
+    ramping: AtomicBool,
+    /// 已渐零：后续块全部输出数字静音，直到连接关闭
+    silent: AtomicBool,
+    /// 已交付的静音块数（tinyLMS 式预静音计数：足够多的静音块顶掉目标端缓冲中的旧音频）
+    silence_blocks: AtomicU32,
+    /// 打包样本位宽（16/32），0 = 未知（尚未解码出首块）
+    sample_bits: AtomicU8,
+    /// 有效位宽（s24-in-s32 传输槽时为 24，其余等于 sample_bits）
+    valid_bits: AtomicU8,
+    /// 淡出窗长度（样本数，约 20ms）
+    window_samples: AtomicUsize,
+}
+
+impl DirectPcmFadeState {
+    fn new() -> Self {
+        Self {
+            gain_start_micro: AtomicU32::new(1_000_000),
+            gain_end_micro: AtomicU32::new(1_000_000),
+            ramping: AtomicBool::new(false),
+            silent: AtomicBool::new(false),
+            silence_blocks: AtomicU32::new(0),
+            sample_bits: AtomicU8::new(0),
+            valid_bits: AtomicU8::new(0),
+            window_samples: AtomicUsize::new(0),
+        }
+    }
+
+    /// 启动淡出：按采样率换算约 20ms 的线性渐零窗，随后块为静音
+    fn begin_fade_out(&self, sample_bits: u8, valid_bits: u8, sample_rate: u32) {
+        if self.silent.load(Ordering::Acquire) {
+            return;
+        }
+        self.sample_bits.store(sample_bits, Ordering::Release);
+        self.valid_bits.store(valid_bits, Ordering::Release);
+        let window = (sample_rate as usize).saturating_mul(20) / 1000;
+        self.window_samples.store(window.max(1), Ordering::Release);
+        let current = self.gain_end_micro.load(Ordering::Acquire);
+        self.gain_start_micro.store(current, Ordering::Release);
+        self.gain_end_micro.store(0, Ordering::Release);
+        self.ramping.store(true, Ordering::Release);
+    }
+
+    fn silent(&self) -> bool {
+        self.silent.load(Ordering::Acquire)
+    }
+
+    /// handoff/seek 换源前清除淡出状态：新源必须从位精确全增益开始，
+    /// 否则上一首遗留的 silent 标记会把新源首块整体置零
+    fn reset(&self) {
+        self.ramping.store(false, Ordering::Release);
+        self.silent.store(false, Ordering::Release);
+        self.silence_blocks.store(0, Ordering::Release);
+    }
+
+    /// 排空谓词：已渐零且交付的静音块数达到下限
+    fn drained(&self, min_blocks: u32) -> bool {
+        self.silent.load(Ordering::Acquire)
+            && self.silence_blocks.load(Ordering::Acquire) >= min_blocks
+    }
 }
 
 struct DirectPcmRing {
@@ -1438,6 +1520,18 @@ struct DirectPcmRing {
     finished: AtomicBool,
     failed: AtomicBool,
     stopped: AtomicBool,
+    fade: DirectPcmFadeState,
+    /// 最近一次成功解码的块字节数（0 = 尚未解码出任何帧）
+    last_block_bytes: AtomicUsize,
+    /// 最近一次成功解码的块帧数
+    last_block_frames: AtomicUsize,
+    /// 关流淡出期间的共享数字静音缓冲区（producer 创建一次，consumer 只读/写零）
+    silence_buffer: Mutex<Option<Vec<u8>>>,
+    /// 单一状态信号：producer 与控制线程共享的条件等待通道（避免任何忙等/轮询）
+    signal: Mutex<()>,
+    signal_cv: Condvar,
+    /// 控制通道存在待处理命令的提示位：命令发送方置位并唤醒，producer 消费命令前清零
+    command_pending: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -1463,7 +1557,118 @@ impl DirectPcmRing {
             finished: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            fade: DirectPcmFadeState::new(),
+            last_block_bytes: AtomicUsize::new(0),
+            last_block_frames: AtomicUsize::new(0),
+            silence_buffer: Mutex::new(None),
+            signal: Mutex::new(()),
+            signal_cv: Condvar::new(),
+            command_pending: AtomicBool::new(false),
         })
+    }
+
+    /// 状态变化通知：取一次锁再释放后 notify，保证不会丢失在等待方进入之前。
+    /// 供 SDK 回调线程调用：仅一次短暂锁 + futex wake，无分配，实时安全。
+    fn notify_state(&self) {
+        let _guard = self.signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.signal_cv.notify_all();
+    }
+
+    /// 命令发送侧：置提示位并唤醒 producer（其可能正处于条件等待中）
+    fn signal_command(&self) {
+        self.command_pending.store(true, Ordering::Release);
+        self.notify_state();
+    }
+
+    /// 条件等待：谓词为真立即返回 true；deadline 内未满足返回 false（超时兜底）。
+    /// 谓词只依赖 ring 自身状态；等待方返回后应回到命令循环保持命令响应性。
+    fn wait_for(&self, predicate: impl Fn(&Self) -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if predicate(self) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .signal_cv
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next;
+        }
+    }
+
+    /// SDK 回调内对即将交付的块原位应用淡出包络/静音。
+    /// 块处于 IN_FLIGHT 状态时仅由本回调可写（下一次 next_block/release 才回收），写入安全。
+    fn apply_fade(&self, data: *mut u8, len: usize) {
+        if data.is_null() || len == 0 {
+            return;
+        }
+        let fade = &self.fade;
+        if fade.silent() {
+            unsafe { ptr::write_bytes(data, 0, len) };
+            fade.silence_blocks.fetch_add(1, Ordering::Release);
+            // 静音交付计数变化：唤醒排空等待方
+            self.notify_state();
+            return;
+        }
+        if !fade.ramping.load(Ordering::Acquire) {
+            return;
+        }
+        let sample_bits = fade.sample_bits.load(Ordering::Acquire);
+        let valid_bits = fade.valid_bits.load(Ordering::Acquire);
+        let window = fade.window_samples.load(Ordering::Acquire);
+        if (sample_bits != 16 && sample_bits != 32) || valid_bits == 0 || window == 0 {
+            return;
+        }
+        let bytes_per_sample = usize::from(sample_bits / 8);
+        let total_samples = len / bytes_per_sample;
+        if total_samples == 0 {
+            return;
+        }
+        let start_gain = f64::from(fade.gain_start_micro.load(Ordering::Acquire)) / 1_000_000.0;
+        let end_gain = f64::from(fade.gain_end_micro.load(Ordering::Acquire)) / 1_000_000.0;
+        let shift = u32::from(sample_bits) - u32::from(valid_bits);
+        let window = window.min(total_samples);
+        let gain_at = |i: usize| -> f64 {
+            if i >= window {
+                end_gain
+            } else {
+                start_gain + (end_gain - start_gain) * (i as f64) / (window as f64)
+            }
+        };
+        let scale = |i: usize, sample: i64| -> i64 {
+            let scaled = (sample as f64 * gain_at(i)).round() as i64;
+            // 有效位对齐：s24-in-s32 传输槽缩放后保持低位零
+            (scaled >> shift) << shift
+        };
+        unsafe {
+            if sample_bits == 16 {
+                let p = data.cast::<i16>();
+                for i in 0..total_samples {
+                    *p.add(i) = scale(i, i64::from(*p.add(i))) as i16;
+                }
+            } else {
+                let p = data.cast::<i32>();
+                for i in 0..total_samples {
+                    *p.add(i) = scale(i, i64::from(*p.add(i))) as i32;
+                }
+            }
+        }
+        // 包络已交付：推进状态
+        fade.gain_start_micro.store(
+            fade.gain_end_micro.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        if end_gain <= 0.0 {
+            fade.silent.store(true, Ordering::Release);
+            // 渐零完成：唤醒排空等待方（此刻静音块计数仍为 0，由 silent 分支继续累加）
+            self.notify_state();
+        }
+        fade.ramping.store(false, Ordering::Release);
     }
 
     fn next_block(&self) -> Option<DirectPcmBlock> {
@@ -1523,6 +1728,8 @@ impl DirectPcmRing {
         self.consumed_frames
             .fetch_add(frames as u64, Ordering::Relaxed);
         slot.state.store(SLOT_FREE, Ordering::Release);
+        // slot 释放：唤醒等待空闲 slot 的 producer
+        self.notify_state();
     }
 
     fn reset_for_transition(&self) {
@@ -1532,6 +1739,7 @@ impl DirectPcmRing {
         self.consumed_frames.store(0, Ordering::Relaxed);
         self.finished.store(false, Ordering::Relaxed);
         self.failed.store(false, Ordering::Relaxed);
+        self.fade.reset();
         for slot in &self.slots {
             slot.state.store(SLOT_FREE, Ordering::Relaxed);
             slot.payload_ptr.store(ptr::null_mut(), Ordering::Relaxed);
@@ -1542,6 +1750,8 @@ impl DirectPcmRing {
             slot.boundary_generation.store(0, Ordering::Relaxed);
             unsafe { &mut *slot.frame.get() }.clear();
         }
+        // finished/failed 已清除、fade 已复位：唤醒 producer 与排空等待方
+        self.notify_state();
     }
 }
 
@@ -1659,11 +1869,17 @@ fn install_staged_pcm_slot(
 }
 
 fn replace_pcm_ring(
-    path: &Path,
+    source: &str,
     ring: &DirectPcmRing,
     current_format: DirectPcmFormat,
 ) -> Result<(DirectPcmDecoder, DirectPcmFormat)> {
-    let mut decoder = DirectPcmDecoder::open_local(path)?;
+    debug!(
+        target: "diretta_handoff",
+        phase = "pcm_ring_open_start",
+        source = %source,
+        "replace_pcm_ring open source"
+    );
+    let mut decoder = DirectPcmDecoder::open_source(source)?;
     let mut prepared = DirectPcmFrame::new()?;
     ensure!(
         decoder.read_frame(&mut prepared)?,
@@ -1673,6 +1889,15 @@ fn replace_pcm_ring(
     ensure!(
         same_pcm_transport(current_format, new_format),
         "[Direct] 新音源 PCM wire format 与当前 Diretta connection 不一致"
+    );
+    debug!(
+        target: "diretta_handoff",
+        phase = "pcm_ring_open_done",
+        sample_rate = %new_format.sample_rate,
+        channels = %new_format.channels,
+        valid_bits = %new_format.valid_bits,
+        storage_bits = %new_format.storage_bits,
+        "replace_pcm_ring first frame decoded"
     );
 
     if new_format.memory_path == DirectPcmMemoryPath::BitPerfectRepack {
@@ -1686,6 +1911,7 @@ fn replace_pcm_ring(
         prepared.repack_planar(new_format.sample_format, prepared.sample_offset)?;
     }
 
+    let silence_blocks_before = ring.fade.silence_blocks.load(Ordering::Acquire);
     ring.reset_for_transition();
     let first_slot = &ring.slots[0];
     first_slot.state.store(SLOT_FILLING, Ordering::Relaxed);
@@ -1712,7 +1938,26 @@ fn replace_pcm_ring(
     first_slot
         .sample_frames
         .store(first_frame.samples_per_channel(), Ordering::Relaxed);
+    // handoff 后第一个 slot 标记为 boundary：消费时 next_block 会递增 transition_count
+    first_slot.boundary_duration_micros.store(
+        ring.duration_micros.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    first_slot
+        .boundary_generation
+        .store(ring.boundary_generation.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    first_slot.boundary.store(true, Ordering::Relaxed);
     first_slot.state.store(SLOT_READY, Ordering::Release);
+    let silence_blocks_after = ring.fade.silence_blocks.load(Ordering::Acquire);
+    debug!(
+        target: "diretta_handoff",
+        phase = "pcm_ring_swap_done",
+        silence_blocks_before = %silence_blocks_before,
+        silence_blocks_after = %silence_blocks_after,
+        transition_count = %ring.transition_count.load(Ordering::Acquire),
+        consumed_frames = %ring.consumed_frames.load(Ordering::Acquire),
+        "replace_pcm_ring slot swap complete"
+    );
     Ok((decoder, new_format))
 }
 
@@ -1741,8 +1986,25 @@ impl DirectPcmMonitor {
                 .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_FREE)
     }
 
+    /// 事件驱动首块消费等待：任一帧被设备消费、失败或源提前结束即唤醒；
+    /// 无事件时阻塞至超时（返回 false）。用于启动校验，取代轮询 sleep
+    pub fn wait_first_consumed(&self, timeout: Duration) -> bool {
+        self.ring.wait_for(
+            |ring| {
+                ring.consumed_frames.load(Ordering::Acquire) > 0
+                    || ring.failed.load(Ordering::Acquire)
+                    || ring.finished.load(Ordering::Acquire)
+            },
+            timeout,
+        )
+    }
+
     pub fn transition_count(&self) -> u64 {
         self.ring.transition_count.load(Ordering::Acquire)
+    }
+
+    pub fn silence_blocks(&self) -> u32 {
+        self.ring.fade.silence_blocks.load(Ordering::Acquire)
     }
 
     pub fn duration(&self) -> f64 {
@@ -1757,6 +2019,7 @@ impl DirectPcmMonitor {
 #[derive(Clone)]
 pub struct DirectPcmStageHandle {
     control_tx: mpsc::Sender<DirectPcmCommand>,
+    ring: Arc<DirectPcmRing>,
 }
 
 impl DirectPcmStageHandle {
@@ -1777,6 +2040,7 @@ impl DirectPcmStageHandle {
                 response: response_tx,
             })
             .context("提交 Source Direct PCM staged source 失败")?;
+        self.ring.signal_command();
         response_rx
             .recv()
             .context("等待 Source Direct PCM staged source 结果失败")?
@@ -1784,6 +2048,7 @@ impl DirectPcmStageHandle {
 
     pub fn cancel(&self) {
         let _ = self.control_tx.send(DirectPcmCommand::CancelStaged);
+        self.ring.signal_command();
     }
 }
 
@@ -1866,6 +2131,10 @@ impl DirectPcmSource {
                 let mut staged: Option<StagedPcmSource> = None;
                 let mut next_slot = 1 % producer_ring.slots.len();
                 while !producer_ring.stopped.load(Ordering::Acquire) {
+                    // 消费命令前清提示位：此后发送方的新命令会重新置位并唤醒
+                    producer_ring
+                        .command_pending
+                        .store(false, Ordering::Release);
                     match control_rx.try_recv() {
                         Ok(DirectPcmCommand::Seek {
                             position_secs,
@@ -1884,8 +2153,8 @@ impl DirectPcmSource {
                             next_slot = 1 % producer_ring.slots.len();
                             continue;
                         }
-                        Ok(DirectPcmCommand::ReplaceLocal { path, response }) => {
-                            let result = replace_pcm_ring(&path, &producer_ring, active_format);
+                        Ok(DirectPcmCommand::ReplaceLocal { source, response }) => {
+                            let result = replace_pcm_ring(&source, &producer_ring, active_format);
                             match result {
                                 Ok((new_decoder, new_format)) => {
                                     decoder = new_decoder;
@@ -1930,14 +2199,74 @@ impl DirectPcmSource {
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
                     if producer_ring.failed.load(Ordering::Acquire) {
-                        thread::sleep(Duration::from_millis(1));
+                        // 事件等待：等 failed 被清（reset_for_transition）或有新命令
+                        producer_ring.wait_for(
+                            |ring| {
+                                !ring.failed.load(Ordering::Acquire)
+                                    || ring.command_pending.load(Ordering::Acquire)
+                            },
+                            PRODUCER_WAIT_CEILING,
+                        );
                         continue;
                     }
                     if producer_ring.finished.load(Ordering::Acquire) {
-                        let Some(candidate) = staged.take() else {
-                            thread::sleep(Duration::from_millis(1));
+                        // 关流前淡出激活：即便文件已读完，也要继续产数字静音块
+                        // 给 consumer apply_fade 把数据置零并累加 silence_blocks
+                        let fade_active = producer_ring.fade.ramping.load(Ordering::Acquire)
+                            || producer_ring.fade.silent.load(Ordering::Acquire);
+                        if !fade_active {
+                            let Some(candidate) = staged.take() else {
+                                // 事件等待：等淡出被激活（关流排空开始）、新源就位或命令到达
+                                producer_ring.wait_for(
+                                    |ring| {
+                                        ring.fade.ramping.load(Ordering::Acquire)
+                                            || ring.fade.silent.load(Ordering::Acquire)
+                                            || !ring.finished.load(Ordering::Acquire)
+                                            || ring.command_pending.load(Ordering::Acquire)
+                                    },
+                                    PRODUCER_WAIT_CEILING,
+                                );
+                                continue;
+                            };
+                            let slot = &producer_ring.slots[next_slot];
+                            if slot
+                                .state
+                                .compare_exchange(
+                                    SLOT_FREE,
+                                    SLOT_FILLING,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                staged = Some(candidate);
+                                // 事件等待：等 consumer 释放 slot 或新命令
+                                producer_ring.wait_for(
+                                    |ring| {
+                                        ring.slots[next_slot].state.load(Ordering::Acquire)
+                                            == SLOT_FREE
+                                            || ring.command_pending.load(Ordering::Acquire)
+                                    },
+                                    PRODUCER_WAIT_CEILING,
+                                );
+                                continue;
+                            }
+                            match install_staged_pcm_slot(candidate, slot) {
+                                Ok((new_decoder, new_format)) => {
+                                    decoder = new_decoder;
+                                    active_format = new_format;
+                                    producer_ring.finished.store(false, Ordering::Release);
+                                    next_slot = (next_slot + 1) % producer_ring.slots.len();
+                                }
+                                Err(_) => {
+                                    slot.state.store(SLOT_FREE, Ordering::Release);
+                                    producer_ring.failed.store(true, Ordering::Release);
+                                }
+                            }
                             continue;
-                        };
+                        }
+                        // fade_active && finished：持续产出数字静音块
+                        // 使用共享零缓冲，按最近一次有效块的几何尺寸交付
                         let slot = &producer_ring.slots[next_slot];
                         if slot
                             .state
@@ -1949,22 +2278,41 @@ impl DirectPcmSource {
                             )
                             .is_err()
                         {
-                            staged = Some(candidate);
-                            thread::sleep(Duration::from_millis(1));
+                            // 事件等待：等 consumer 释放 slot 或新命令
+                            producer_ring.wait_for(
+                                |ring| {
+                                    ring.slots[next_slot].state.load(Ordering::Acquire) == SLOT_FREE
+                                        || ring.command_pending.load(Ordering::Acquire)
+                                },
+                                PRODUCER_WAIT_CEILING,
+                            );
                             continue;
                         }
-                        match install_staged_pcm_slot(candidate, slot) {
-                            Ok((new_decoder, new_format)) => {
-                                decoder = new_decoder;
-                                active_format = new_format;
-                                producer_ring.finished.store(false, Ordering::Release);
-                                next_slot = (next_slot + 1) % producer_ring.slots.len();
-                            }
-                            Err(_) => {
-                                slot.state.store(SLOT_FREE, Ordering::Release);
-                                producer_ring.failed.store(true, Ordering::Release);
-                            }
+                        let bytes = producer_ring.last_block_bytes.load(Ordering::Acquire);
+                        let frames = producer_ring.last_block_frames.load(Ordering::Acquire);
+                        if bytes == 0 || frames == 0 {
+                            // 尚未成功解码过任何帧，无法推断静音块几何尺寸：保持空闲
+                            slot.state.store(SLOT_FREE, Ordering::Release);
+                            producer_ring.wait_for(
+                                |ring| ring.command_pending.load(Ordering::Acquire),
+                                PRODUCER_WAIT_CEILING,
+                            );
+                            continue;
                         }
+                        let mut guard = match producer_ring.silence_buffer.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        let buffer = guard.get_or_insert_with(|| vec![0u8; bytes]);
+                        if buffer.len() < bytes {
+                            *buffer = vec![0u8; bytes];
+                        }
+                        slot.payload_ptr
+                            .store(buffer.as_ptr().cast_mut(), Ordering::Relaxed);
+                        slot.payload_len.store(bytes, Ordering::Relaxed);
+                        slot.sample_frames.store(frames, Ordering::Relaxed);
+                        slot.state.store(SLOT_READY, Ordering::Release);
+                        next_slot = (next_slot + 1) % producer_ring.slots.len();
                         continue;
                     }
                     let slot = &producer_ring.slots[next_slot];
@@ -1978,7 +2326,14 @@ impl DirectPcmSource {
                         )
                         .is_err()
                     {
-                        thread::sleep(Duration::from_millis(1));
+                        // 事件等待：等 consumer 释放 slot 或新命令
+                        producer_ring.wait_for(
+                            |ring| {
+                                ring.slots[next_slot].state.load(Ordering::Acquire) == SLOT_FREE
+                                    || ring.command_pending.load(Ordering::Acquire)
+                            },
+                            PRODUCER_WAIT_CEILING,
+                        );
                         continue;
                     }
 
@@ -1987,20 +2342,37 @@ impl DirectPcmSource {
                         Ok(true) => {
                             let frame_format = match frame.format() {
                                 Ok(value) => value,
-                                Err(_) => {
+                                Err(error) => {
+                                    warn!(
+                                        target: "diretta_handoff",
+                                        phase = "producer_frame_format_err",
+                                        error = %error,
+                                        "Source Direct 解码帧缺少格式信息，ring 标记失败"
+                                    );
                                     slot.state.store(SLOT_FREE, Ordering::Release);
                                     producer_ring.failed.store(true, Ordering::Release);
                                     return;
                                 }
                             };
                             if frame_format != active_format {
+                                warn!(
+                                    target: "diretta_handoff",
+                                    phase = "producer_format_mismatch",
+                                    "Source Direct 中途格式变化，ring 标记失败"
+                                );
                                 slot.state.store(SLOT_FREE, Ordering::Release);
                                 producer_ring.failed.store(true, Ordering::Release);
                                 return;
                             }
                             let data = match frame.payload_ptr() {
                                 Ok(value) => value,
-                                Err(_) => {
+                                Err(error) => {
+                                    warn!(
+                                        target: "diretta_handoff",
+                                        phase = "producer_payload_ptr_err",
+                                        error = %error,
+                                        "Source Direct 帧负载指针不可用，ring 标记失败"
+                                    );
                                     slot.state.store(SLOT_FREE, Ordering::Release);
                                     producer_ring.failed.store(true, Ordering::Release);
                                     return;
@@ -2010,6 +2382,14 @@ impl DirectPcmSource {
                             slot.payload_len.store(frame.payload_len, Ordering::Relaxed);
                             slot.sample_frames
                                 .store(frame.samples_per_channel(), Ordering::Relaxed);
+                            // 记录最近一次有效块几何尺寸，供关流淡出期间合成静音块
+                            producer_ring
+                                .last_block_bytes
+                                .store(frame.payload_len, Ordering::Release);
+                            producer_ring.last_block_frames.store(
+                                frame.samples_per_channel(),
+                                Ordering::Release,
+                            );
                             slot.state.store(SLOT_READY, Ordering::Release);
                             next_slot = (next_slot + 1) % producer_ring.slots.len();
                         }
@@ -2032,7 +2412,13 @@ impl DirectPcmSource {
                                 producer_ring.finished.store(true, Ordering::Release);
                             }
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            warn!(
+                                target: "diretta_handoff",
+                                phase = "producer_read_frame_err",
+                                error = %error,
+                                "Source Direct 解码失败，ring 标记失败"
+                            );
                             slot.state.store(SLOT_FREE, Ordering::Release);
                             producer_ring.failed.store(true, Ordering::Release);
                         }
@@ -2066,6 +2452,7 @@ impl DirectPcmSource {
     pub fn stage_handle(&self) -> DirectPcmStageHandle {
         DirectPcmStageHandle {
             control_tx: self.control_tx.clone(),
+            ring: Arc::clone(&self.ring),
         }
     }
 
@@ -2100,23 +2487,65 @@ impl DirectPcmSource {
                 response: response_tx,
             })
             .context("提交 Source Direct PCM seek 失败")?;
+        self.ring.signal_command();
         response_rx
             .recv()
             .context("等待 Source Direct PCM seek 结果失败")?
     }
 
-    pub fn replace_local_while_paused(&mut self, path: &Path) -> Result<DirectPcmFormat> {
+    /// 关流前源级淡出：SDK 继续拉块时输出线性渐零（约 20ms），随后块为数字静音。
+    /// 与 pause+close 组合使用，消除手动切歌/停止时 mid-sample 硬切爆音。
+    pub fn begin_fade_out(&self) {
+        self.ring
+            .fade
+            .begin_fade_out(self.format.storage_bits, self.format.valid_bits, self.format.sample_rate);
+        // 唤醒 producer：finished 状态下它需立即转入静音块合成以推进排空
+        self.ring.notify_state();
+    }
+
+    /// 淡出块是否已交付给 SDK（后续块均为静音）
+    pub fn is_faded_out(&self) -> bool {
+        self.ring.fade.silent()
+    }
+
+    /// 已交付的静音块数（预静音计数）
+    pub fn silence_blocks_handed(&self) -> u32 {
+        self.ring.fade.silence_blocks.load(Ordering::Acquire)
+    }
+
+    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
+    /// 取代旧的「10ms 轮询 + 固定 sleep」，控制线程在等待期间不占用 CPU。
+    pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        self.ring
+            .wait_for(|ring| ring.fade.drained(min_blocks), timeout)
+    }
+
+    pub fn replace_local_while_paused(&mut self, source: &str) -> Result<DirectPcmFormat> {
+        debug!(
+            target: "diretta_handoff",
+            phase = "pcm_api_send",
+            source = %source,
+            "DirectPcmSource::replace_local_while_paused send command"
+        );
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
             .send(DirectPcmCommand::ReplaceLocal {
-                path: path.to_owned(),
+                source: source.to_owned(),
                 response: response_tx,
             })
             .context("提交 Source Direct PCM handoff 失败")?;
+        self.ring.signal_command();
         let format = response_rx
             .recv()
             .context("等待 Source Direct PCM handoff 结果失败")??;
         self.format = format;
+        debug!(
+            target: "diretta_handoff",
+            phase = "pcm_api_recv",
+            sample_rate = %format.sample_rate,
+            channels = %format.channels,
+            "DirectPcmSource::replace_local_while_paused received format"
+        );
         Ok(format)
     }
 }
@@ -2133,6 +2562,8 @@ pub unsafe extern "C" fn direct_pcm_next_block(
     let Some(block) = ring.next_block() else {
         return false;
     };
+    // 关流前淡出/静音在交付前原位应用（块 IN_FLIGHT 期仅本回调可写）
+    ring.apply_fade(block.data.cast_mut(), block.len);
     unsafe {
         *data = block.data;
         *len = block.len;
@@ -2181,12 +2612,33 @@ fn ffmpeg_error(code: i32, action: &str) -> anyhow::Error {
 mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use base64::Engine;
 
     use super::*;
 
     static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// 测试辅助：轮询等待 producer 把下一个 slot 填好。
+    /// 真实播放路径有消费循环在持续拉取，不需要 sleep；
+    /// 但测试代码单次调用直接消费，可能撞上 producer 还没填的窗口。
+    fn poll_next_block(
+        context: *mut std::ffi::c_void,
+        data: &mut *const u8,
+        len: &mut usize,
+    ) -> bool {
+        // 先 yield 让 producer 线程有机会抢占 CPU 填 slot
+        std::thread::yield_now();
+        for _ in 0..500 {
+            if unsafe { direct_pcm_next_block(context, data, len) } {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        eprintln!("poll_next_block 超时：producer 可能未启动或已卡死");
+        false
+    }
 
     struct TempAudioFile {
         path: std::path::PathBuf,
@@ -2842,6 +3294,80 @@ mod tests {
         unsafe { direct_pcm_release_block(source.callback_context()) };
     }
 
+    /// 关流前淡出：当前块头部位精确、窗尾渐零，后续块全静音
+    #[test]
+    fn fade_out_ramps_block_head_bit_exact_then_silence() {
+        let sample_rate = 44_100_u32;
+        let mut pcm: Vec<u8> = Vec::new();
+        for i in 0..16_384_i32 {
+            let sample = ((i * 37) % 20000 - 10000) as i16;
+            pcm.extend_from_slice(&sample.to_le_bytes());
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        let fixture = TempAudioFile::wav(sample_rate, 16, &pcm);
+        let reference = DirectPcmSource::open_local(&fixture.path).unwrap();
+        let fading = DirectPcmSource::open_local(&fixture.path).unwrap();
+
+        let mut data = ptr::null();
+        let mut len = 0_usize;
+        // 两个源的第一块位精确一致（淡出前零触碰）
+        assert!(
+            unsafe { direct_pcm_next_block(reference.callback_context(), &mut data, &mut len) },
+            "reference#1: failed={} finished={}",
+            reference.monitor().failed(),
+            reference.monitor().finished()
+        );
+        let ref1 = unsafe { slice::from_raw_parts(data, len) }.to_vec();
+        unsafe { direct_pcm_release_block(reference.callback_context()) };
+        assert!(
+            poll_next_block(fading.callback_context(), &mut data, &mut len),
+            "fading#1: failed={} finished={}",
+            fading.monitor().failed(),
+            fading.monitor().finished()
+        );
+        assert_eq!(unsafe { slice::from_raw_parts(data, len) }, ref1);
+        unsafe { direct_pcm_release_block(fading.callback_context()) };
+
+        // 启动淡出：下一块头部增益 1.0（位精确），窗尾渐零
+        fading.begin_fade_out();
+        assert!(!fading.is_faded_out());
+        assert!(
+            poll_next_block(reference.callback_context(), &mut data, &mut len),
+            "reference#2: failed={} finished={}",
+            reference.monitor().failed(),
+            reference.monitor().finished()
+        );
+        let ref2 = unsafe { slice::from_raw_parts(data, len) }.to_vec();
+        unsafe { direct_pcm_release_block(reference.callback_context()) };
+        assert!(
+            poll_next_block(fading.callback_context(), &mut data, &mut len),
+            "fading#2: failed={} finished={} silence={}",
+            fading.monitor().failed(),
+            fading.monitor().finished(),
+            fading.silence_blocks_handed()
+        );
+        let faded = unsafe { slice::from_raw_parts(data, len) };
+        assert_eq!(&faded[..2], &ref2[..2], "块首样本增益 1.0 应保持位精确");
+        let last = i16::from_le_bytes([faded[len - 2], faded[len - 1]]);
+        assert_eq!(last, 0, "淡出窗尾应落到零电平");
+        assert!(faded.len() == ref2.len());
+        unsafe { direct_pcm_release_block(fading.callback_context()) };
+        assert!(fading.is_faded_out());
+
+        // 后续块全部数字静音，且静音块计数递增
+        assert!(
+            poll_next_block(fading.callback_context(), &mut data, &mut len),
+            "fading#3 静音块: failed={} finished={} silence={}",
+            fading.monitor().failed(),
+            fading.monitor().finished(),
+            fading.silence_blocks_handed()
+        );
+        let silent = unsafe { slice::from_raw_parts(data, len) };
+        assert!(silent.iter().all(|byte| *byte == 0));
+        unsafe { direct_pcm_release_block(fading.callback_context()) };
+        assert_eq!(fading.silence_blocks_handed(), 1);
+    }
+
     #[test]
     fn same_wire_format_handoff_keeps_callback_context_across_packed_and_planar_pcm() {
         const WAVPACK16: &str = "d3Zwa2YAAAAQBAAACAAAAAAAAAAIAAAAMRi8BMKPq/ECAVdWAwAEBJzucu4A/mr9BQZSBlIGfgaWA5YCUgOKFgAA///+/2Gq/v/f/0/+3W/9/7v9/9+X/v/9/5jz+//3Sfj/9x9z+P/3/4N2AwBBUEVUQUdFWNAHAAA8AAAAAQAAAAAAAKAAAAAAAAAAAAwAAAAAAAAAZW5jb2RlcgBMYXZmNjIuMy4xMDBBUEVUQUdFWNAHAAA8AAAAAQAAAAAAAIAAAAAAAAAAAA==";
@@ -2871,7 +3397,7 @@ mod tests {
             DirectPcmMemoryPath::ZeroCopyPacked
         );
         let new_format = source
-            .replace_local_while_paused(&replacement.path)
+            .replace_local_while_paused(&replacement.path.to_string_lossy())
             .unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(new_format.sample_rate, 44_100);
@@ -2898,7 +3424,7 @@ mod tests {
         let format = source.format();
 
         let error = source
-            .replace_local_while_paused(&incompatible.path)
+            .replace_local_while_paused(&incompatible.path.to_string_lossy())
             .unwrap_err();
         assert!(error.to_string().contains("wire format"));
         assert_eq!(source.callback_context(), context);
@@ -3013,6 +3539,199 @@ mod tests {
 
         let error = frame.accept_decoded_frame(32).unwrap_err();
         assert!(error.to_string().contains("不支持 FFmpeg sample format"));
+    }
+
+    // ── Handoff（连接复用）测试 ────────────────────────────────────────────────
+
+    /// same_pcm_transport：同格式（44.1kHz/16bit/2ch）应该通过
+    #[test]
+    fn same_pcm_transport_accepts_identical_format() {
+        let f1 = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 16,
+            storage_bits: 16,
+            sample_format: DirectPcmSampleFormat::Signed16,
+            memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+        let f2 = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 16,
+            storage_bits: 16,
+            sample_format: DirectPcmSampleFormat::Signed16,
+            memory_path: DirectPcmMemoryPath::BitPerfectRepack, // memory_path 不影响兼容性
+        };
+        assert!(same_pcm_transport(f1, f2));
+    }
+
+    /// same_pcm_transport：不同 sample_rate 应该拒绝
+    #[test]
+    fn same_pcm_transport_rejects_different_sample_rate() {
+        let f1 = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 16,
+            storage_bits: 16,
+            sample_format: DirectPcmSampleFormat::Signed16,
+            memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+        let f2 = DirectPcmFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            valid_bits: 16,
+            storage_bits: 16,
+            sample_format: DirectPcmSampleFormat::Signed16,
+            memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+        assert!(!same_pcm_transport(f1, f2));
+    }
+
+    /// same_pcm_transport：不同 channels 应该拒绝
+    #[test]
+    fn same_pcm_transport_rejects_different_channels() {
+        let f1 = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 16,
+            storage_bits: 16,
+            sample_format: DirectPcmSampleFormat::Signed16,
+            memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+        let f2 = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 1,
+            valid_bits: 16,
+            storage_bits: 16,
+            sample_format: DirectPcmSampleFormat::Signed16,
+            memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+        assert!(!same_pcm_transport(f1, f2));
+    }
+
+    /// open_source：本地文件走 avformat_open_input 路径（回归测试 dispatcher 兼容）
+    #[test]
+    fn open_source_local_file_path_succeeds() {
+        let samples = (0i16..512i16).flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        let fixture = TempAudioFile::wav(44_100, 16, &samples);
+        // open_source 接受 CString path string，与 open_local 等价
+        let result = DirectPcmDecoder::open_source(&fixture.path.to_string_lossy());
+        assert!(
+            result.is_ok(),
+            "open_source 对本地文件路径应该成功"
+        );
+    }
+
+    /// open_source：无效 HTTP URL 应该走 HTTP 分支并被 FFmpeg 拒绝（不是 panic 或死锁）
+    #[test]
+    fn open_source_http_url_fails_gracefully_on_invalid_url() {
+        // 使用一个明确不可达的 URL；FFmpeg 应该报错而不是崩溃
+        let url = "http://127.0.0.1:59999/nonexistent";
+        let result = DirectPcmDecoder::open_source(url);
+        assert!(
+            result.is_err(),
+            "无效 HTTP URL 应该返回错误，而不是 panic 或成功"
+        );
+        // 关键：调用没有 panic
+    }
+
+    /// open_source：HTTP URL 不应被 dispatcher 当作本地路径（如果走本地分支会报 NUL 或 No such file）
+    #[test]
+    fn open_source_http_url_dispatches_to_http_branch() {
+        let url = "http://127.0.0.1:59999/";
+        let result = DirectPcmDecoder::open_source(url);
+        // 关键断言：返回的是 Err（FFmpeg 网络层拒绝）
+        // 注意：不能再 format!("{:?}", err)，因为错误源链里的 DirectPcmDecoder 不实现 Debug
+        assert!(result.is_err(), "HTTP URL 应该走 HTTP 分支并被 FFmpeg 拒绝");
+    }
+
+    /// replace_local_while_paused：同格式切换后 silence_blocks 归零、消费新 slot 后 transition_count +1
+    #[test]
+    fn replace_local_clears_silence_blocks_and_increments_transition_count() {
+        let samples_a = (0i16..8192i16).flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        let samples_b = (8192i16..16384i16).flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        let fixture_a = TempAudioFile::wav(44_100, 16, &samples_a);
+        let fixture_b = TempAudioFile::wav(44_100, 16, &samples_b);
+
+        let mut source = DirectPcmSource::open_local(&fixture_a.path).unwrap();
+        let monitor = source.monitor();
+
+        // pump 一些帧（让 ring 进入稳定播放状态）
+        for _ in 0..10 {
+            let mut data = ptr::null::<u8>();
+            let mut len = 0_usize;
+            if unsafe { direct_pcm_next_block(source.callback_context(), &mut data, &mut len) } {
+                unsafe { direct_pcm_release_block(source.callback_context()) };
+            }
+        }
+        let tx_before = monitor.transition_count();
+
+        // 同格式 handoff
+        source.set_duration(2.0);
+        let new_format = source.replace_local_while_paused(&fixture_b.path.to_string_lossy()).unwrap();
+
+        // 断言 1：新格式与原格式完全兼容
+        assert_eq!(new_format.sample_rate, 44_100);
+        assert_eq!(new_format.channels, 2);
+        assert_eq!(new_format.storage_bits, 16);
+
+        // 断言 2：handoff 后 ring 仍然可读（播放流不断）
+        let mut data = ptr::null::<u8>();
+        let mut len = 0_usize;
+        let readable = unsafe { direct_pcm_next_block(source.callback_context(), &mut data, &mut len) };
+        assert!(readable, "handoff 后 ring 应立即可读，否则切歌有卡顿");
+        if readable {
+            unsafe { direct_pcm_release_block(source.callback_context()) };
+        }
+
+        // 断言 3：消费新 slot 后 transition_count +1（切歌事件被 ring 标记）
+        // 注：transition_count 在 next_block() 内部递增，不是在 reset_for_transition()
+        let tx_after = monitor.transition_count();
+        assert_eq!(
+            tx_after,
+            tx_before + 1,
+            "handoff 后消费新 slot 应使 transition_count +1，tx_before={tx_before} tx_after={tx_after}"
+        );
+
+        // 断言 4：silence_blocks 计数被 reset_for_transition 清零
+        // （只要没有连续消费静音块，silence_blocks 应保持 0）
+        let silence_after = monitor.silence_blocks();
+        assert!(
+            silence_after <= 8,
+            "handoff 后 silence_blocks 不应大量累积，实际={silence_after}（这会导致切歌拖尾）"
+        );
+    }
+
+    /// replace_local_while_paused：不同格式应该返回错误（不 panic、不泄漏连接状态）
+    #[test]
+    fn replace_local_rejects_different_format_gracefully() {
+        // fixture_a: 44.1kHz; fixture_b: 48kHz（不同 sample_rate → 不兼容）
+        let samples_a = (0i16..4096i16).flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        let samples_b = (4096i16..8192i16).flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>();
+        let fixture_a = TempAudioFile::wav(44_100, 16, &samples_a);
+        let fixture_b = TempAudioFile::wav(48_000, 16, &samples_b); // 不同 sample_rate
+
+        let mut source = DirectPcmSource::open_local(&fixture_a.path).unwrap();
+
+        let result = source.replace_local_while_paused(&fixture_b.path.to_string_lossy());
+
+        assert!(
+            result.is_err(),
+            "不同 sample_rate 应该返回错误，而不是静默替换导致音频损坏"
+        );
+
+        // 原始 source 仍然可用（错误不泄漏状态）
+        let mut data = ptr::null::<u8>();
+        let mut len = 0_usize;
+        let still_playing =
+            unsafe { direct_pcm_next_block(source.callback_context(), &mut data, &mut len) };
+        assert!(
+            still_playing,
+            "格式不兼容错误不应破坏原始 source"
+        );
+        if still_playing {
+            unsafe { direct_pcm_release_block(source.callback_context()) };
+        }
     }
 }
 

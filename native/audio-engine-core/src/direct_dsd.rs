@@ -5,9 +5,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
 use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
@@ -618,6 +618,9 @@ const SLOT_FILLING: u8 = 1;
 const SLOT_READY: u8 = 2;
 const SLOT_IN_FLIGHT: u8 = 3;
 const NO_SLOT: usize = usize::MAX;
+/// producer 条件等待上限：所有关键事件（slot 释放/命令/状态翻转）都有 notify，
+/// 超时仅作为漏报兜底；到期后回到循环顶保持命令响应性
+const PRODUCER_WAIT_CEILING: Duration = Duration::from_millis(100);
 
 struct DirectDsdSlot {
     state: AtomicU8,
@@ -661,7 +664,7 @@ enum DirectDsdCommand {
         response: mpsc::SyncSender<Result<f64>>,
     },
     ReplaceLocal {
-        path: PathBuf,
+        source: String,
         response: mpsc::SyncSender<Result<DirectDsdFormat>>,
     },
     StageLocal {
@@ -683,6 +686,11 @@ struct DirectDsdRing {
     finished: AtomicBool,
     failed: AtomicBool,
     stopped: AtomicBool,
+    /// 单一状态信号：producer 与控制线程共享的条件等待通道（避免任何忙等/轮询）
+    signal: Mutex<()>,
+    signal_cv: Condvar,
+    /// 控制通道存在待处理命令的提示位：命令发送方置位并唤醒，producer 消费命令前清零
+    command_pending: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -708,6 +716,43 @@ impl DirectDsdRing {
             finished: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            signal: Mutex::new(()),
+            signal_cv: Condvar::new(),
+            command_pending: AtomicBool::new(false),
+        }
+    }
+
+    /// 状态变化通知：取一次锁再释放后 notify，保证不会丢失在等待方进入之前。
+    /// 供 SDK 回调线程调用：仅一次短暂锁 + futex wake，无分配，实时安全。
+    fn notify_state(&self) {
+        let _guard = self.signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.signal_cv.notify_all();
+    }
+
+    /// 命令发送侧：置提示位并唤醒 producer（其可能正处于条件等待中）
+    fn signal_command(&self) {
+        self.command_pending.store(true, Ordering::Release);
+        self.notify_state();
+    }
+
+    /// 条件等待：谓词为真立即返回 true；deadline 内未满足返回 false（超时兜底）。
+    /// 谓词只依赖 ring 自身状态；等待方返回后应回到命令循环保持命令响应性。
+    fn wait_for(&self, predicate: impl Fn(&Self) -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut guard = self.signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if predicate(self) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, _) = self
+                .signal_cv
+                .wait_timeout(guard, deadline - now)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = next;
         }
     }
 
@@ -763,6 +808,8 @@ impl DirectDsdRing {
             self.consumed_bits_per_channel
                 .fetch_add(bits, Ordering::Relaxed);
             slot.state.store(SLOT_FREE, Ordering::Release);
+            // slot 释放：唤醒等待空闲 slot 的 producer
+            self.notify_state();
         }
     }
 
@@ -782,6 +829,8 @@ impl DirectDsdRing {
             slot.boundary_duration_micros.store(0, Ordering::Relaxed);
             slot.boundary_generation.store(0, Ordering::Relaxed);
         }
+        // finished/failed 已清除：唤醒 producer
+        self.notify_state();
     }
 
     fn ensure_capacity(&self, capacity: usize) {
@@ -868,12 +917,12 @@ fn install_staged_dsd_slot(
 }
 
 fn replace_dsd_ring(
-    path: &Path,
+    source: &str,
     ring: &DirectDsdRing,
     current_format: DirectDsdFormat,
     wire_bit_order: DirectDsdBitOrder,
 ) -> Result<(DirectDsdReader, DirectDsdFormat)> {
-    let mut reader = DirectDsdReader::open_local(path)?;
+    let mut reader = DirectDsdReader::open_local(Path::new(source))?;
     let new_format = reader.format();
     ensure!(
         same_dsd_transport(current_format, new_format),
@@ -918,6 +967,19 @@ impl DirectDsdMonitor {
                 .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_FREE)
     }
 
+    /// 事件驱动首块消费等待：任一位被设备消费、失败或源提前结束即唤醒；
+    /// 无事件时阻塞至超时（返回 false）。用于启动校验，取代轮询 sleep
+    pub fn wait_first_consumed(&self, timeout: Duration) -> bool {
+        self.ring.wait_for(
+            |ring| {
+                ring.consumed_bits_per_channel.load(Ordering::Acquire) > 0
+                    || ring.failed.load(Ordering::Acquire)
+                    || ring.finished.load(Ordering::Acquire)
+            },
+            timeout,
+        )
+    }
+
     pub fn transition_count(&self) -> u64 {
         self.ring.transition_count.load(Ordering::Acquire)
     }
@@ -934,6 +996,7 @@ impl DirectDsdMonitor {
 #[derive(Clone)]
 pub struct DirectDsdStageHandle {
     control_tx: mpsc::Sender<DirectDsdCommand>,
+    ring: Arc<DirectDsdRing>,
 }
 
 impl DirectDsdStageHandle {
@@ -946,6 +1009,7 @@ impl DirectDsdStageHandle {
                 response: response_tx,
             })
             .context("提交 Native DSD staged source 失败")?;
+        self.ring.signal_command();
         response_rx
             .recv()
             .context("等待 Native DSD staged source 结果失败")?
@@ -953,6 +1017,7 @@ impl DirectDsdStageHandle {
 
     pub fn cancel(&self) {
         let _ = self.control_tx.send(DirectDsdCommand::CancelStaged);
+        self.ring.signal_command();
     }
 }
 
@@ -999,6 +1064,10 @@ impl DirectDsdSource {
                 let mut staged: Option<StagedDsdSource> = None;
                 let mut next_slot = 1 % producer_ring.slots.len();
                 while !producer_ring.stopped.load(Ordering::Acquire) {
+                    // 消费命令前清提示位：此后发送方的新命令会重新置位并唤醒
+                    producer_ring
+                        .command_pending
+                        .store(false, Ordering::Release);
                     match control_rx.try_recv() {
                         Ok(DirectDsdCommand::SetWireBitOrder {
                             bit_order,
@@ -1038,9 +1107,9 @@ impl DirectDsdSource {
                             next_slot = 1 % producer_ring.slots.len();
                             continue;
                         }
-                        Ok(DirectDsdCommand::ReplaceLocal { path, response }) => {
+                        Ok(DirectDsdCommand::ReplaceLocal { source, response }) => {
                             let result = replace_dsd_ring(
-                                &path,
+                                &source,
                                 &producer_ring,
                                 active_format,
                                 wire_bit_order,
@@ -1083,12 +1152,26 @@ impl DirectDsdSource {
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
                     if producer_ring.failed.load(Ordering::Acquire) {
-                        thread::sleep(Duration::from_millis(1));
+                        // 事件等待：等 failed 被清（reset_for_transition）或有新命令
+                        producer_ring.wait_for(
+                            |ring| {
+                                !ring.failed.load(Ordering::Acquire)
+                                    || ring.command_pending.load(Ordering::Acquire)
+                            },
+                            PRODUCER_WAIT_CEILING,
+                        );
                         continue;
                     }
                     if producer_ring.finished.load(Ordering::Acquire) {
                         let Some(candidate) = staged.take() else {
-                            thread::sleep(Duration::from_millis(1));
+                            // 事件等待：等新源 stage 完成、状态翻转或命令到达
+                            producer_ring.wait_for(
+                                |ring| {
+                                    !ring.finished.load(Ordering::Acquire)
+                                        || ring.command_pending.load(Ordering::Acquire)
+                                },
+                                PRODUCER_WAIT_CEILING,
+                            );
                             continue;
                         };
                         let slot = &producer_ring.slots[next_slot];
@@ -1103,7 +1186,14 @@ impl DirectDsdSource {
                             .is_err()
                         {
                             staged = Some(candidate);
-                            thread::sleep(Duration::from_millis(1));
+                            // 事件等待：等 consumer 释放 slot 或新命令
+                            producer_ring.wait_for(
+                                |ring| {
+                                    ring.slots[next_slot].state.load(Ordering::Acquire) == SLOT_FREE
+                                        || ring.command_pending.load(Ordering::Acquire)
+                                },
+                                PRODUCER_WAIT_CEILING,
+                            );
                             continue;
                         }
                         match install_staged_dsd_slot(candidate, slot, wire_bit_order) {
@@ -1131,7 +1221,14 @@ impl DirectDsdSource {
                         )
                         .is_err()
                     {
-                        thread::sleep(Duration::from_millis(1));
+                        // 事件等待：等 consumer 释放 slot 或新命令
+                        producer_ring.wait_for(
+                            |ring| {
+                                ring.slots[next_slot].state.load(Ordering::Acquire) == SLOT_FREE
+                                    || ring.command_pending.load(Ordering::Acquire)
+                            },
+                            PRODUCER_WAIT_CEILING,
+                        );
                         continue;
                     }
                     match fill_claimed_slot(&mut reader, slot, wire_bit_order) {
@@ -1193,6 +1290,7 @@ impl DirectDsdSource {
     pub fn stage_handle(&self) -> DirectDsdStageHandle {
         DirectDsdStageHandle {
             control_tx: self.control_tx.clone(),
+            ring: Arc::clone(&self.ring),
         }
     }
 
@@ -1221,6 +1319,7 @@ impl DirectDsdSource {
                 response: response_tx,
             })
             .context("提交 Native DSD wire bit-order 适配失败")?;
+        self.ring.signal_command();
         response_rx
             .recv()
             .context("等待 Native DSD wire bit-order 适配结果失败")?
@@ -1234,19 +1333,21 @@ impl DirectDsdSource {
                 response: response_tx,
             })
             .context("提交 Native DSD seek 失败")?;
+        self.ring.signal_command();
         response_rx
             .recv()
             .context("等待 Native DSD seek 结果失败")?
     }
 
-    pub fn replace_local_while_paused(&mut self, path: &Path) -> Result<DirectDsdFormat> {
+    pub fn replace_local_while_paused(&mut self, source: &str) -> Result<DirectDsdFormat> {
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
             .send(DirectDsdCommand::ReplaceLocal {
-                path: path.to_owned(),
+                source: source.to_owned(),
                 response: response_tx,
             })
             .context("提交 Native DSD handoff 失败")?;
+        self.ring.signal_command();
         let format = response_rx
             .recv()
             .context("等待 Native DSD handoff 结果失败")??;
@@ -1678,7 +1779,7 @@ mod tests {
         let mut source = DirectDsdSource::open_local(&first.path).unwrap();
         let context = source.callback_context();
 
-        let format = source.replace_local_while_paused(&second.path).unwrap();
+        let format = source.replace_local_while_paused(&second.path.to_string_lossy()).unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(format.bit_rate, 2_822_400);
         assert_eq!(format.channels, 2);
@@ -1702,7 +1803,7 @@ mod tests {
         let mut source = DirectDsdSource::open_local(&dsf.path).unwrap();
         let context = source.callback_context();
 
-        let format = source.replace_local_while_paused(&dff.path).unwrap();
+        let format = source.replace_local_while_paused(&dff.path.to_string_lossy()).unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(format.bit_order, DirectDsdBitOrder::MsbFirst);
         assert!(!source.failed());

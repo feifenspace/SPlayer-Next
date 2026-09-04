@@ -1,5 +1,7 @@
 #[cfg(any(feature = "diretta", test))]
 use std::path::Path;
+#[cfg(feature = "diretta")]
+use std::time::Duration;
 
 #[cfg(any(feature = "diretta", test))]
 use anyhow::anyhow;
@@ -336,9 +338,9 @@ mod imp {
 
         pub fn replace_local_source_while_paused(
             &mut self,
-            path: &Path,
+            source: &str,
         ) -> Result<DirectPcmFormat> {
-            self.source.replace_local_while_paused(path)
+            self.source.replace_local_while_paused(source)
         }
 
         pub fn failed(&self) -> bool {
@@ -363,6 +365,21 @@ mod imp {
 
         pub fn set_duration(&self, duration_secs: f64) {
             self.source.set_duration(duration_secs);
+        }
+
+        /// 关流/换源前源级淡出（详见 DirectPcmSource::begin_fade_out）
+        pub fn begin_fade_out(&self) {
+            self.source.begin_fade_out();
+        }
+
+        /// 淡出是否已生效（后续块均为数字静音）
+        pub fn is_faded_out(&self) -> bool {
+            self.source.is_faded_out()
+        }
+
+        /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时
+        pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+            self.source.wait_fade_drained(min_blocks, timeout)
         }
     }
 
@@ -457,9 +474,9 @@ mod imp {
 
         pub fn replace_local_source_while_paused(
             &mut self,
-            path: &Path,
+            source: &str,
         ) -> Result<DirectDsdFormat> {
-            self.source.replace_local_while_paused(path)
+            self.source.replace_local_while_paused(source)
         }
 
         pub fn failed(&self) -> bool {
@@ -500,6 +517,11 @@ mod imp {
 
     pub fn scan_devices() -> Result<Vec<DirettaDevice>> {
         Ok(Vec::new())
+    }
+
+    /// 非 diretta 构建下的占位实现：能力查询依赖 Diretta SDK。
+    pub fn query_target_caps(_target_id: &str) -> Result<DirettaTargetCapabilities> {
+        Err(anyhow::anyhow!("Diretta SDK support is not compiled"))
     }
 
     #[cfg(test)]

@@ -2,6 +2,8 @@ use anyhow::Result;
 #[cfg(feature = "diretta")]
 use anyhow::bail;
 
+use std::time::Duration;
+
 use crate::direct_dsd::{DirectDsdFormat, DirectDsdMonitor};
 use crate::direct_pcm::{DirectPcmFormat, DirectPcmMonitor};
 
@@ -58,6 +60,17 @@ impl DirectMonitor {
             Self::Dsd(value) => value.finished(),
             #[cfg(test)]
             Self::Fake(value) => value.finished.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    /// 事件驱动首块消费等待：任一音频数据被设备消费、失败或源提前结束即唤醒。
+    /// Fake 监视器（仅测试）无事件机制，直接返回 true 由调用方复查状态
+    pub fn wait_first_consumed(&self, timeout: Duration) -> bool {
+        match self {
+            Self::Pcm(value) => value.wait_first_consumed(timeout),
+            Self::Dsd(value) => value.wait_first_consumed(timeout),
+            #[cfg(test)]
+            Self::Fake(_) => true,
         }
     }
 
@@ -165,6 +178,35 @@ impl DirectStageHandle {
 enum DirectTransport {
     Pcm(DirettaDirectConnection),
     Dsd(DirettaDirectDsdConnection),
+}
+
+#[cfg(feature = "diretta")]
+impl DirectTransport {
+    /// 换源/关流前的源级淡出：下一交付块 20ms 线性渐零，随后块为数字静音。
+    /// DSD 无独立淡出通道（位流在块边界硬切换），保持 no-op。
+    fn begin_fade_out(&self) {
+        match self {
+            Self::Pcm(value) => value.begin_fade_out(),
+            Self::Dsd(_) => {}
+        }
+    }
+
+    /// 淡出是否已生效（后续块均为数字静音）。DSD 恒返回 true。
+    fn is_faded_out(&self) -> bool {
+        match self {
+            Self::Pcm(value) => value.is_faded_out(),
+            Self::Dsd(_) => true,
+        }
+    }
+
+    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
+    /// DSD 无淡出通道，恒返回 true（无排空需求）。
+    fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        match self {
+            Self::Pcm(value) => value.wait_fade_drained(min_blocks, timeout),
+            Self::Dsd(_) => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -390,7 +432,7 @@ impl DirectPlayback {
                 if is_dsd {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_local_source_while_paused(path)?;
+                let format = value.replace_local_source_while_paused(&path_str)?;
                 value.set_duration(cue_dur);
                 DirectFormat::Pcm(format)
             }
@@ -398,7 +440,7 @@ impl DirectPlayback {
                 if !is_dsd {
                     bail!("[Direct] Native DSD → PCM 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_local_source_while_paused(path)?;
+                let format = value.replace_local_source_while_paused(&path_str)?;
                 DirectFormat::Dsd(format)
             }
         };
@@ -482,6 +524,64 @@ impl DirectPlayback {
         {
             unreachable!()
         }
+    }
+
+    /// 换源/关流前的源级淡出（详见 DirectTransport::begin_fade_out）
+    pub fn begin_fade_out(&self) {
+        #[cfg(feature = "diretta")]
+        self.transport.begin_fade_out();
+        #[cfg(all(test, not(feature = "diretta")))]
+        {} // fake 无音频流，无需淡出
+    }
+
+    /// 淡出是否已生效（后续块均为数字静音）
+    pub fn is_faded_out(&self) -> bool {
+        #[cfg(feature = "diretta")]
+        {
+            self.transport.is_faded_out()
+        }
+        #[cfg(all(test, not(feature = "diretta")))]
+        {
+            true
+        }
+        #[cfg(not(any(feature = "diretta", test)))]
+        {
+            unreachable!("Direct 淡出查询仅在 diretta/test 配置下可用")
+        }
+    }
+
+    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时返回 false
+    pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        #[cfg(feature = "diretta")]
+        {
+            self.transport.wait_fade_drained(min_blocks, timeout)
+        }
+        #[cfg(all(test, not(feature = "diretta")))]
+        {
+            let _ = (min_blocks, timeout);
+            true // fake 无音频流，视为已排空
+        }
+        #[cfg(not(any(feature = "diretta", test)))]
+        {
+            let _ = (min_blocks, timeout);
+            unreachable!("Direct 淡出排空仅在 diretta/test 配置下可用")
+        }
+    }
+
+    /// fake 传输的换源：仅更新时长，返回 fake PCM 格式（供 player 层 handoff 单测使用）
+    #[cfg(all(test, not(feature = "diretta")))]
+    pub fn handoff_local_while_paused(&mut self, source: &str, duration: f64) -> Result<DirectFormat> {
+        let _ = source;
+        self.duration = duration;
+        self.seek_base = 0.0;
+        Ok(DirectFormat::Pcm(DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 16,
+            storage_bits: 16,
+            sample_format: crate::direct_pcm::DirectPcmSampleFormat::Signed16,
+            memory_path: crate::direct_pcm::DirectPcmMemoryPath::ZeroCopyPacked,
+        }))
     }
 
     pub fn format(&self) -> DirectFormat {
@@ -577,6 +677,11 @@ impl DirectPlayback {
 
     pub fn finished(&self) -> bool {
         self.monitor().finished()
+    }
+
+    /// 事件驱动首块消费等待：用于 Direct 启动校验，取代轮询 sleep
+    pub fn wait_first_consumed(&self, timeout: Duration) -> bool {
+        self.monitor().wait_first_consumed(timeout)
     }
 
     #[cfg(test)]

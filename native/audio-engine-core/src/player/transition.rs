@@ -5,7 +5,7 @@ use std::thread::JoinHandle;
 use crate::audio_output::AudioOutput;
 use crate::decoder;
 #[cfg(any(feature = "diretta", test))]
-use crate::direct_runtime::DirectPlayback;
+use crate::direct_runtime::{DirectFormat, DirectPlayback};
 use crate::equalizer::Equalizer;
 use crate::metadata::AudioMetadata;
 use crate::playback::PlaybackHandle;
@@ -432,5 +432,102 @@ impl InnerPlayer {
         }
 
         Ok(Some(metadata))
+    }
+
+    /// Direct handoff 前置登记：只推进 load token 并取消在途加载，
+    /// 不触碰 Direct 连接 / 播放线程 —— 旧曲目在 probe / 淡出期间继续出声。
+    /// probe 或格式预检失败后，调用方再用 take_for_async_load 做全量回收。
+    #[cfg(any(feature = "diretta", test))]
+    pub fn take_threads_only(&mut self, handle: HttpCancelHandle) -> u64 {
+        let token = self.load_token.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(previous) = self.pending_load_handle.replace(handle) {
+            previous.cancel();
+        }
+        token
+    }
+
+    /// 当前 Direct 连接的 wire 格式（无连接时 None）
+    #[cfg(any(feature = "diretta", test))]
+    pub fn direct_format(&self) -> Option<DirectFormat> {
+        self.direct_playback.as_ref().map(DirectPlayback::format)
+    }
+
+    /// 播放中启动 Direct 源级淡出（暂停/无连接时为无害 no-op）
+    #[cfg(any(feature = "diretta", test))]
+    pub fn begin_direct_fade_out(&mut self) -> Result<()> {
+        if self.state != PlayerState::Playing {
+            return Ok(());
+        }
+        let playback = self
+            .direct_playback
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("[Direct] 无活跃 Direct 连接可淡出"))?;
+        playback.begin_fade_out();
+        Ok(())
+    }
+
+    /// 淡出是否已完全生效（无连接 / 非播放态视为已静音）
+    #[cfg(any(feature = "diretta", test))]
+    pub fn direct_faded_out(&self) -> bool {
+        match &self.direct_playback {
+            None => true,
+            Some(playback) => self.state != PlayerState::Playing || playback.is_faded_out(),
+        }
+    }
+
+    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
+    /// 无连接 / 非播放态立即返回 true（暂停态 handoff 无需排空）。
+    #[cfg(any(feature = "diretta", test))]
+    pub fn direct_wait_fade_drained(&self, min_blocks: u32, timeout: std::time::Duration) -> bool {
+        match &self.direct_playback {
+            None => true,
+            Some(playback) => {
+                self.state != PlayerState::Playing
+                    || playback.wait_fade_drained(min_blocks, timeout)
+            }
+        }
+    }
+
+    /// 同格式 Direct handoff 提交：保留 Diretta 连接，生产者线程在块边界原子换源。
+    ///
+    /// 返回：
+    /// - `Ok(Some(format))`：已切到新源，old 连接复用成功
+    /// - `Ok(None)`：token 已被更新的 load/stop 抢占，放弃本次 handoff
+    /// - `Err`：换源失败（典型为 wire 格式不一致），连接保持原状（可能已淡出静音），
+    ///   调用方应回退 take_for_async_load 全量重连
+    #[cfg(any(feature = "diretta", test))]
+    pub fn commit_direct_handoff(
+        &mut self,
+        token: u64,
+        source: &str,
+        duration: f64,
+        auto_play: bool,
+    ) -> Result<Option<DirectFormat>> {
+        if token != self.load_token.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let playback = self
+            .direct_playback
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("[Direct] 无活跃 Direct 连接可复用"))?;
+        let format = playback.handoff_local_while_paused(source, duration)?;
+        self.current_source = Some(source.to_owned());
+        self.audio_duration = if duration > 0.0 {
+            duration
+        } else {
+            playback.duration()
+        };
+        // staged gapless boundary 同款处理：旧封面不再属于当前 source
+        self.cover_raw = None;
+        self.fft.reset();
+        if auto_play && self.state != PlayerState::Playing {
+            playback.play()?;
+            self.state = PlayerState::Playing;
+            self.emit(PlayerEvent::StateChanged {
+                state: PlayerState::Playing,
+            });
+            self.start_position_timer();
+        }
+        Ok(Some(format))
     }
 }
