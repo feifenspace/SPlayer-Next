@@ -440,6 +440,18 @@ impl DirectPcmFrame {
 const INV_SQRT2_F32: f32 = 0.70710678;
 const INV_SQRT2_F64: f64 = 0.7071067811865475;
 
+/// 通用 downmix 循环可达声道（4/5/≥9）的 idx3..7 立体声归属：
+/// FFmpeg 平面序 FL FR FC LFE BL BR SL SR（0 = 弃用，b'L'/b'R' = 归入左/右）。
+/// 6/7/8 声道有专门特化分支不经此表；≥9 布局未知，按 7.1 语义归属并截断。
+fn downmix_extra_targets(channels: usize) -> [u8; 5] {
+    match channels {
+        //        idx3  idx4  idx5  idx6  idx7
+        4 => [b'R', 0, 0, 0, 0], // quad：idx3=BR→R（idx2=BL 由 FC 分支特例归 L）
+        5 => [b'L', b'R', 0, 0, 0], // 5.0：两枚环绕 idx3→L、idx4→R（side/back 变体归属相同）
+        _ => [0, b'L', b'R', b'L', b'R'],
+    }
+}
+
 unsafe fn downmix_planar_i16(
     extended_data: *mut *mut u8,
     channels: usize,
@@ -509,20 +521,30 @@ unsafe fn downmix_planar_i16(
         return Ok(());
     }
 
-    // 通用多声道下混
+    // 通用多声道下混（4/5/≥9 声道；6/7/8 走上面的特化分支）
+    let targets = downmix_extra_targets(channels);
     for i in 0..samples {
         let idx = start_sample + i;
         let mut l = *planes[0].add(idx) as f32;
         let mut r = *planes[1].add(idx) as f32;
         if channels > 2 && !planes[2].is_null() {
             let c = *planes[2].add(idx) as f32;
-            l += INV_SQRT2_F32 * c;
-            r += INV_SQRT2_F32 * c;
+            if channels == 4 {
+                // quad（FL FR BL BR）：planes[2] 是 BL，不是 FC
+                l += 0.5 * c;
+            } else {
+                l += INV_SQRT2_F32 * c;
+                r += INV_SQRT2_F32 * c;
+            }
         }
         for ch in 3..channels.min(8) {
             if !planes[ch].is_null() {
                 let s = *planes[ch].add(idx) as f32;
-                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+                match targets[ch - 3] {
+                    b'L' => l += 0.5 * s,
+                    b'R' => r += 0.5 * s,
+                    _ => {}
+                }
             }
         }
         output[i * 2] = l.round().clamp(-32768.0, 32767.0) as i16;
@@ -600,20 +622,30 @@ unsafe fn downmix_planar_i32(
         return Ok(());
     }
 
-    // 通用多声道下混
+    // 通用多声道下混（4/5/≥9 声道；6/7/8 走上面的特化分支）
+    let targets = downmix_extra_targets(channels);
     for i in 0..samples {
         let idx = start_sample + i;
         let mut l = *planes[0].add(idx) as f64;
         let mut r = *planes[1].add(idx) as f64;
         if channels > 2 && !planes[2].is_null() {
             let c = *planes[2].add(idx) as f64;
-            l += INV_SQRT2_F64 * c;
-            r += INV_SQRT2_F64 * c;
+            if channels == 4 {
+                // quad（FL FR BL BR）：planes[2] 是 BL，不是 FC
+                l += 0.5 * c;
+            } else {
+                l += INV_SQRT2_F64 * c;
+                r += INV_SQRT2_F64 * c;
+            }
         }
         for ch in 3..channels.min(8) {
             if !planes[ch].is_null() {
                 let s = *planes[ch].add(idx) as f64;
-                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+                match targets[ch - 3] {
+                    b'L' => l += 0.5 * s,
+                    b'R' => r += 0.5 * s,
+                    _ => {}
+                }
             }
         }
         output[i * 2] = l.round().clamp(-2147483648.0, 2147483647.0) as i32;
@@ -637,19 +669,29 @@ unsafe fn downmix_float_planar_to_i32(
         planes[ch] = p;
     }
 
+    let targets = downmix_extra_targets(channels);
     for i in 0..samples {
         let idx = start_sample + i;
         let mut l = *planes[0].add(idx);
         let mut r = *planes[1].add(idx);
         if channels > 2 && !planes[2].is_null() {
             let c = *planes[2].add(idx);
-            l += INV_SQRT2_F32 * c;
-            r += INV_SQRT2_F32 * c;
+            if channels == 4 {
+                // quad（FL FR BL BR）：planes[2] 是 BL，不是 FC
+                l += 0.5 * c;
+            } else {
+                l += INV_SQRT2_F32 * c;
+                r += INV_SQRT2_F32 * c;
+            }
         }
         for ch in 3..channels.min(8) {
             if !planes[ch].is_null() {
                 let s = *planes[ch].add(idx);
-                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+                match targets[ch - 3] {
+                    b'L' => l += 0.5 * s,
+                    b'R' => r += 0.5 * s,
+                    _ => {}
+                }
             }
         }
         output[i * 2] = (l.clamp(-1.0, 1.0) * 2147483647.0).round() as i32;
@@ -666,13 +708,20 @@ unsafe fn downmix_packed_i16(
     output: &mut [i16],
 ) -> Result<()> {
     ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    let targets = downmix_extra_targets(channels);
     for i in 0..samples {
         let base = (start_sample + i) * channels;
         let fl = *ptr.add(base) as f32;
         let fr = *ptr.add(base + 1) as f32;
         let fc = if channels > 2 { *ptr.add(base + 2) as f32 } else { 0.0 };
-        let mut l = fl + INV_SQRT2_F32 * fc;
-        let mut r = fr + INV_SQRT2_F32 * fc;
+        // quad（FL FR BL BR）：plane[2] 是 BL，不是 FC
+        let (fc_l, fc_r) = if channels == 4 {
+            (0.5, 0.0)
+        } else {
+            (INV_SQRT2_F32, INV_SQRT2_F32)
+        };
+        let mut l = fl + fc_l * fc;
+        let mut r = fr + fc_r * fc;
         if channels == 6 {
             // 5.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL/SL, 5=BR/SR
             let bl = *ptr.add(base + 4) as f32;
@@ -697,7 +746,11 @@ unsafe fn downmix_packed_i16(
         } else {
             for ch in 3..channels.min(8) {
                 let s = *ptr.add(base + ch) as f32;
-                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+                match targets[ch - 3] {
+                    b'L' => l += 0.5 * s,
+                    b'R' => r += 0.5 * s,
+                    _ => {}
+                }
             }
         }
         output[i * 2] = l.round().clamp(-32768.0, 32767.0) as i16;
@@ -714,13 +767,20 @@ unsafe fn downmix_packed_i32(
     output: &mut [i32],
 ) -> Result<()> {
     ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    let targets = downmix_extra_targets(channels);
     for i in 0..samples {
         let base = (start_sample + i) * channels;
         let fl = *ptr.add(base) as f64;
         let fr = *ptr.add(base + 1) as f64;
         let fc = if channels > 2 { *ptr.add(base + 2) as f64 } else { 0.0 };
-        let mut l = fl + INV_SQRT2_F64 * fc;
-        let mut r = fr + INV_SQRT2_F64 * fc;
+        // quad（FL FR BL BR）：plane[2] 是 BL，不是 FC
+        let (fc_l, fc_r) = if channels == 4 {
+            (0.5, 0.0)
+        } else {
+            (INV_SQRT2_F64, INV_SQRT2_F64)
+        };
+        let mut l = fl + fc_l * fc;
+        let mut r = fr + fc_r * fc;
         if channels == 6 {
             // 5.1 环绕声: 0=FL, 1=FR, 2=FC, 3=LFE, 4=BL/SL, 5=BR/SR
             let bl = *ptr.add(base + 4) as f64;
@@ -745,7 +805,11 @@ unsafe fn downmix_packed_i32(
         } else {
             for ch in 3..channels.min(8) {
                 let s = *ptr.add(base + ch) as f64;
-                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+                match targets[ch - 3] {
+                    b'L' => l += 0.5 * s,
+                    b'R' => r += 0.5 * s,
+                    _ => {}
+                }
             }
         }
         output[i * 2] = l.round().clamp(-2147483648.0, 2147483647.0) as i32;
@@ -762,13 +826,20 @@ unsafe fn downmix_packed_float_to_i32(
     output: &mut [i32],
 ) -> Result<()> {
     ensure!(output.len() >= samples * 2, "Source Direct downmix output buffer 太小");
+    let targets = downmix_extra_targets(channels);
     for i in 0..samples {
         let base = (start_sample + i) * channels;
         let fl = *ptr.add(base);
         let fr = *ptr.add(base + 1);
         let fc = if channels > 2 { *ptr.add(base + 2) } else { 0.0 };
-        let mut l = fl + INV_SQRT2_F32 * fc;
-        let mut r = fr + INV_SQRT2_F32 * fc;
+        // quad（FL FR BL BR）：plane[2] 是 BL，不是 FC
+        let (fc_l, fc_r) = if channels == 4 {
+            (0.5, 0.0)
+        } else {
+            (INV_SQRT2_F32, INV_SQRT2_F32)
+        };
+        let mut l = fl + fc_l * fc;
+        let mut r = fr + fc_r * fc;
         if channels == 6 {
             let bl = *ptr.add(base + 4);
             let br = *ptr.add(base + 5);
@@ -790,7 +861,11 @@ unsafe fn downmix_packed_float_to_i32(
         } else {
             for ch in 3..channels.min(8) {
                 let s = *ptr.add(base + ch);
-                if ch % 2 == 1 { l += 0.5 * s; } else { r += 0.5 * s; }
+                match targets[ch - 3] {
+                    b'L' => l += 0.5 * s,
+                    b'R' => r += 0.5 * s,
+                    _ => {}
+                }
             }
         }
         output[i * 2] = (l.clamp(-1.0, 1.0) * 2147483647.0).round() as i32;
@@ -1401,6 +1476,9 @@ struct DirectPcmSlot {
     boundary_duration_micros: AtomicU64,
     boundary_generation: AtomicU64,
     frame: UnsafeCell<DirectPcmFrame>,
+    /// 关流淡出期间的数字静音缓冲：slot 自有存储，扩容只发生在 FILLING 独占期，
+    /// 交付后只读——换曲块尺寸变化不会使其他 slot 已发布的指针失效
+    silence: UnsafeCell<Box<[u8]>>,
 }
 
 impl DirectPcmSlot {
@@ -1414,11 +1492,26 @@ impl DirectPcmSlot {
             boundary_duration_micros: AtomicU64::new(0),
             boundary_generation: AtomicU64::new(0),
             frame: UnsafeCell::new(DirectPcmFrame::new()?),
+            silence: UnsafeCell::new(Box::new([])),
         })
+    }
+
+    /// 填充本 slot 的数字静音块并发布指针（调用前 slot 已被认领为 FILLING）。
+    /// PCM 静音即 0x00（signed 零点），预填一次后无需重写。
+    fn fill_silence(&self, bytes: usize, frames: usize) {
+        let silence = unsafe { &mut *self.silence.get() };
+        if silence.len() < bytes {
+            *silence = vec![0u8; bytes].into_boxed_slice();
+        }
+        self.payload_ptr
+            .store(silence.as_mut_ptr(), Ordering::Relaxed);
+        self.payload_len.store(bytes, Ordering::Relaxed);
+        self.sample_frames.store(frames, Ordering::Relaxed);
     }
 }
 
-// slot 的 frame 只在 FILLING 时由 producer 修改，在 READY/IN_FLIGHT 时只读。
+// slot 的 frame 与 silence 只在 FILLING 时由 producer 写入/扩容，
+// 在 READY/IN_FLIGHT 时只读。
 unsafe impl Sync for DirectPcmSlot {}
 
 enum DirectPcmCommand {
@@ -1525,8 +1618,6 @@ struct DirectPcmRing {
     last_block_bytes: AtomicUsize,
     /// 最近一次成功解码的块帧数
     last_block_frames: AtomicUsize,
-    /// 关流淡出期间的共享数字静音缓冲区（producer 创建一次，consumer 只读/写零）
-    silence_buffer: Mutex<Option<Vec<u8>>>,
     /// 单一状态信号：producer 与控制线程共享的条件等待通道（避免任何忙等/轮询）
     signal: Mutex<()>,
     signal_cv: Condvar,
@@ -1560,7 +1651,6 @@ impl DirectPcmRing {
             fade: DirectPcmFadeState::new(),
             last_block_bytes: AtomicUsize::new(0),
             last_block_frames: AtomicUsize::new(0),
-            silence_buffer: Mutex::new(None),
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
             command_pending: AtomicBool::new(false),
@@ -2266,7 +2356,7 @@ impl DirectPcmSource {
                             continue;
                         }
                         // fade_active && finished：持续产出数字静音块
-                        // 使用共享零缓冲，按最近一次有效块的几何尺寸交付
+                        // 使用本 slot 自有缓冲，按最近一次有效块的几何尺寸交付
                         let slot = &producer_ring.slots[next_slot];
                         if slot
                             .state
@@ -2299,18 +2389,7 @@ impl DirectPcmSource {
                             );
                             continue;
                         }
-                        let mut guard = match producer_ring.silence_buffer.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        let buffer = guard.get_or_insert_with(|| vec![0u8; bytes]);
-                        if buffer.len() < bytes {
-                            *buffer = vec![0u8; bytes];
-                        }
-                        slot.payload_ptr
-                            .store(buffer.as_ptr().cast_mut(), Ordering::Relaxed);
-                        slot.payload_len.store(bytes, Ordering::Relaxed);
-                        slot.sample_frames.store(frames, Ordering::Relaxed);
+                        slot.fill_silence(bytes, frames);
                         slot.state.store(SLOT_READY, Ordering::Release);
                         next_slot = (next_slot + 1) % producer_ring.slots.len();
                         continue;
@@ -3526,6 +3605,86 @@ mod tests {
         }
         assert_eq!(output_packed_5_1[0], 6657);
         assert_eq!(output_packed_5_1[1], 8364);
+    }
+
+    #[test]
+    fn silence_blocks_use_per_slot_storage() {
+        let ring = DirectPcmRing::new().unwrap();
+        let slot_a = &ring.slots[0];
+        let slot_b = &ring.slots[1];
+
+        slot_a.fill_silence(1024, 256);
+        let ptr_a = slot_a.payload_ptr.load(Ordering::Relaxed);
+        assert_eq!(slot_a.payload_len.load(Ordering::Relaxed), 1024);
+
+        slot_b.fill_silence(4096, 1024);
+        let ptr_b = slot_b.payload_ptr.load(Ordering::Relaxed);
+        assert_ne!(ptr_a, ptr_b, "两个 slot 的静音块不得共享同一分配");
+
+        // slot_b 扩容不得影响 slot_a 已发布的指针
+        slot_b.fill_silence(8192, 2048);
+        assert_eq!(slot_a.payload_ptr.load(Ordering::Relaxed), ptr_a);
+        assert_eq!(slot_b.payload_len.load(Ordering::Relaxed), 8192);
+
+        // PCM 静音即全零（signed 零点）
+        let silence = unsafe { &*slot_b.silence.get() };
+        assert_eq!(silence.len(), 8192);
+        assert!(silence.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn quad_downmix_routes_bl_to_left_and_br_to_right() {
+        // quad 布局（FL FR BL BR）：planes[2] 是 BL 而非 FC，planes[3] 是 BR
+        let mut ch_data: Vec<Vec<i16>> = (0..4)
+            .map(|ch| vec![(ch as i16 + 1) * 1000; 16])
+            .collect();
+        let mut ptrs: Vec<*mut u8> = ch_data
+            .iter_mut()
+            .map(|v| v.as_mut_ptr() as *mut u8)
+            .collect();
+
+        let mut output = vec![0_i16; 32];
+        unsafe {
+            downmix_planar_i16(ptrs.as_mut_ptr(), 4, 0, 16, &mut output).unwrap();
+        }
+        // L = FL + 0.5·BL = 1000 + 1500 = 2500；R = FR + 0.5·BR = 2000 + 2000 = 4000
+        assert_eq!(output[0], 2500);
+        assert_eq!(output[1], 4000);
+
+        // packed 路径同归属
+        let mut packed = vec![0_i16; 4 * 16];
+        for i in 0..16 {
+            for ch in 0..4 {
+                packed[i * 4 + ch] = (ch as i16 + 1) * 1000;
+            }
+        }
+        let mut packed_output = vec![0_i16; 32];
+        unsafe {
+            downmix_packed_i16(packed.as_ptr(), 4, 0, 16, &mut packed_output).unwrap();
+        }
+        assert_eq!(packed_output[0], 2500);
+        assert_eq!(packed_output[1], 4000);
+    }
+
+    #[test]
+    fn five_channel_downmix_routes_surround_pair_by_side() {
+        // 5.0：修复前 idx3/idx4 按奇偶灌反左右
+        let mut ch_data: Vec<Vec<i16>> = (0..5)
+            .map(|ch| vec![(ch as i16 + 1) * 1000; 16])
+            .collect();
+        let mut ptrs: Vec<*mut u8> = ch_data
+            .iter_mut()
+            .map(|v| v.as_mut_ptr() as *mut u8)
+            .collect();
+
+        let mut output = vec![0_i16; 32];
+        unsafe {
+            downmix_planar_i16(ptrs.as_mut_ptr(), 5, 0, 16, &mut output).unwrap();
+        }
+        // L = FL + √½·FC + 0.5·idx3 = 1000 + 2121 + 2000 = 5121
+        // R = FR + √½·FC + 0.5·idx4 = 2000 + 2121 + 2500 = 6621
+        assert_eq!(output[0], 5121);
+        assert_eq!(output[1], 6621);
     }
 
     #[test]
