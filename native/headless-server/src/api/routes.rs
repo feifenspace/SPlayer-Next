@@ -721,7 +721,10 @@ fn online_source_mode(state: &AppState) -> String {
 /// （fd 关闭后编号可能被复用，路径会静默指向别的文件）；FFmpeg 打开成功后
 /// 解码器持有自己的文件描述符，本值即可释放
 enum DirectInput {
+    /// `file` 从不被读取——它是 fd N 的存活锚点（Drop 即关闭 fd），
+    /// 路径 `/proc/self/fd/N` 的解析依赖它存活，dead_code 为有意误报
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     Memfd { file: std::fs::File, path: String },
     Path(String),
 }
