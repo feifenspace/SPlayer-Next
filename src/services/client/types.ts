@@ -95,6 +95,8 @@ export interface IPlayerClient extends PlayerApi {
   registerNextCandidate(source: string, durationHintSecs?: number): Promise<IpcResponse>;
   /** 清除下一曲候选 */
   clearNextCandidate(): Promise<IpcResponse>;
+  /** 服务端权威"正在播放"快照（headless：重开页面恢复曲目显示） */
+  getNowPlaying(): Promise<IpcResponse<any>>;
 }
 
 export interface IAppClient {

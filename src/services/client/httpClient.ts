@@ -615,6 +615,11 @@ export class HttpPlayerClient implements IPlayerClient {
     return this.request("/api/v1/player/queue/next-candidate", { method: "DELETE" });
   }
 
+  /** 服务端权威“正在播放”快照（重开页面恢复曲目显示） */
+  async getNowPlaying(): Promise<IpcResponse<any>> {
+    return this.request("/api/v1/player/now-playing");
+  }
+
   private emitEvent(event: PlayerEvent): void {
     for (const listener of this.eventListeners) {
       try {
@@ -791,6 +796,7 @@ export class HttpPlayerClient implements IPlayerClient {
         volume: data.volume,
         isFinished: Boolean(data.is_finished),
         speed: data.speed ?? 1.0,
+        currentSource: data.current_source ?? undefined,
       },
     };
   }

@@ -4,6 +4,7 @@ import type { PersonalFmOptions } from "@/types/netease";
 import { handleEvent } from "./events";
 import { cancelStagedDirectNext } from "./gapless";
 import { resetServerAutoAdvance } from "./serverAutoAdvance";
+import { playerClient } from "@/services/client";
 import type { RepeatMode, ShuffleMode } from "@/stores/status";
 import { useMediaStore } from "@/stores/media";
 import { useSettingsStore } from "@/stores/settings";
@@ -1142,6 +1143,7 @@ export const restoreLastTrack = async (): Promise<void> => {
 
   // 检查服务端当前是否已经在播放或暂停状态（如 Headless 后台守护进程持续播放中）
   let isServerActive = false;
+  let serverSource: string | null = null;
   try {
     const serverStatus = await window.api.player.getStatus();
     if (serverStatus.success && serverStatus.data) {
@@ -1154,9 +1156,40 @@ export const restoreLastTrack = async (): Promise<void> => {
         playback.setCurrentTime(serverStatus.data.position, { force: true });
         playback.setPlaying(serverStatus.data.state === "playing");
       }
+      serverSource = serverStatus.data.currentSource ?? null;
     }
   } catch (error) {
     console.error("[player] getStatus failed", error);
+  }
+
+  // 服务端正在播放（可能经历了自动接力）：优先用服务端权威元数据恢复曲目显示，
+  // 避免队列 playIndex 停留在旧曲（浏览器关闭期间接力过的场景）
+  if (isServerActive && serverSource) {
+    try {
+      const np = await playerClient.getNowPlaying();
+      const meta = np.success ? (np.data as any)?.metadata : null;
+      if (meta) {
+        const track: Track = {
+          id: serverSource,
+          source: "local",
+          path: serverSource,
+          title: meta.title || serverSource,
+          artists: meta.artist
+            ? meta.artist.split("/").map((name: string) => ({ name: name.trim() }))
+            : [],
+          album: meta.album ? { name: meta.album } : undefined,
+          cover: meta.cover || undefined,
+          duration: Math.round((meta.duration_secs ?? 0) * 1000),
+        };
+        media.setTrack(track);
+        status.trackLoading = false;
+        status.currentSource = serverSource;
+        lyricLoader.beginLoad();
+        return; // 服务端已在播，无需本地加载
+      }
+    } catch (error) {
+      console.error("[player] getNowPlaying failed", error);
+    }
   }
 
   const lastTrack = status.currentTrack;

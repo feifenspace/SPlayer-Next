@@ -198,4 +198,9 @@ export class ElectronPlayerClient implements IPlayerClient {
   async clearNextCandidate(): Promise<IpcResponse> {
     return { success: true };
   }
+
+  /** 桌面端曲目信息由渲染进程持久化恢复，无需服务端快照 */
+  async getNowPlaying(): Promise<IpcResponse<any>> {
+    return { success: false, error: "getNowPlaying is only available in headless server mode" };
+  }
 }
