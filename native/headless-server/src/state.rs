@@ -146,6 +146,7 @@ impl AppState {
             let auto_advance_requested = Arc::clone(&auto_advance_requested);
             let now_playing = Arc::clone(&now_playing);
             let staged_meta = Arc::clone(&staged_meta);
+            let pending_next = Arc::clone(&pending_next);
             Arc::new(move |event: PlayerEvent| {
                 // 先 clone 一份当前快照，避免持有读锁跨越后续写锁操作
                 let current: Option<WsState> = snapshot.read().clone();
@@ -214,6 +215,11 @@ impl AppState {
                                 *now_playing.lock() = Some(meta);
                             }
                         }
+                        // 边界即候选消费点：刚切入的曲子就是 pending_next 里注册的
+                        // 那首，不清掉的话曲终自动连播会在它播完后重放一遍
+                        // （引擎 current_source 不随边界更新，曲终时无法自证重复）。
+                        // 浏览器在场时 position tick 一两秒内会重注册新的下一曲
+                        *pending_next.lock() = None;
                         let _ = ws_tx.send(serde_json::json!({
                             "type": "directTrackBoundary",
                             "data": { "duration": duration, "generation": generation },

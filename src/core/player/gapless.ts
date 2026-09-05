@@ -11,7 +11,7 @@
  */
 
 import type { Track } from "@shared/types/player";
-import type { ResolvedTrackSource } from "@/services/audioSource";
+import { resolveTrackSource, type ResolvedTrackSource } from "@/services/audioSource";
 import { useMediaStore } from "@/stores/media";
 import { useStatusStore } from "@/stores/status";
 import { useSettingsStore } from "@/stores/settings";
@@ -37,6 +37,20 @@ let stagedTrackId = "";
 let stageUnavailable = false;
 /** 上次 stage 检查时的 track id，用于检测切曲并复位状态 */
 let lastSeenTrackId = "";
+/** 正在为候选解析直链的 track id（预载链路未命中时的兜底解析，防 tick 重复） */
+let resolvingCandidateId = "";
+
+/** 检测切曲：复位 per-track 状态 */
+const resetIfTrackChanged = (): void => {
+  const track = useMediaStore().track;
+  const id = track?.id ?? "";
+  if (id !== lastSeenTrackId) {
+    lastSeenTrackId = id;
+    stagedTrackId = "";
+    stageUnavailable = false;
+    resolvingCandidateId = "";
+  }
+};
 
 /**
  * CUE 虚拟路径转换为引擎 stage 支持的物理分段格式 `path|start|dur|track`。
@@ -48,17 +62,6 @@ export const buildStagingSource = (track: Track, resolvedSource: string): string
   const startSec = track.cueStartMs / 1000;
   const durSec = Math.max(((track.cueEndMs ?? 0) - track.cueStartMs) / 1000, 0);
   return `${track.cueAudioPath}|${startSec.toFixed(3)}|${durSec.toFixed(3)}|${track.track ?? 1}`;
-};
-
-/** 检测切曲：复位 per-track 状态 */
-const resetIfTrackChanged = (): void => {
-  const track = useMediaStore().track;
-  const id = track?.id ?? "";
-  if (id !== lastSeenTrackId) {
-    lastSeenTrackId = id;
-    stagedTrackId = "";
-    stageUnavailable = false;
-  }
 };
 
 /**
@@ -93,14 +96,37 @@ export const maybeStageDirectNext = (): void => {
   });
   if (!candidate) return;
 
-  // 复用预载链路已解析的音源；尚未解析完成时等下一个 position tick 再试
+  // 复用预载链路已解析的音源；尚未解析完成时等下一个 position tick 再试。
+  // 预载开关关闭时调度器直接空转，peek 永远为空——Diretta 输出下无缝 stage
+  // 是核心收益（旁路预载开关的本意），此时自行解析直链后再 stage
   const peeked = peekNextTrackPreload(candidate.track);
-  if (!peeked?.source) return;
+  if (!peeked?.source) {
+    if (!isDirettaOutput || resolvingCandidateId === candidate.track.id) return;
+    resolvingCandidateId = candidate.track.id;
+    void (async () => {
+      try {
+        const resolved = await resolveTrackSource(candidate.track, { silent: true });
+        if (resolved?.source) stageCandidate(candidate, resolved.source, durationSecs);
+      } catch {
+        // 解析失败本曲内放弃（resolvingCandidateId 占位至切曲复位）
+      }
+    })();
+    return;
+  }
+  stageCandidate(candidate, peeked.source.source, durationSecs);
+};
 
-  const source = buildStagingSource(candidate.track, peeked.source.source);
-  const duration = candidate.track.duration > 0 ? candidate.track.duration / 1000 : durationSecs;
+/** 解析出音源后统一 stage 入口（buildStagingSource 转 CUE 管道格式） */
+const stageCandidate = (
+  candidate: { track: Track; index: number },
+  resolvedSource: string,
+  durationSecs: number,
+): void => {
+  const track = candidate.track;
+  const source = buildStagingSource(track, resolvedSource);
+  const duration = track.duration > 0 ? track.duration / 1000 : durationSecs;
   const generation = ++stageGeneration;
-  stagedTrackId = candidate.track.id;
+  stagedTrackId = track.id;
 
   void (async () => {
     try {
@@ -111,7 +137,7 @@ export const maybeStageDirectNext = (): void => {
         stagedTrackId = "";
         return;
       }
-      console.info("[gapless] staged next track:", candidate.track.title);
+      console.info("[gapless] staged next track:", track.title);
     } catch (err) {
       console.warn("[gapless] stage next failed silently:", err);
       stageUnavailable = true;

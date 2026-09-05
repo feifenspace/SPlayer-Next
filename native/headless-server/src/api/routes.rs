@@ -114,6 +114,8 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                 .auto_advance_requested
                 .swap(false, std::sync::atomic::Ordering::AcqRel)
             {
+                // 曲终自动连播的重放由边界消费兜底：gapless 边界切换时已把
+                // pending_next 清空（state.rs），候选不可能是刚无缝播完的曲子
                 let candidate = state.pending_next.lock().take();
                 if let Some(next) = candidate {
                     tracing::info!(source = %next.source, "曲终自动连播：加载下一曲候选");
