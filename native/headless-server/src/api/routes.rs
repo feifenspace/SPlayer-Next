@@ -90,8 +90,11 @@ const DIRETTA_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// headless 没有 Electron 主进程的 requestReinit 链路：OutputFailed/OutputStalled
 /// 在事件回调里只置位请求标志（回调线程禁止锁 player / 触发 async），由本任务
-/// 消费标志并对当前源做全量重载 + seek 回退。失败按冷却窗口重试，连续超限则
-/// 进入暂停态、广播 outputRecoveryFailed 并抑制一段时长；用户换源立即解除。
+/// 消费标志并对当前源做重载 + seek 回退。停滞时 handoff 会复用被设备端楔死的
+/// Direct 连接，因此每次重载前先 stop 全量拆线，让 load 对 Target 全新握手。
+/// 同一源的停滞重试（无论单次重载是否成功）计入上限，超限后优先跳下一曲候选
+/// （可能是本曲特定内容触发的设备端故障），无候选/限流/跳转失败才进入暂停态、
+/// 广播 outputRecoveryFailed 并抑制一段时长；用户换源立即解除。
 pub fn spawn_output_recovery_watchdog(state: AppState) {
     tokio::spawn(async move {
         let mut episode_active = false;
@@ -99,6 +102,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
         let mut last_attempt: Option<std::time::Instant> = None;
         let mut suppressed_since: Option<std::time::Instant> = None;
         let mut recovery_source: Option<String> = None;
+        let mut last_recovery_skip: Option<std::time::Instant> = None;
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -183,8 +187,11 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
             let (source, position_secs) = {
                 let player = state.player.lock();
                 if player.state() != audio_engine_core::PlayerState::Playing {
-                    // 用户已暂停/停止或曲目自然结束：本段恢复作废
+                    // 用户已暂停/停止或曲目自然结束：本段恢复作废，计数清零
+                    // （用户介入后重新给予完整重试预算）
                     episode_active = false;
+                    consecutive_failures = 0;
+                    recovery_source = None;
                     continue;
                 }
                 match player.current_source().map(String::from) {
@@ -203,8 +210,12 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                 source = %source,
                 position_secs,
                 attempt = consecutive_failures,
-                "输出停滞/失败：全量重载恢复"
+                "输出停滞/失败：拆线重载恢复"
             );
+
+            // 停滞时 handoff 重载只会复用被设备端楔死的 Direct 连接（重载几次都
+            // 无效）：先 stop 全量拆线（淡出+排空后异步关闭），load 时全新握手
+            let _ = stop_handler(State(state.clone())).await;
 
             let load_result = load_handler(
                 State(state.clone()),
@@ -219,11 +230,9 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
             let load_ok = matches!(&load_result, Ok(response) if response.success);
             if load_ok {
                 if position_secs > OUTPUT_RECOVERY_MIN_RESUME_POSITION {
-                    if let Err(error) = seek_handler(
-                        State(state.clone()),
-                        Json(SeekRequest { position_secs }),
-                    )
-                    .await
+                    if let Err(error) =
+                        seek_handler(State(state.clone()), Json(SeekRequest { position_secs }))
+                            .await
                     {
                         tracing::warn!(?error, "输出恢复 seek 回退失败");
                     }
@@ -237,15 +246,55 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                 );
             }
 
-            if !load_ok && consecutive_failures >= OUTPUT_RECOVERY_MAX_CONSECUTIVE {
-                state.player.lock().enter_paused_for_recovery();
-                let _ = state.ws_tx.send(serde_json::json!({
-                    "type": "outputRecoveryFailed",
-                    "data": { "source": source },
-                }));
-                suppressed_since = Some(std::time::Instant::now());
+            // 同一源反复停滞即超限——单次重载"成功"（下载/探测 OK）不代表输出
+            // 在走，重载救不了设备端不拉流的情况。优先跳下一曲候选（可能是本曲
+            // 特定内容/格式触发的故障），无候选、限流或跳转失败才进入暂停态
+            if consecutive_failures >= OUTPUT_RECOVERY_MAX_CONSECUTIVE {
+                let skip_allowed = last_recovery_skip
+                    .map_or(true, |t| t.elapsed() >= OUTPUT_RECOVERY_SKIP_COOLDOWN);
+                let candidate = if skip_allowed {
+                    state.pending_next.lock().take()
+                } else {
+                    None
+                };
+                let mut advanced = false;
+                if let Some(next) = candidate {
+                    tracing::info!(from = %source, to = %next.source, "输出恢复重试超限，跳下一曲候选");
+                    advanced = matches!(
+                        load_handler(
+                            State(state.clone()),
+                            Query(LoadQuery {}),
+                            Json(LoadRequest {
+                                source: next.source.clone(),
+                                auto_play: Some(true),
+                                meta: None,
+                            }),
+                        )
+                        .await,
+                        Ok(response) if response.success
+                    );
+                    if advanced {
+                        last_recovery_skip = Some(std::time::Instant::now());
+                        let _ = state.ws_tx.send(serde_json::json!({
+                            "type": "outputRecoveryAdvanced",
+                            "data": { "from": source, "to": next.source },
+                        }));
+                    } else {
+                        tracing::warn!(to = %next.source, "输出恢复跳下一曲失败");
+                    }
+                }
+                if !advanced {
+                    state.player.lock().enter_paused_for_recovery();
+                    let _ = state.ws_tx.send(serde_json::json!({
+                        "type": "outputRecoveryFailed",
+                        "data": { "source": source },
+                    }));
+                    suppressed_since = Some(std::time::Instant::now());
+                    tracing::warn!("输出恢复连续失败，进入暂停态等待客户端介入");
+                }
                 episode_active = false;
-                tracing::warn!("输出恢复连续失败，进入暂停态等待客户端介入");
+                consecutive_failures = 0;
+                recovery_source = None;
             }
         }
     });
