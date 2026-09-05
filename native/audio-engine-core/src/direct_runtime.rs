@@ -228,37 +228,61 @@ impl DirectStageHandle {
     }
 }
 
-#[cfg(feature = "diretta")]
+/// Direct 传输层：cfg 只出现在变体声明处（Fake 仅无 SDK 单测存在），
+/// 方法体用带 cfg 的单 match 分派——不再需要每方法三套 cfg 与 `unreachable!()`
 enum DirectTransport {
+    #[cfg(feature = "diretta")]
     Pcm(DirettaDirectConnection),
+    #[cfg(feature = "diretta")]
     Dsd(DirettaDirectDsdConnection),
+    /// 无 SDK 单测（`all(test, not(feature = "diretta"))`）用的 fake 传输
+    #[cfg(all(test, not(feature = "diretta")))]
+    Fake(std::sync::Arc<FakeDirectState>),
 }
 
-#[cfg(feature = "diretta")]
 impl DirectTransport {
     /// 换源/关流前的源级淡出：下一交付块 20ms 线性渐零，随后块为数字静音。
     /// DSD 无独立淡出通道（位流在块边界硬切换），保持 no-op。
     fn begin_fade_out(&self) {
         match self {
+            #[cfg(feature = "diretta")]
             Self::Pcm(value) => value.begin_fade_out(),
+            #[cfg(feature = "diretta")]
             Self::Dsd(_) => {}
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => {}
+            // 空枚举兜底：既无 diretta 也非 test 的构建不存在可构造的传输
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
 
-    /// 淡出是否已生效（后续块均为数字静音）。DSD 恒返回 true。
+    /// 淡出是否已生效（后续块均为数字静音）。DSD/Fake 恒返回 true。
     fn is_faded_out(&self) -> bool {
         match self {
+            #[cfg(feature = "diretta")]
             Self::Pcm(value) => value.is_faded_out(),
+            #[cfg(feature = "diretta")]
             Self::Dsd(_) => true,
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => true,
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
 
     /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
-    /// DSD 无淡出通道，恒返回 true（无排空需求）。
+    /// DSD/Fake 无淡出需求，恒返回 true。
     fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
         match self {
+            #[cfg(feature = "diretta")]
             Self::Pcm(value) => value.wait_fade_drained(min_blocks, timeout),
+            #[cfg(feature = "diretta")]
             Self::Dsd(_) => true,
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => true,
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
 }
@@ -296,11 +320,6 @@ impl FakeDirectState {
     }
 }
 
-#[cfg(test)]
-enum TestTransport {
-    Fake(std::sync::Arc<FakeDirectState>),
-}
-
 pub struct DirectPlayback {
     duration: f64,
     seek_base: f64,
@@ -309,10 +328,7 @@ pub struct DirectPlayback {
     selector: String,
     #[cfg(feature = "diretta")]
     source: String,
-    #[cfg(feature = "diretta")]
     transport: DirectTransport,
-    #[cfg(all(test, not(feature = "diretta")))]
-    transport: TestTransport,
 }
 
 impl DirectPlayback {
@@ -505,26 +521,20 @@ impl DirectPlayback {
         self.seek_transition_count = self.monitor().transition_count();
         Ok(format)
     }
-
     pub fn seek_while_paused(&mut self, position_secs: f64) -> Result<f64> {
-        #[cfg(feature = "diretta")]
         let actual_position = match &mut self.transport {
+            #[cfg(feature = "diretta")]
             DirectTransport::Pcm(value) => value.seek_while_paused(position_secs)?,
+            #[cfg(feature = "diretta")]
             DirectTransport::Dsd(value) => value.seek_while_paused(position_secs)?,
-        };
-        #[cfg(all(test, not(feature = "diretta")))]
-        let actual_position = {
-            match &self.transport {
-                TestTransport::Fake(value) => {
-                    value
-                        .position_micros
-                        .store(0, std::sync::atomic::Ordering::Release);
-                }
+            #[cfg(all(test, not(feature = "diretta")))]
+            DirectTransport::Fake(value) => {
+                value
+                    .position_micros
+                    .store(0, std::sync::atomic::Ordering::Release);
+                position_secs
             }
-            position_secs
         };
-        #[cfg(not(any(feature = "diretta", test)))]
-        let actual_position = position_secs;
 
         self.seek_base = actual_position;
         self.seek_transition_count = self.monitor().transition_count();
@@ -532,95 +542,50 @@ impl DirectPlayback {
     }
 
     pub fn play(&mut self) -> Result<()> {
-        #[cfg(feature = "diretta")]
-        {
-            match &mut self.transport {
-                DirectTransport::Pcm(value) => value.play(),
-                DirectTransport::Dsd(value) => value.play(),
+        match &mut self.transport {
+            #[cfg(feature = "diretta")]
+            DirectTransport::Pcm(value) => value.play(),
+            #[cfg(feature = "diretta")]
+            DirectTransport::Dsd(value) => value.play(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            DirectTransport::Fake(value) => {
+                value
+                    .playing
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
             }
-        }
-        #[cfg(all(test, not(feature = "diretta")))]
-        {
-            match &self.transport {
-                TestTransport::Fake(value) => {
-                    value
-                        .playing
-                        .store(true, std::sync::atomic::Ordering::Release);
-                    Ok(())
-                }
-            }
-        }
-        #[cfg(not(any(feature = "diretta", test)))]
-        {
-            unreachable!()
         }
     }
 
     pub fn pause(&mut self) -> Result<()> {
-        #[cfg(feature = "diretta")]
-        {
-            match &mut self.transport {
-                DirectTransport::Pcm(value) => value.pause(),
-                DirectTransport::Dsd(value) => value.pause(),
+        match &mut self.transport {
+            #[cfg(feature = "diretta")]
+            DirectTransport::Pcm(value) => value.pause(),
+            #[cfg(feature = "diretta")]
+            DirectTransport::Dsd(value) => value.pause(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            DirectTransport::Fake(value) => {
+                value
+                    .playing
+                    .store(false, std::sync::atomic::Ordering::Release);
+                Ok(())
             }
-        }
-        #[cfg(all(test, not(feature = "diretta")))]
-        {
-            match &self.transport {
-                TestTransport::Fake(value) => {
-                    value
-                        .playing
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    Ok(())
-                }
-            }
-        }
-        #[cfg(not(any(feature = "diretta", test)))]
-        {
-            unreachable!()
         }
     }
 
     /// 换源/关流前的源级淡出（详见 DirectTransport::begin_fade_out）
     pub fn begin_fade_out(&self) {
-        #[cfg(feature = "diretta")]
         self.transport.begin_fade_out();
-        #[cfg(all(test, not(feature = "diretta")))]
-        {} // fake 无音频流，无需淡出
     }
 
     /// 淡出是否已生效（后续块均为数字静音）
     pub fn is_faded_out(&self) -> bool {
-        #[cfg(feature = "diretta")]
-        {
-            self.transport.is_faded_out()
-        }
-        #[cfg(all(test, not(feature = "diretta")))]
-        {
-            true
-        }
-        #[cfg(not(any(feature = "diretta", test)))]
-        {
-            unreachable!("Direct 淡出查询仅在 diretta/test 配置下可用")
-        }
+        self.transport.is_faded_out()
     }
 
     /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时返回 false
     pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
-        #[cfg(feature = "diretta")]
-        {
-            self.transport.wait_fade_drained(min_blocks, timeout)
-        }
-        #[cfg(all(test, not(feature = "diretta")))]
-        {
-            let _ = (min_blocks, timeout);
-            true // fake 无音频流，视为已排空
-        }
-        #[cfg(not(any(feature = "diretta", test)))]
-        {
-            let _ = (min_blocks, timeout);
-            unreachable!("Direct 淡出排空仅在 diretta/test 配置下可用")
-        }
+        self.transport.wait_fade_drained(min_blocks, timeout)
     }
 
     /// open 后启动验证：等待首块被设备真正消费。
@@ -705,47 +670,31 @@ impl DirectPlayback {
     }
 
     pub fn format(&self) -> DirectFormat {
-        #[cfg(feature = "diretta")]
-        {
-            match &self.transport {
-                DirectTransport::Pcm(value) => DirectFormat::Pcm(value.format()),
-                DirectTransport::Dsd(value) => DirectFormat::Dsd(value.format()),
-            }
-        }
-        #[cfg(all(test, not(feature = "diretta")))]
-        {
-            DirectFormat::Pcm(DirectPcmFormat {
+        match &self.transport {
+            #[cfg(feature = "diretta")]
+            DirectTransport::Pcm(value) => DirectFormat::Pcm(value.format()),
+            #[cfg(feature = "diretta")]
+            DirectTransport::Dsd(value) => DirectFormat::Dsd(value.format()),
+            #[cfg(all(test, not(feature = "diretta")))]
+            DirectTransport::Fake(_) => DirectFormat::Pcm(DirectPcmFormat {
                 sample_rate: 44_100,
                 channels: 2,
                 valid_bits: 16,
                 storage_bits: 16,
                 sample_format: crate::direct_pcm::DirectPcmSampleFormat::Signed16,
                 memory_path: crate::direct_pcm::DirectPcmMemoryPath::ZeroCopyPacked,
-            })
-        }
-        #[cfg(not(any(feature = "diretta", test)))]
-        {
-            unreachable!()
+            }),
         }
     }
 
     pub fn monitor(&self) -> DirectMonitor {
-        #[cfg(feature = "diretta")]
-        {
-            match &self.transport {
-                DirectTransport::Pcm(value) => DirectMonitor::Pcm(value.monitor()),
-                DirectTransport::Dsd(value) => DirectMonitor::Dsd(value.monitor()),
-            }
-        }
-        #[cfg(all(test, not(feature = "diretta")))]
-        {
-            match &self.transport {
-                TestTransport::Fake(value) => DirectMonitor::Fake(std::sync::Arc::clone(value)),
-            }
-        }
-        #[cfg(not(any(feature = "diretta", test)))]
-        {
-            unreachable!()
+        match &self.transport {
+            #[cfg(feature = "diretta")]
+            DirectTransport::Pcm(value) => DirectMonitor::Pcm(value.monitor()),
+            #[cfg(feature = "diretta")]
+            DirectTransport::Dsd(value) => DirectMonitor::Dsd(value.monitor()),
+            #[cfg(all(test, not(feature = "diretta")))]
+            DirectTransport::Fake(value) => DirectMonitor::Fake(std::sync::Arc::clone(value)),
         }
     }
 
@@ -820,14 +769,14 @@ impl DirectPlayback {
             duration,
             seek_base: 0.0,
             seek_transition_count: 0,
-            transport: TestTransport::Fake(state),
+            transport: DirectTransport::Fake(state),
         }
     }
 
     #[cfg(all(test, not(feature = "diretta")))]
     pub fn fake_state(&self) -> std::sync::Arc<FakeDirectState> {
         match &self.transport {
-            TestTransport::Fake(value) => std::sync::Arc::clone(value),
+            DirectTransport::Fake(value) => std::sync::Arc::clone(value),
         }
     }
 }
