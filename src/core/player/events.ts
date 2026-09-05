@@ -7,6 +7,8 @@ import * as autoClose from "@/services/autoClose";
 import * as abLoop from "@/services/abLoop";
 import * as cacheScheduler from "@/services/cacheScheduler";
 import * as playStats from "./stats";
+import { playerClient } from "@/services/client";
+import { adoptServerAdvancedTrack, maybeRegisterNextCandidate } from "./serverAutoAdvance";
 import {
   hasReachedSeekTarget,
   insertManyToQueue,
@@ -39,8 +41,19 @@ const finishCurrentTrack = async (): Promise<void> => {
   endedGuard = true;
   try {
     const stopByTimer = autoClose.onTrackEnded();
-    // FM 模式跳过
     const repeatOne = status.repeatMode === "one" && !status.fmMode;
+    // headless 自动连播：候选已在曲中注册，曲终由服务端接力加载下一曲；
+    // 本地仅结算统计/定时关闭/单曲循环，避免与服务端接力双重加载。
+    // FM 候选未注册（需实时解析），回退本地推进
+    if (playerClient.supportsServerAutoAdvance && !status.fmMode) {
+      playStats.onTrackEnded(repeatOne && !stopByTimer);
+      if (stopByTimer) return;
+      if (repeatOne) {
+        await seek(0);
+        await play();
+      }
+      return;
+    }
     // 结算播放统计
     playStats.onTrackEnded(repeatOne && !stopByTimer);
     // 定时关闭"等本曲结束"模式
@@ -81,6 +94,10 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       }
       playback.setDuration(event.data.duration);
       playback.setPlaying(event.data.state === "playing");
+      // headless 自动连播：服务端接力切曲后，按 current_source 采纳队列曲目
+      if (event.data.currentSource && playerClient.supportsServerAutoAdvance) {
+        adoptServerAdvancedTrack(event.data.currentSource);
+      }
       break;
     case "seek":
       markSeek(event.data.position);
@@ -104,6 +121,8 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       cacheScheduler.tick(adjusted);
       // Diretta Source Direct 无缝 stage 检查（内部自节流）
       maybeStageDirectNext();
+      // headless 自动连播：注册下一曲候选（内部自节流）
+      maybeRegisterNextCandidate();
       const track = useMediaStore().track;
       // 已 stage 无缝下一曲时交给引擎 boundary 事件推进，避免此处提前完整重载
       if (

@@ -84,6 +84,8 @@ export interface DirettaTargetCapabilities {
 export type ClientMode = "electron" | "http";
 
 export interface IPlayerClient extends PlayerApi {
+  /** 是否支持服务端自动连播（headless HTTP 为 true，桌面 IPC 为 false） */
+  readonly supportsServerAutoAdvance: boolean;
   scanDirettaTargets(): Promise<IpcResponse<DirettaTarget[]>>;
   getDirettaStatus(): Promise<IpcResponse<DirettaStatus>>;
   selectDirettaTarget(target: string | null): Promise<IpcResponse<any>>;

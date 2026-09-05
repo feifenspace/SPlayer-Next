@@ -192,6 +192,8 @@ export interface PlayerStatus {
   volume: number;
   speed: number;
   isFinished: boolean;
+  /** 服务端当前音源（仅 headless WS snapshot 附带，用于自动连播采纳） */
+  currentSource?: string;
 }
 
 /** 音频输出设备 */

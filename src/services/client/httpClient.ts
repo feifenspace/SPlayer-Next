@@ -42,6 +42,9 @@ export class HttpPlayerClient implements IPlayerClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private isDestroyed = false;
 
+  /** headless 服务端支持候选预注册 + 曲终自动连播 */
+  readonly supportsServerAutoAdvance = true;
+
   constructor(baseUrl?: string, wsUrl?: string) {
     if (typeof window !== "undefined") {
       const protocol = window.location.protocol === "https:" ? "https:" : "http:";
@@ -304,6 +307,7 @@ export class HttpPlayerClient implements IPlayerClient {
     volume?: number;
     is_finished?: boolean;
     speed?: number;
+    current_source?: string;
   }): void {
     const currentState = this.normalizeState(data.state);
     const posMs = Math.round((data.position || 0) * 1000);
@@ -328,6 +332,7 @@ export class HttpPlayerClient implements IPlayerClient {
         volume: data.volume ?? 1.0,
         isFinished: Boolean(data.is_finished),
         speed: Number(data.speed ?? 1.0),
+        currentSource: data.current_source,
       },
     });
   }

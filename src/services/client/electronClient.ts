@@ -21,6 +21,9 @@ export class ElectronPlayerClient implements IPlayerClient {
     return window.api.player;
   }
 
+  /** 桌面端队列由渲染进程驱动，无服务端自动连播 */
+  readonly supportsServerAutoAdvance = false;
+
   load(source: string, options?: LoadOptions): Promise<IpcResponse<LoadResult>> {
     return this.api.load(source, options);
   }

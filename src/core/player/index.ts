@@ -3,6 +3,7 @@ import type { TagEditRequest, TagWriteOutcome } from "@shared/types/tagEditor";
 import type { PersonalFmOptions } from "@/types/netease";
 import { handleEvent } from "./events";
 import { cancelStagedDirectNext } from "./gapless";
+import { resetServerAutoAdvance } from "./serverAutoAdvance";
 import type { RepeatMode, ShuffleMode } from "@/stores/status";
 import { useMediaStore } from "@/stores/media";
 import { useSettingsStore } from "@/stores/settings";
@@ -137,6 +138,8 @@ export const load = async (
   seekTarget = null;
   playback.setSeeking(false);
   resetForLoad(meta?.duration ?? 0);
+  // 客户端主动加载：清空自动连播注册（防止服务端接力与手动切歌竞态）
+  resetServerAutoAdvance();
   // 非本地并行歌词与取色
   const isOnline = meta?.source !== "local";
   if (isOnline) {

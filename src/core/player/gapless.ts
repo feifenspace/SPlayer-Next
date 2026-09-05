@@ -42,7 +42,7 @@ let lastSeenTrackId = "";
  * CUE 虚拟路径转换为引擎 stage 支持的物理分段格式 `path|start|dur|track`。
  * cue:// 路径只有 DB/load 通道能解析，stage_local 只认管道格式
  */
-const buildStagingSource = (track: Track, resolvedSource: string): string => {
+export const buildStagingSource = (track: Track, resolvedSource: string): string => {
   if (!resolvedSource.startsWith("cue://")) return resolvedSource;
   if (!track.cueAudioPath || track.cueStartMs == null) return resolvedSource;
   const startSec = track.cueStartMs / 1000;
