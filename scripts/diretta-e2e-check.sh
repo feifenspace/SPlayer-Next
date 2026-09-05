@@ -43,8 +43,13 @@ EOF
 # T1 基础播放：state=Playing 且 10 秒位置推进 ≥8s
 t1() {
   say "== T1 基础播放 =="
-  post /api/v1/player/load "{\"source\":\"$TRACK_A\",\"auto_play\":true}" > /dev/null
-  wait_playing || { bad "加载后未进入 Playing"; return 1; }
+  local resp
+  resp=$(post /api/v1/player/load "{\"source\":\"$TRACK_A\",\"auto_play\":true}")
+  if ! wait_playing; then
+    say "  load 响应: ${resp:-<empty>}"
+    bad "加载后未进入 Playing（响应即服务端错误文本，常见为 Target 未就绪——先断电重启 Target）"
+    return 1
+  fi
   p0=$(st | awk '{print $2}'); sleep 10; p1=$(st | awk '{print $2}')
   awk -v a="$p0" -v b="$p1" 'BEGIN { exit !((b - a) >= 8.0) }' \
     && ok "位置推进 ${p0}→${p1}（10s）" || bad "位置推进不足: ${p0}→${p1}"
@@ -56,11 +61,12 @@ t2() {
   for n in 1 2 3 4 5; do
     src=$([ $((n % 2)) -eq 1 ] && echo "$TRACK_A" || echo "$TRACK_B")
     t0=$(date +%s)
-    post /api/v1/player/load "{\"source\":\"$src\",\"auto_play\":true}" > /dev/null
+    resp=$(post /api/v1/player/load "{\"source\":\"$src\",\"auto_play\":true}")
     if wait_playing; then
       dt=$(( $(date +%s) - t0 ))
       [ "$dt" -le 3 ] && ok "切换 #$n 完成（${dt}s）" || bad "切换 #$n 耗时 ${dt}s（>3s）"
     else
+      say "  load 响应: ${resp:-<empty>}"
       bad "切换 #$n 未回到 Playing"
     fi
     sleep 2
