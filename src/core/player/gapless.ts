@@ -70,8 +70,11 @@ export const maybeStageDirectNext = (): void => {
 
   const settings = useSettingsStore();
   const status = useStatusStore();
-  // 与 preloadNextTrack 同一开关控制整条无缝链路
-  if (!settings.player.preloadNextTrack) return;
+  // 无缝链路开关：全局预载关闭时跳过；但 Diretta 输出例外——
+  // 无缝 stage 是 Diretta 的核心收益，不随全局预载开关关闭（对齐 splayer-atom 修复）
+  const output = settings.player.outputDevice ?? "";
+  const isDirettaOutput = output.startsWith("diretta:") || output.startsWith("diretta@");
+  if (!settings.player.preloadNextTrack && !isDirettaOutput) return;
   // 单曲循环引擎内无下一曲概念；FM 的下一曲必须实时解析
   if (status.repeatMode === "one" || status.fmMode) return;
   if (status.state !== "playing") return;
