@@ -1480,6 +1480,17 @@ async fn load_handler(
     match committed_meta {
         Some(meta) => {
             update_now_playing(&state, &source, &meta);
+            // 开流格式观测：把每次 load 的采样率/位深/编解码留在日志里，
+            // 用于与输出停滞的相关性分析（Target 对特定格式拒收的定位）
+            tracing::info!(
+                source = %source,
+                sample_rate = meta.sample_rate,
+                original_sample_rate = meta.original_sample_rate,
+                channels = meta.channels,
+                bits_per_sample = meta.bits_per_sample,
+                codec = ?meta.codec,
+                "load 已提交"
+            );
             Ok(Json(PlayerResponse::ok(json!({
                 "status": if auto_play { "playing" } else { "paused" },
                 "source": source,
@@ -1771,12 +1782,20 @@ async fn direct_stage_next_handler(
     .map_err(|e| ApiError::internal(format!("Stage next worker error: {e}")))?;
 
     match result {
-        Ok(()) => Ok(Json(PlayerResponse::ok(json!({
-            "staged": true,
-            "source": source,
-            "generation": generation,
-        })))),
-        Err(err) => Err(ApiError::bad_request(format!("Direct stage failed: {err}"))),
+        Ok(()) => {
+            tracing::info!(source = %source, generation, "无缝候选已 stage");
+            Ok(Json(PlayerResponse::ok(json!({
+                "staged": true,
+                "source": source,
+                "generation": generation,
+            }))))
+        }
+        Err(err) => {
+            // 常见拒绝原因：wire format 与当前连接不一致（采样率/位深跳变，
+            // 引擎拒绝跨格式无缝）——这条日志用于与曲终自动连播、输出停滞关联
+            tracing::info!(source = %source, error = %err, "无缝 stage 被拒，回退曲终接力");
+            Err(ApiError::bad_request(format!("Direct stage failed: {err}")))
+        }
     }
 }
 
