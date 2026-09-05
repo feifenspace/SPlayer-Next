@@ -693,3 +693,5 @@ Electron --headless 与 headless-server 由**同一晚相差 16 秒的两个 com
 - 批次 B：`wscat` 观察 subscribe 后 FFT 事件到达；seek 后 `seeked` 事件延迟 < 100ms。
 - 批次 C：浏览器播放 → 关闭浏览器 → 曲终后 `journalctl` 确认自动接续且曲目正确；双标签后写覆盖；单曲循环播完即停。
 - 风险提示：批次 C 触及前端队列/media store 状态同步，是剩余工作中唯一有 UX 回归风险的改动，单独提交并手工验收；批次 A/D 可先行。
+
+> 后续方案（tinyLMS-old / splayer-atom 对照的 Diretta 硬化批次 E/F + 上游同步 SOP）见同目录 `hardening-and-upstream-sync-plan.md`（2026-09-05）。
