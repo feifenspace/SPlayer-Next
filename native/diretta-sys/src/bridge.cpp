@@ -11,7 +11,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -107,11 +109,52 @@ bool discover(DIRETTA::Find& find, DIRETTA::Find::PortResalts& results) {
     set_error("failed to open Diretta discovery socket");
     return false;
   }
-  if (!find.findOutput(results)) {
-    set_error("Diretta target discovery failed");
-    return false;
+  // 【对齐 tinyLMS】发现重试 + 广播备选：Target 冷启动时公告可能滞后
+  for (int retry = 0; retry < 3; ++retry) {
+    if (retry > 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
+    if (find.findOutput(results) && !results.empty()) {
+      return true;
+    }
+    // 备选：标准广播发现（findTarget），转换后供按地址匹配
+    DIRETTA::Find::TargetResalts targets;
+    if (find.findTarget(targets) && !targets.empty()) {
+      for (const auto& [addr, info] : targets) {
+        results[addr] = DIRETTA::Find::TargetConnectInfo();
+      }
+      if (!results.empty()) {
+        return true;
+      }
+    }
   }
-  return true;
+  set_error("Diretta target discovery failed");
+  return false;
+}
+
+// 【对齐 tinyLMS】MTU 测量结果按 IP 缓存：省去局域网重复测量的 50-100ms。
+// 默认值（1500）不缓存——下次连接会重试真实测量
+std::mutex g_mtu_cache_mutex;
+std::map<std::string, std::uint32_t> g_mtu_cache;
+
+std::uint32_t measured_mtu_for(const ACQUA::IPAddress& target, DIRETTA::Find& find) {
+  {
+    std::lock_guard<std::mutex> lock(g_mtu_cache_mutex);
+    auto it = g_mtu_cache.find(target.get_full_str());
+    if (it != g_mtu_cache.end()) {
+      return it->second;
+    }
+  }
+  std::uint32_t mtu = 0;
+  if (!find.measSendMTU(target, mtu) || mtu == 0) {
+    mtu = 1500;
+    return mtu;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_mtu_cache_mutex);
+    g_mtu_cache[target.get_full_str()] = mtu;
+  }
+  return mtu;
 }
 
 DIRETTA::FormatID pcm_format(std::uint8_t storage_bits) {
@@ -131,6 +174,7 @@ void* open_direct_with_format(
   std::uint16_t channels,
   DIRETTA::FormatID format_id,
   DIRETTA::FormatID alternate_format_id,
+  double bytes_per_sample,
   void* source_context,
   SPlayerDirettaNextBlock next_block,
   SPlayerDirettaReleaseBlock release_block,
@@ -162,25 +206,34 @@ void* open_direct_with_format(
       return nullptr;
     }
 
-    std::uint32_t mtu = 0;
-    if (!connection->find->measSendMTU(target, mtu) || mtu == 0) {
-      mtu = 1500;
-    }
+    // 【对齐 tinyLMS】MTU 按 IP 缓存（见 measured_mtu_for）
+    std::uint32_t mtu = measured_mtu_for(target, *connection->find);
+
+    // 【对齐 tinyLMS】按 MTU 动态计算传输周期：UDP 包尽量填满 MTU，减少分片
+    // 抖动；DSD 高码率下避免包过大导致 SDK 内部挂起。约束 100us ~ 10ms
+    const std::uint32_t udp_overhead = 48; // IPv6(40) + UDP(8)
+    const std::uint32_t efficient_mtu = (mtu > udp_overhead) ? (mtu - udp_overhead) : 1452;
+    const double bytes_per_second =
+      static_cast<double>(sample_rate) * static_cast<double>(channels) * bytes_per_sample;
+    std::uint32_t cycle_time_us = static_cast<std::uint32_t>(
+      (static_cast<double>(efficient_mtu) / bytes_per_second) * 1000000.0);
+    cycle_time_us = std::clamp(cycle_time_us, 100u, 10000u);
 
     connection->sync = std::make_unique<DirectSync>(
       source_context,
       next_block,
       release_block);
-    const auto thread_mode = static_cast<DIRETTA::Sync::THRED_MODE>(5);
+    // THRED_MODE(289) 为 tinyLMS 验证过的实时线程配置组合；CPU 参数 -1,-1 交由 SDK 自选核心
+    const auto thread_mode = static_cast<DIRETTA::Sync::THRED_MODE>(289);
     const auto ifno = static_cast<std::uint16_t>(target.get_ifno());
     if (!connection->sync->open(
           thread_mode,
-          ACQUA::Clock::MilliSeconds(100),
+          ACQUA::Clock::MicroSeconds(cycle_time_us),
           ifno,
           "SPlayer-Next",
-          0,
-          0,
-          0,
+          0x44525400,
+          -1,
+          -1,
           0,
           DIRETTA::Sync::MSMODE_AUTO)) {
       set_error("failed to open Diretta Source Direct sync");
@@ -217,11 +270,12 @@ void* open_direct_with_format(
     }
 
     connection->sync->configTransferAuto(
-      ACQUA::Clock::MicroSeconds(200),
+      ACQUA::Clock::MicroSeconds(cycle_time_us),
       ACQUA::Clock(),
-      ACQUA::Clock::MicroSeconds(100000));
+      ACQUA::Clock::MicroSeconds(30000));
 
-    if (!connection->sync->connectPrepare()) {
+    // true = 强制 Target 状态机重置：全量重连（跨格式/重连）需要干净的协商起点
+    if (!connection->sync->connectPrepare(true)) {
       set_error("failed to prepare Diretta Source Direct connection");
       return nullptr;
     }
@@ -322,6 +376,7 @@ void* splayer_diretta_open_direct(
     channels,
     format_id,
     DIRETTA::FormatID::NONE,
+    4.0,
     source_context,
     next_block,
     release_block,
@@ -363,6 +418,7 @@ void* splayer_diretta_open_dsd_direct(
     channels,
     source_format_id,
     alternate_format_id,
+    1.0,
     source_context,
     next_block,
     release_block,
@@ -508,11 +564,8 @@ extern "C" bool splayer_diretta_query_target_caps(const char* target_id,
     fill_cstr(out_caps->full_addr, target.get_full_str());
     out_caps->if_idx = static_cast<int32_t>(target.get_ifno());
 
-    // 3. 测量 MTU（Find 需预热；尽量复用扫描结果）
-    std::uint32_t measured_mtu = 0;
-    if (!find.measSendMTU(target, measured_mtu) || measured_mtu == 0) {
-      measured_mtu = 1500;
-    }
+    // 3. 测量 MTU（Find 需预热；尽量复用扫描结果，按 IP 缓存）
+    std::uint32_t measured_mtu = measured_mtu_for(target, find);
     out_caps->mtu_measured = measured_mtu;
 
     // 4. 创建临时 QuerySync 并打开
