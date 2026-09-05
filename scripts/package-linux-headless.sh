@@ -421,7 +421,8 @@ RestartSec=3
 LimitRTPRIO=infinity
 LimitMEMLOCK=infinity
 AmbientCapabilities=CAP_SYS_NICE CAP_NET_RAW CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_SYS_NICE CAP_NET_RAW CAP_NET_BIND_SERVICE
+# CAP_DAC_OVERRIDE 必须保留：数据目录属主非 root 时，root 仍需越过权限位写库
+CapabilityBoundingSet=CAP_SYS_NICE CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
 
 [Install]
 WantedBy=multi-user.target
