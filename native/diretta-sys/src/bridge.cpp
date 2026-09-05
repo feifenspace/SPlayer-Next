@@ -224,16 +224,16 @@ void* open_direct_with_format(
       next_block,
       release_block);
     // THRED_MODE(289) 为 tinyLMS 验证过的实时线程配置组合；CPU 参数 -1,-1 交由 SDK 自选核心
-    const auto thread_mode = static_cast<DIRETTA::Sync::THRED_MODE>(289);
+    const auto thread_mode = static_cast<DIRETTA::Sync::THRED_MODE>(5);
     const auto ifno = static_cast<std::uint16_t>(target.get_ifno());
     if (!connection->sync->open(
           thread_mode,
-          ACQUA::Clock::MicroSeconds(cycle_time_us),
+          ACQUA::Clock::MilliSeconds(100),
           ifno,
           "SPlayer-Next",
-          0x44525400,
-          -1,
-          -1,
+          0,
+          0,
+          0,
           0,
           DIRETTA::Sync::MSMODE_AUTO)) {
       set_error("failed to open Diretta Source Direct sync");
@@ -270,7 +270,7 @@ void* open_direct_with_format(
     }
 
     connection->sync->configTransferAuto(
-      ACQUA::Clock::MicroSeconds(cycle_time_us),
+      ACQUA::Clock::MilliSeconds(100),
       ACQUA::Clock(),
       ACQUA::Clock::MicroSeconds(30000));
 
