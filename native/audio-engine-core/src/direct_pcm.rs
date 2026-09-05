@@ -2125,6 +2125,10 @@ pub struct DirectPcmMonitor {
 }
 
 impl DirectPcmMonitor {
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
     pub fn consumed_position(&self) -> f64 {
         self.ring.consumed_frames.load(Ordering::Acquire) as f64 / f64::from(self.sample_rate)
     }

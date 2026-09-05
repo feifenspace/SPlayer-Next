@@ -96,6 +96,17 @@ impl DirectMonitor {
         }
     }
 
+    /// 高码率判定：PCM >96kHz，或任意 DSD 位流（块周期长）——停滞阈值放宽依据。
+    /// Fake 恒为 false
+    pub fn is_high_rate(&self) -> bool {
+        match self {
+            Self::Pcm(value) => value.sample_rate() > 96_000,
+            Self::Dsd(_) => true,
+            #[cfg(test)]
+            Self::Fake(_) => false,
+        }
+    }
+
     /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
     /// DSD 无淡出通道恒 true；Fake 无音频流恒 true。
     /// 句柄持有 ring 的 Arc 引用，供调用方在 player 锁外排空

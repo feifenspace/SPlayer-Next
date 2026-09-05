@@ -672,7 +672,7 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split("} // namespace").next())
             .expect("Diretta open path should exist");
-        assert!(open.contains("connectPrepare()"));
+        assert!(open.contains("connectPrepare(true)"));
         assert!(open.contains("connect(0)"));
         assert!(open.contains("connectWait()"));
         assert!(!open.contains("is_online()"));

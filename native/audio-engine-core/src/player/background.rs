@@ -102,10 +102,11 @@ impl InnerPlayer {
             };
             let handle = thread::spawn(move || {
                 let mut last_transition_count = initial_transition_count;
-                // 停滞检测：消费位置连续 STALL_THRESHOLD_TICKS 次未动且仍有待消费
+                // 停滞检测：消费位置连续阈值次未动且仍有待消费
                 // 数据 → 设备端不再拉流（链路停滞）；待消费为零是 SDK 等解码补数
-                // 据，不视为停滞。首块消费前不计（Direct 启动握手可能慢于 1.2s）
-                const STALL_THRESHOLD_TICKS: u32 = 6; // 6 * 200ms = 1.2s
+                // 据，不视为停滞。首块消费前不计（Direct 启动握手可能慢于 1.2s）。
+                // 高码率（PCM >96k / 任意 DSD）块周期更长，阈值放宽（对齐 tinyLMS）
+                let stall_threshold: u32 = if monitor.is_high_rate() { 8 } else { 6 };
                 let mut last_consumed = 0.0_f64;
                 let mut first_consumed_seen = false;
                 let mut stall_ticks: u32 = 0;
@@ -151,7 +152,7 @@ impl InnerPlayer {
                         && monitor.pending_blocks() > 0
                     {
                         stall_ticks += 1;
-                        if stall_ticks >= STALL_THRESHOLD_TICKS {
+                        if stall_ticks >= stall_threshold {
                             cb(PlayerEvent::OutputStalled);
                             // 发完归零，由恢复方冷却防抖
                             stall_ticks = 0;
