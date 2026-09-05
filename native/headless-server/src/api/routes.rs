@@ -83,6 +83,8 @@ const OUTPUT_RECOVERY_MAX_CONSECUTIVE: u32 = 3;
 const OUTPUT_RECOVERY_SUPPRESS_RESET: Duration = Duration::from_secs(60);
 /// 恢复后回退进度小于该值时不 seek
 const OUTPUT_RECOVERY_MIN_RESUME_POSITION: f64 = 1.0;
+/// Diretta 可达性/能力探测硬超时：DKS 调用（发现重试 + MTU 测量）内部无超时保护
+const DIRETTA_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 启动输出恢复看门狗（服务启动时调用一次）。
 ///
@@ -2624,8 +2626,9 @@ async fn diretta_status_handler(
 
 /// 切换音频输出到指定的 Diretta Target 设备（或传入 null/空 恢复默认声卡）。
 ///
-/// 设备选择在**下一次 load 时生效**（当前曲目不受影响）；携带 target 时会做一次
-/// 可达性探测（隔离线程，最长 2-3s），结果仅写入响应不阻断登记——目标可能暂时
+/// 设备选择在**下一次 load 时生效**（当前曲目不受影响），并持久化到 server_state
+/// （重启后 AppState 自动恢复，浏览器不在场也能连对设备）。携带 target 时会做一次
+/// 可达性探测（隔离线程 + 硬超时），结果仅写入响应不阻断登记——目标可能暂时
 /// 离线，用户可先登记待其上线
 async fn diretta_select_handler(
     State(state): State<AppState>,
@@ -2651,21 +2654,51 @@ async fn diretta_select_handler(
     let reachable = match &dev_name {
         Some(target) => {
             let target = target.clone();
-            spawn_isolated_blocking("diretta-select-verify", move || {
-                audio_engine_core::diretta::query_target_caps(&target).is_ok()
-            })
+            // DKS 探测内部无超时（3 轮发现重试 + MTU 测量），Target 被占用/半死时
+            // 可无限阻塞并卡死页面初始化链：硬超时兜底，按"暂不可达"放行登记。
+            // 超时的探测 OS 线程无法取消，留在后台自行结束
+            let target_for_log = target.clone();
+            match tokio::time::timeout(
+                DIRETTA_PROBE_TIMEOUT,
+                spawn_isolated_blocking("diretta-select-verify", move || {
+                    audio_engine_core::diretta::query_target_caps(&target).is_ok()
+                }),
+            )
             .await
-            .map_err(|e| ApiError::internal(e))?
+            {
+                Ok(Ok(reachable)) => reachable,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "Diretta 可达性探测线程异常");
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(target = %target_for_log, "Diretta 可达性探测超时，按暂不可达处理");
+                    false
+                }
+            }
         }
         None => true,
     };
 
-    let mut player = state.player.lock();
-    player.set_output_device(dev_name);
+    {
+        let mut player = state.player.lock();
+        player.set_output_device(dev_name.clone());
+    }
+    // 持久化本次选择（顺序取锁：player 与 db 不嵌套，避免锁序问题）
+    {
+        let conn = state.db.lock();
+        if let Err(e) = crate::db::set_server_state(
+            &conn,
+            crate::state::OUTPUT_DEVICE_STATE_KEY,
+            dev_name.as_deref().unwrap_or(""),
+        ) {
+            tracing::warn!(error = %e, "保存输出设备选择失败");
+        }
+    }
 
     Ok(Json(PlayerResponse::ok(json!({
         "status": "output_device_updated",
-        "selected_device": player.selected_device(),
+        "selected_device": dev_name,
         "takes_effect": "next_load",
         "reachable": reachable,
     }))))
@@ -2691,12 +2724,28 @@ async fn diretta_target_info_handler(
         return Err(ApiError::bad_request("Diretta target is required"));
     }
 
-    let caps = spawn_isolated_blocking("diretta-info-worker", move || {
-        audio_engine_core::diretta::query_target_caps(&target)
-    })
+    let caps = match tokio::time::timeout(
+        DIRETTA_PROBE_TIMEOUT,
+        spawn_isolated_blocking("diretta-info-worker", move || {
+            audio_engine_core::diretta::query_target_caps(&target)
+        }),
+    )
     .await
-    .map_err(|e| ApiError::internal(format!("Diretta target info task failed: {e}")))?
-    .map_err(|e| ApiError::internal(format!("Diretta target capability query failed: {e}")))?;
+    {
+        Ok(Ok(result)) => result.map_err(|e| {
+            ApiError::internal(format!("Diretta target capability query failed: {e}"))
+        })?,
+        Ok(Err(e)) => {
+            return Err(ApiError::internal(format!(
+                "Diretta target info task failed: {e}"
+            )))
+        }
+        Err(_) => {
+            return Err(ApiError::internal(
+                "Diretta target 探测超时（DKS 调用无内部超时，已中止等待）",
+            ))
+        }
+    };
 
     let pcm_format_desc = if caps.supports_pcm {
         format!(

@@ -144,6 +144,14 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             updated_at INTEGER NOT NULL
         );
 
+        -- 服务端内部运行状态（输出设备选择等）：独立于前端 settings，
+        -- 不随 get_all_settings 下发、不被 reset_settings 清空
+        CREATE TABLE IF NOT EXISTS server_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS play_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             track_id TEXT NOT NULL,
@@ -1237,6 +1245,36 @@ pub fn set_all_settings(
 /// 重置所有配置项
 pub fn reset_settings(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM settings", [])?;
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// 服务端内部状态（server_state 表）
+// -------------------------------------------------------------------
+
+/// 读取服务端内部状态值
+pub fn get_server_state(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("SELECT value FROM server_state WHERE key = ?1")?;
+    let val: Option<String> = stmt.query_row(params![key], |r| r.get(0)).optional()?;
+    Ok(val)
+}
+
+/// 写入服务端内部状态值（UPSERT）
+pub fn set_server_state(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    conn.execute(
+        r#"
+        INSERT INTO server_state (key, value, updated_at)
+        VALUES (?1, ?2, ?3)
+        ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at = excluded.updated_at
+        "#,
+        params![key, value, now],
+    )?;
     Ok(())
 }
 

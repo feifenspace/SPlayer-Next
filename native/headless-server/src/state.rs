@@ -8,8 +8,12 @@ use std::sync::Arc;
 use audio_engine_core::{EventEmitter, InnerPlayer, PlayerEvent, PlayerState};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::broadcast;
+use tracing::info;
 
 use crate::config::Config;
+
+/// server_state 表键：最后一次选择的输出设备（重启自动恢复，浏览器不在场也能连对设备）
+pub const OUTPUT_DEVICE_STATE_KEY: &str = "output_device";
 
 fn serialize_player_state<S>(state: &PlayerState, serializer: S) -> Result<S::Ok, S::Error>
 where
@@ -96,6 +100,15 @@ impl AppState {
     pub fn new(config: &Config) -> anyhow::Result<Self> {
         let db_path = config.resolved_database_path();
         let db_conn = crate::db::init_db(&db_path)?;
+
+        // 输出设备恢复：显式配置的 diretta_target 优先（运营者写死，不被浏览器
+        // 上次的选择覆盖）；否则用服务端记忆的上次选择（headless 自恢复，
+        // 不依赖浏览器在场）
+        let saved_output_device = if config.diretta_target.is_none() {
+            crate::db::get_server_state(&db_conn, OUTPUT_DEVICE_STATE_KEY).ok().flatten()
+        } else {
+            None
+        };
         let db = Arc::new(Mutex::new(db_conn));
 
         let mut inner_player = InnerPlayer::new()?;
@@ -106,6 +119,10 @@ impl AppState {
         if let Some(ref target) = config.diretta_target {
             let diretta_dev = format!("diretta:{}", target);
             inner_player.set_output_device(Some(diretta_dev));
+        } else if let Some(saved) = saved_output_device {
+            let dev = if saved.is_empty() { None } else { Some(saved) };
+            info!(device = ?dev, "恢复上次输出设备");
+            inner_player.set_output_device(dev);
         }
         let player = Arc::new(Mutex::new(inner_player));
 
