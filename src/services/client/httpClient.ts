@@ -243,6 +243,13 @@ export class HttpPlayerClient implements IPlayerClient {
             });
           }
           break;
+        case "autoAdvanceFailed":
+          // 服务端曲终接力失败：浏览器在场时由前端兜底切歌
+          this.emitEvent({
+            type: "serverAutoAdvanceFailed",
+            data: { source: String(msg.data?.source ?? ""), error: msg.data?.error },
+          });
+          break;
         // outputFailed / outputStalled / outputRecoveryFailed / nextCandidateChanged：
         // 服务端自行恢复与记录，客户端暂无消费方
         default:

@@ -89,7 +89,7 @@ t3() {
   else
     bad "曲终后状态异常: $s"
   fi
-  post /api/v1/player/queue/next-candidate-cancel > /dev/null 2>&1 || true
+  curl -s -X DELETE "${BASE}/api/v1/player/queue/next-candidate" > /dev/null 2>&1 || true
 }
 
 gen_tracks

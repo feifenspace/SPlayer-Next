@@ -213,6 +213,11 @@ export type PlayerEvent =
   | { type: "ended" }
   | { type: "sourceError" }
   | {
+      type: "serverAutoAdvanceFailed";
+      /** 服务端接力加载失败的候选 source 与原因 */
+      data: { source: string; error?: string };
+    }
+  | {
       type: "directTrackBoundary";
       /** 无缝切换后新曲时长（毫秒） */
       data: { duration: number; generation: number };

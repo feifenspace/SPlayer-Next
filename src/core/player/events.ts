@@ -151,6 +151,17 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       // 音源失效（网络中断 / URL 过期）
       await recoverFromSourceFailure();
       break;
+    case "serverAutoAdvanceFailed":
+      // 服务端曲终接力失败（候选 URL 失效等）：浏览器在场时由前端接管推进
+      if (playerClient.supportsServerAutoAdvance && !status.fmMode) {
+        console.warn(
+          "[player] 服务端自动连播失败，前端接管切歌",
+          event.data.source,
+          event.data.error,
+        );
+        await nextTrack();
+      }
+      break;
     case "play":
       await play();
       break;

@@ -121,11 +121,22 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                         }),
                     )
                     .await;
-                    if !matches!(&load_result, Ok(response) if response.success) {
-                        tracing::warn!(source = %next.source, "自动连播加载失败");
+                    let failure = match &load_result {
+                        Ok(response) if response.success => None,
+                        Ok(response) => Some(
+                            response
+                                .error
+                                .as_ref()
+                                .map(|e| format!("{}: {}", e.code, e.message))
+                                .unwrap_or_else(|| "success=false".to_string()),
+                        ),
+                        Err(e) => Some(format!("{}: {}", e.code, e.message)),
+                    };
+                    if let Some(detail) = failure {
+                        tracing::warn!(source = %next.source, error = %detail, "自动连播加载失败");
                         let _ = state.ws_tx.send(serde_json::json!({
                             "type": "autoAdvanceFailed",
-                            "data": { "source": next.source },
+                            "data": { "source": next.source, "error": detail },
                         }));
                     }
                 }
@@ -926,12 +937,27 @@ pub struct NextCandidateRequest {
     pub duration_hint: Option<f64>,
 }
 
+/// 服务端可加载的候选 source：HTTP(S) 直链、绝对路径、CUE 虚拟轨。
+/// 裸 track id / 相对路径解码器打不开，注册了也只会在曲终加载失败
+fn is_loadable_candidate_source(source: &str) -> bool {
+    source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("cue://")
+        || source.starts_with('/')
+}
+
 /// 注册下一曲候选（B 层自动连播）：浏览器关闭后服务端仍能在曲终自动接续。
 /// 单槽后写覆盖；曲终加载完成后候选即被消费
 async fn queue_next_candidate_handler(
     State(state): State<AppState>,
     Json(payload): Json<NextCandidateRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
+    if !is_loadable_candidate_source(&payload.source) {
+        return Err(ApiError::bad_request(format!(
+            "候选 source 无法被服务端加载（需为 URL/绝对路径/cue://）：{}",
+            payload.source
+        )));
+    }
     *state.pending_next.lock() = Some(crate::state::PendingNext {
         source: payload.source.clone(),
         duration_hint: payload.duration_hint,

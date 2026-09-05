@@ -10,8 +10,10 @@ import { useSettingsStore } from "@/stores/settings";
 import * as queue from "@/stores/queue";
 import { playerClient } from "@/services/client";
 import { peekNextTrackPreload } from "@/services/nextTrackPreloader";
+import { resolveTrackSource } from "@/services/audioSource";
 import { buildStagingSource } from "@/core/player/gapless";
 import { getNextTrackCandidate } from "./candidate";
+import type { CandidateResult } from "./candidate";
 import * as lyricLoader from "@/services/lyric/loader";
 import * as coverLoader from "@/services/coverLoader";
 import { extractColorFromUrl } from "@/utils/color";
@@ -20,6 +22,12 @@ import { extractColorFromUrl } from "@/utils/color";
 let registeredNext: { source: string; track: Track; index: number } | null = null;
 /** 已注册候选对应的当前曲 source（去重，防 position tick 重复注册） */
 let registeredForSource: string | null = null;
+/** 正在/最近一次解析直链的候选 track id（防 position tick 重复发起解析） */
+let resolvingTrackId: string | null = null;
+/** 上次直链解析尝试时间（失败后的重试冷却） */
+let lastResolveAttemptAt = 0;
+/** 直链解析失败后的重试冷却：瞬时网络故障不至于直接判死本曲自动连播 */
+const RESOLVE_RETRY_COOLDOWN_MS = 30_000;
 
 /**
  * 位置事件驱动：把下一曲候选注册到服务端（内部自节流；桌面模式 no-op）。
@@ -40,27 +48,64 @@ export const maybeRegisterNextCandidate = (): void => {
     shuffleMode: status.shuffleMode,
   });
   if (!candidate) {
-    if (registeredForSource !== null) {
+    if (registeredForSource !== null || resolvingTrackId !== null) {
       registeredForSource = null;
       registeredNext = null;
+      resolvingTrackId = null;
       void playerClient.clearNextCandidate().catch(() => {});
     }
     return;
   }
 
-  // 音源解析：优先预载链路的已解析 URL（在线源），回退本地/管道格式
-  const peeked = peekNextTrackPreload(candidate.track);
-  const resolved =
-    peeked?.source?.source ??
+  // 本曲候选已注册可用音源：不再重算（在线直链解析/预载切换不做反复覆盖）
+  if (registeredNext?.track.id === candidate.track.id && registeredForSource !== null) return;
+
+  // 音源解析：优先预载链路的已解析 URL（在线源），回退本地/CUE。
+  // 裸 track id 不能作为候选——服务端只认 URL/绝对路径/cue://，注册了也必在曲终加载失败
+  const resolvedSource =
+    peekNextTrackPreload(candidate.track)?.source?.source ??
     candidate.track.cueAudioPath ??
-    candidate.track.path ??
-    candidate.track.id;
-  const source = buildStagingSource(candidate.track, resolved);
+    candidate.track.path;
+  if (resolvedSource) {
+    registerCandidate(candidate, buildStagingSource(candidate.track, resolvedSource));
+    return;
+  }
+  resolveThenRegister(candidate);
+};
+
+/** 解析成功/拿到可用音源后统一注册入口（单槽后写覆盖） */
+const registerCandidate = (candidate: CandidateResult, source: string): void => {
   if (source === registeredForSource) return;
   registeredForSource = source;
   registeredNext = { source, track: candidate.track, index: candidate.index };
+  resolvingTrackId = null;
   const durationHintSecs = candidate.track.duration > 0 ? candidate.track.duration / 1000 : 0;
   void playerClient.registerNextCandidate(source, durationHintSecs).catch(() => {});
+};
+
+/**
+ * 预载未命中且无本地路径（在线/流媒体曲）：先解析直链再注册。
+ * 失败按冷却窗口由后续 position tick 重试，不阻塞播放
+ */
+const resolveThenRegister = (candidate: CandidateResult): void => {
+  if (
+    resolvingTrackId === candidate.track.id &&
+    Date.now() - lastResolveAttemptAt < RESOLVE_RETRY_COOLDOWN_MS
+  ) {
+    return;
+  }
+  resolvingTrackId = candidate.track.id;
+  lastResolveAttemptAt = Date.now();
+  void (async () => {
+    try {
+      const resolved = await resolveTrackSource(candidate.track, { silent: true });
+      if (resolved?.source) {
+        registerCandidate(candidate, buildStagingSource(candidate.track, resolved.source));
+      }
+    } catch {
+      // 保持占位等冷却后重试；解析彻底不可用时本曲不注册，服务端曲终自然停止
+    }
+  })();
 };
 
 /**
@@ -72,6 +117,8 @@ export const adoptServerAdvancedTrack = (source: string): boolean => {
   const { track, index } = registeredNext;
   registeredNext = null;
   registeredForSource = null;
+  resolvingTrackId = null;
+  lastResolveAttemptAt = 0;
 
   const status = useStatusStore();
   const media = useMediaStore();
@@ -91,4 +138,6 @@ export const adoptServerAdvancedTrack = (source: string): boolean => {
 export const resetServerAutoAdvance = (): void => {
   registeredNext = null;
   registeredForSource = null;
+  resolvingTrackId = null;
+  lastResolveAttemptAt = 0;
 };
