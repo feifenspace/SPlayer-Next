@@ -2393,6 +2393,8 @@ async fn ws_run(mut socket: WebSocket, state: AppState) {
     let mut rx_scan = state.scan_tx.subscribe();
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // 本连接是否订阅 FFT 频谱（默认关闭；订阅计数归零时关闭引擎 FFT 定时器）
+    let mut fft_subscribed = false;
 
     loop {
         tokio::select! {
@@ -2405,7 +2407,11 @@ async fn ws_run(mut socket: WebSocket, state: AppState) {
                 }
             }
             Ok(msg) = rx.recv() => {
-                // 推送事件触发的状态更新
+                // FFT 事件按本连接订阅状态过滤；其余事件原样转发
+                let is_fft = msg.get("type").and_then(|t| t.as_str()) == Some("fftData");
+                if is_fft && !fft_subscribed {
+                    continue;
+                }
                 let payload = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into());
                 if socket.send(Message::Text(payload.into())).await.is_err() {
                     break;
@@ -2424,13 +2430,64 @@ async fn ws_run(mut socket: WebSocket, state: AppState) {
             }
             res = socket.recv() => {
                 match res {
+                    Some(Ok(Message::Text(text))) => {
+                        // 客户端→服务端控制消息：目前仅支持 FFT 订阅
+                        // {type:"subscribe", data:{fft:true|false}}
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                            continue;
+                        };
+                        if value.get("type").and_then(|t| t.as_str()) != Some("subscribe") {
+                            continue;
+                        }
+                        let wants_fft = value
+                            .pointer("/data/fft")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if wants_fft && !fft_subscribed {
+                            fft_subscribed = true;
+                            let first = state
+                                .fft_subscriber_count
+                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                                == 0;
+                            if first {
+                                let st = state.clone();
+                                let _ = spawn_isolated_blocking("fft-enable", move || {
+                                    st.player.lock().set_fft_enabled(true);
+                                })
+                                .await;
+                            }
+                        } else if !wants_fft && fft_subscribed {
+                            fft_subscribed = false;
+                            fft_release(&state).await;
+                        }
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
             }
         }
     }
+
+    // 连接断开：退订 FFT，订阅计数归零时关闭引擎 FFT 定时器
+    if fft_subscribed {
+        fft_release(&state).await;
+    }
     let _ = socket.close().await;
+}
+
+/// FFT 订阅计数 -1，归零时关闭播放器 FFT 定时器（避免无消费空转）
+async fn fft_release(state: &AppState) {
+    let last = state
+        .fft_subscriber_count
+        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+        == 1;
+    if last {
+        let st = state.clone();
+        let _ = spawn_isolated_blocking("fft-disable", move || {
+            st.player.lock().set_fft_enabled(false);
+        })
+        .await;
+    }
 }
 
 // -------------------------------------------------------------------

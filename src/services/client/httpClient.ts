@@ -131,6 +131,15 @@ export class HttpPlayerClient implements IPlayerClient {
 
       this.ws = new WebSocket(wsUrlWithToken);
 
+      this.ws.onopen = () => {
+        // 订阅 FFT 频谱事件（服务端按连接过滤，计数归零自动关闭引擎 FFT）
+        try {
+          this.ws?.send(JSON.stringify({ type: "subscribe", data: { fft: true } }));
+        } catch {
+          // ignore subscribe failures
+        }
+      };
+
       this.ws.onmessage = (event) => {
         try {
           const data: ServerWsMessage = JSON.parse(event.data);
@@ -212,6 +221,23 @@ export class HttpPlayerClient implements IPlayerClient {
                 console.error("[HttpClient] Error in scan listener", e);
               }
             }
+          }
+          break;
+        case "fftData":
+          if (msg.data) {
+            this.emitEvent({
+              type: "fftData",
+              data: { ldata: msg.data.ldata ?? [], rdata: msg.data.rdata ?? [] },
+            });
+          }
+          break;
+        case "seeked":
+          if (msg.data?.position != null) {
+            // 服务端为秒，桌面协议为毫秒，此处对齐
+            this.emitEvent({
+              type: "seek",
+              data: { position: Math.round(msg.data.position * 1000) },
+            });
           }
           break;
         // outputFailed / outputStalled / outputRecoveryFailed / nextCandidateChanged：

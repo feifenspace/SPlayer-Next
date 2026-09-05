@@ -80,6 +80,8 @@ pub struct AppState {
     pub output_recovery_requested: Arc<std::sync::atomic::AtomicU64>,
     /// 曲终自动连播请求（Ended 事件置位，输出恢复看门狗消费）
     pub auto_advance_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// FFT 频谱订阅连接数（ws 维护）：归零时关闭引擎 FFT 定时器避免无消费空转
+    pub fft_subscriber_count: Arc<std::sync::atomic::AtomicUsize>,
     /// 下一曲候选（B 层自动连播单槽；None = 未注册）
     pub pending_next: Arc<Mutex<Option<PendingNext>>>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
@@ -110,6 +112,7 @@ impl AppState {
         let scan_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let output_recovery_requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let auto_advance_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fft_subscriber_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_next = Arc::new(Mutex::new(None));
 
         // 回调可能在播放器内部线程触发，不能在这里再次 lock player。
@@ -196,6 +199,20 @@ impl AppState {
                             .store(unix_millis(), std::sync::atomic::Ordering::Release);
                         let _ = ws_tx.send(serde_json::json!({ "type": kind, "data": {} }));
                     }
+                    PlayerEvent::FftData { ldata, rdata } => {
+                        // 仅进广播频道：ws_run 按每连接订阅过滤；FFT 定时器只在
+                        // 有订阅者时开启（ws_run 负责 set_fft_enabled），避免无消费空转
+                        let _ = ws_tx.send(serde_json::json!({
+                            "type": "fftData",
+                            "data": { "ldata": ldata, "rdata": rdata },
+                        }));
+                    }
+                    PlayerEvent::Seeked { position } => {
+                        let _ = ws_tx.send(serde_json::json!({
+                            "type": "seeked",
+                            "data": { "position": position },
+                        }));
+                    }
                     #[allow(unreachable_patterns)]
                     _ => {}
                 }
@@ -213,6 +230,7 @@ impl AppState {
             scan_cancel,
             output_recovery_requested,
             auto_advance_requested,
+            fft_subscriber_count,
             pending_next,
             snapshot,
         })

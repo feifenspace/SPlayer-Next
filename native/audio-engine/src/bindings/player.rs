@@ -415,6 +415,11 @@ impl AudioPlayer {
                     event_type: "sourceError".into(),
                     ..Default::default()
                 },
+                PlayerEvent::Seeked { position } => JsPlayerEvent {
+                    event_type: "seeked".into(),
+                    position: Some(position),
+                    ..Default::default()
+                },
                 PlayerEvent::Position { position, duration } => JsPlayerEvent {
                     event_type: "position".into(),
                     position: Some(position),
@@ -530,7 +535,7 @@ impl AudioPlayer {
             #[cfg(not(feature = "diretta"))]
             let current_direct_format: Option<crate::direct_runtime::DirectFormat> = None;
             let (direct_initial_take, token) = if direct_active {
-                (None, player.take_threads_only(handle.clone()))
+                (None, player.reserve_direct_handoff_token(handle.clone()))
             } else {
                 let (old_threads, token) = player.take_for_async_load(handle.clone());
                 (Some(old_threads), token)

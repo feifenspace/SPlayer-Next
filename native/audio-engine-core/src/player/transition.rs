@@ -294,6 +294,10 @@ impl InnerPlayer {
             self.start_position_timer();
             self.start_fft_timer();
         }
+        // seek 确认事件：客户端不必等下一个 Position 事件兜底
+        self.emit(PlayerEvent::Seeked {
+            position: position_secs,
+        });
 
         Ok(true)
     }
@@ -390,6 +394,10 @@ impl InnerPlayer {
         if should_play {
             self.start_position_timer();
         }
+        // seek 确认事件：position 取 Direct 回放的实际 seek 落点
+        self.emit(PlayerEvent::Seeked {
+            position: self.seek_base,
+        });
         Ok(true)
     }
 

@@ -11,6 +11,8 @@ pub enum PlayerEvent {
     Ended,
     /// Source Direct 已在同一 Diretta connection 上无缝切入 staged 下一首
     DirectTrackBoundary { duration: f64, generation: u64 },
+    /// seek 提交成功（秒）——让客户端即时确认，不必等下一个 Position 事件兜底
+    Seeked { position: f64 },
     /// 音源失效（网络中断 / URL 过期）
     SourceError,
     /// 位置更新（秒）—— 由内部定时器推送
