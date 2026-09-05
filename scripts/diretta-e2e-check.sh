@@ -25,13 +25,19 @@ media = sys.argv[1]; SR = 44100; CH = 2; SECS = 35
 for name, f in {"trackA_440.wav": 440, "trackB_880.wav": 880}.items():
     p = os.path.join(media, name)
     if os.path.exists(p) and os.path.getsize(p) > 1000000: continue
-    w = wave.open(p, "wb"); w.setnchannels(CH); w.setsampwidth(SW=2); w.setframerate(SR)
+    w = wave.open(p, "wb")
+    w.setnchannels(CH)
+    w.setsampwidth(2)
+    w.setframerate(SR)
     frames = bytearray()
     for i in range(SR * SECS):
         v = int(12000 * math.sin(2 * math.pi * f * i / SR))
         frames += struct.pack("<hh", v, v)
-    w.writeframes(bytes(frames)); w.close()
+    w.writeframes(bytes(frames))
+    w.close()
+    print("generated:", p)
 EOF
+  [ -s "$MEDIA/trackA_440.wav" ] && [ -s "$MEDIA/trackB_880.wav" ] || { say "FAIL: 测试音轨生成失败"; exit 1; }
 }
 
 # T1 基础播放：state=Playing 且 10 秒位置推进 ≥8s
