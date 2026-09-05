@@ -1469,6 +1469,14 @@ extern "C" fn avio_seek(opaque: *mut std::ffi::c_void, offset: i64, whence: i32)
 }
 
 const DIRECT_RING_DEPTH: usize = 8;
+/// pre-mute 静音窗口时长：覆盖换源/seek 复位的供数空窗（对齐 tinyLMS 8 cycles ≈ 80ms）
+const PRE_MUTE_WINDOW_MS: u64 = 80;
+
+/// 进程内单调毫秒时钟（pre-mute 窗口用，不受系统墙钟跳变影响）
+fn mono_millis() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
 const SLOT_FREE: u8 = 0;
 const SLOT_FILLING: u8 = 1;
 const SLOT_READY: u8 = 2;
@@ -1630,6 +1638,11 @@ struct DirectPcmRing {
     last_block_bytes: AtomicUsize,
     /// 最近一次成功解码的块帧数
     last_block_frames: AtomicUsize,
+    /// pre-mute 静音窗口截止（monotonic 毫秒，0 = 未触发）：换源/seek 复位前触发，
+    /// 窗口内 SDK 拉取遇供数空窗时交付静音块，消除 Target 欠载杂音
+    pre_mute_until_ms: AtomicU64,
+    /// pre-mute 静音缓冲（全零）：仅 SDK 回调线程（consumer）读写，producer 不触碰
+    pre_mute_buf: Mutex<Vec<u8>>,
     /// 单一状态信号：producer 与控制线程共享的条件等待通道（避免任何忙等/轮询）
     signal: Mutex<()>,
     signal_cv: Condvar,
@@ -1663,6 +1676,8 @@ impl DirectPcmRing {
             fade: DirectPcmFadeState::new(),
             last_block_bytes: AtomicUsize::new(0),
             last_block_frames: AtomicUsize::new(0),
+            pre_mute_until_ms: AtomicU64::new(0),
+            pre_mute_buf: Mutex::new(Vec::new()),
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
             command_pending: AtomicBool::new(false),
@@ -1779,6 +1794,14 @@ impl DirectPcmRing {
             return None;
         }
 
+        // pre-mute 窗口（换源/seek 复位触发）：SDK 拉取遇供数空窗时交付静音块
+        // 而非"无块"，消除 Target 欠载杂音；静音块不推进 consumed/boundary 会计
+        if self.pre_mute_active() {
+            if let Some(block) = self.pre_mute_block() {
+                return Some(block);
+            }
+        }
+
         let index = self.consumer_index.load(Ordering::Relaxed);
         let slot = &self.slots[index];
         if slot
@@ -1834,6 +1857,33 @@ impl DirectPcmRing {
         self.notify_state();
     }
 
+    /// 触发 pre-mute 静音窗口（换源/seek 复位前调用）：窗口内 SDK 拉取遇
+    /// 供数空窗时交付静音块而非"无块"，消除 Target 侧欠载杂音
+    fn trigger_pre_mute(&self) {
+        self.pre_mute_until_ms
+            .store(mono_millis() + PRE_MUTE_WINDOW_MS, Ordering::Release);
+    }
+
+    fn pre_mute_active(&self) -> bool {
+        self.pre_mute_until_ms.load(Ordering::Acquire) > mono_millis()
+    }
+
+    /// 供数空窗静音块：全零（signed 零点），几何沿用最近一次有效块
+    fn pre_mute_block(&self) -> Option<DirectPcmBlock> {
+        let bytes = self.last_block_bytes.load(Ordering::Acquire);
+        if bytes == 0 {
+            return None;
+        }
+        let mut buf = self.pre_mute_buf.lock().unwrap_or_else(|p| p.into_inner());
+        if buf.len() < bytes {
+            buf.resize(bytes, 0);
+        }
+        Some(DirectPcmBlock {
+            data: buf.as_ptr(),
+            len: bytes,
+        })
+    }
+
     fn reset_for_transition(&self) {
         self.release_in_flight();
         self.consumer_index.store(0, Ordering::Relaxed);
@@ -1863,6 +1913,8 @@ fn seek_pcm_ring(
     expected_format: DirectPcmFormat,
     position_secs: f64,
 ) -> Result<f64> {
+    // seek 复位同样存在供数空窗：pre-mute 窗口内 SDK 拉取拿到静音块而非欠载
+    ring.trigger_pre_mute();
     ring.reset_for_transition();
     let first_slot = &ring.slots[0];
     first_slot.state.store(SLOT_FILLING, Ordering::Relaxed);
@@ -2015,6 +2067,8 @@ fn replace_pcm_ring(
     }
 
     let silence_blocks_before = ring.fade.silence_blocks.load(Ordering::Acquire);
+    // 换源复位有供数空窗：pre-mute 窗口内 SDK 拉取拿到静音块而非欠载（消除切杂音）
+    ring.trigger_pre_mute();
     ring.reset_for_transition();
     let first_slot = &ring.slots[0];
     first_slot.state.store(SLOT_FILLING, Ordering::Relaxed);
@@ -3614,6 +3668,29 @@ mod tests {
     #[test]
     fn strict_ring_underrun_returns_no_block_instead_of_inserting_silence() {
         let ring = DirectPcmRing::new().unwrap();
+        assert!(ring.next_block().is_none());
+    }
+
+    /// pre-mute 窗口（换源/seek 复位触发）：空环拉取交付静音块而非"无块"，
+    /// 消除 Target 欠载杂音；窗口关闭后恢复严格欠载语义
+    #[test]
+    fn pre_mute_window_delivers_silence_over_the_underrun_gap() {
+        let ring = DirectPcmRing::new().unwrap();
+        // 未触发窗口：严格欠载语义（None）保持不变
+        assert!(ring.next_block().is_none());
+
+        // 模拟播放中记录的块几何 + 换源/seek 触发的 pre-mute 窗口
+        ring.last_block_bytes.store(480, Ordering::Relaxed);
+        ring.last_block_frames.store(120, Ordering::Relaxed);
+        ring.trigger_pre_mute();
+        let block = ring.next_block().expect("pre-mute 窗口内应交付静音块");
+        assert_eq!(block.len, 480);
+        assert!(unsafe { std::slice::from_raw_parts(block.data, block.len) }
+            .iter()
+            .all(|&b| b == 0));
+
+        // 窗口关闭后恢复严格欠载语义，保证 Ended 判定不受影响
+        ring.pre_mute_until_ms.store(0, Ordering::Relaxed);
         assert!(ring.next_block().is_none());
     }
 

@@ -613,6 +613,14 @@ fn adapt_dsd_bit_order(
 }
 
 const DIRECT_DSD_RING_DEPTH: usize = 8;
+/// pre-mute 静音窗口时长：覆盖换源/seek 复位的供数空窗（对齐 tinyLMS DSD 20 cycles）
+const PRE_MUTE_WINDOW_MS: u64 = 80;
+
+/// 进程内单调毫秒时钟（pre-mute 窗口用，不受系统墙钟跳变影响）
+fn mono_millis() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
 const SLOT_FREE: u8 = 0;
 const SLOT_FILLING: u8 = 1;
 const SLOT_READY: u8 = 2;
@@ -691,6 +699,13 @@ struct DirectDsdRing {
     signal_cv: Condvar,
     /// 控制通道存在待处理命令的提示位：命令发送方置位并唤醒，producer 消费命令前清零
     command_pending: AtomicBool,
+    /// pre-mute 静音窗口截止（monotonic 毫秒，0 = 未触发）：换源/seek 复位前触发，
+    /// 窗口内 SDK 拉取遇供数空窗时交付静音块，消除 Target 欠载杂音
+    pre_mute_until_ms: AtomicU64,
+    /// pre-mute 静音缓冲（0x69）：仅 SDK 回调线程（consumer）读写，producer 不触碰
+    pre_mute_buf: Mutex<Vec<u8>>,
+    /// 最近一次交付块的长度（pre-mute 静音块的几何依据）
+    last_delivered_len: AtomicUsize,
 }
 
 #[derive(Clone, Copy)]
@@ -719,6 +734,9 @@ impl DirectDsdRing {
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
             command_pending: AtomicBool::new(false),
+            pre_mute_until_ms: AtomicU64::new(0),
+            pre_mute_buf: Mutex::new(Vec::new()),
+            last_delivered_len: AtomicUsize::new(0),
         }
     }
 
@@ -761,6 +779,13 @@ impl DirectDsdRing {
         if self.failed.load(Ordering::Acquire) {
             return None;
         }
+        // pre-mute 窗口（换源/seek 复位触发）：SDK 拉取遇供数空窗时交付 0x69
+        // 静音块而非"无块"，消除 Target 欠载杂音；不推进 consumed/boundary 会计
+        if self.pre_mute_active() {
+            if let Some(block) = self.pre_mute_block() {
+                return Some(block);
+            }
+        }
         let index = self.consumer_index.load(Ordering::Relaxed);
         let slot = &self.slots[index];
         if slot
@@ -797,7 +822,36 @@ impl DirectDsdRing {
         self.in_flight.store(index, Ordering::Release);
         self.consumer_index
             .store((index + 1) % self.slots.len(), Ordering::Relaxed);
+        self.last_delivered_len.store(len, Ordering::Relaxed);
         Some(DirectDsdBlock { data, len })
+    }
+
+    /// 触发 pre-mute 静音窗口（换源/seek 复位前调用）：窗口内 SDK 拉取遇
+    /// 供数空窗时交付 0x69 静音块而非"无块"，消除 Target 侧欠载杂音
+    fn trigger_pre_mute(&self) {
+        self.pre_mute_until_ms
+            .store(mono_millis() + PRE_MUTE_WINDOW_MS, Ordering::Release);
+    }
+
+    fn pre_mute_active(&self) -> bool {
+        self.pre_mute_until_ms.load(Ordering::Acquire) > mono_millis()
+    }
+
+    /// 供数空窗静音块：0x69（PDM 直流均衡），几何沿用最近一次交付块
+    fn pre_mute_block(&self) -> Option<DirectDsdBlock> {
+        let len = self.last_delivered_len.load(Ordering::Acquire);
+        if len == 0 {
+            return None;
+        }
+        let mut buf = self.pre_mute_buf.lock().unwrap_or_else(|p| p.into_inner());
+        if buf.len() < len {
+            // DSD 静音必须为 0x69，防止满幅直流偏置爆音
+            buf.resize(len, DSD_SILENCE_BYTE);
+        }
+        Some(DirectDsdBlock {
+            data: buf.as_ptr(),
+            len,
+        })
     }
 
     fn release_in_flight(&self) {
@@ -851,6 +905,8 @@ fn seek_dsd_ring(
     wire_bit_order: DirectDsdBitOrder,
     position_secs: f64,
 ) -> Result<f64> {
+    // seek 复位同样存在供数空窗：pre-mute 窗口内 SDK 拉取拿到 0x69 静音块而非欠载
+    ring.trigger_pre_mute();
     ring.reset_for_transition();
     let actual_position = reader.seek_seconds(position_secs)?;
     ensure!(
@@ -931,6 +987,8 @@ fn replace_dsd_ring(
     let duration_micros = (reader.duration_secs() * 1_000_000.0)
         .round()
         .clamp(0.0, u64::MAX as f64) as u64;
+    // 换源复位有供数空窗：pre-mute 窗口内 SDK 拉取拿到 0x69 静音块而非欠载（消除切杂音）
+    ring.trigger_pre_mute();
     ring.reset_for_transition();
     ring.ensure_capacity(reader.max_output_len());
     // 对齐 staged 安装语义：boundary 元数据在 slot 发布（READY）前写好，
@@ -1919,6 +1977,28 @@ mod tests {
     #[test]
     fn strict_dsd_ring_underrun_returns_no_block_instead_of_inserting_data() {
         let ring = DirectDsdRing::new(64);
+        assert!(ring.next_block().is_none());
+    }
+
+    /// pre-mute 窗口（换源/seek 复位触发）：空环拉取交付 0x69 静音块而非"无块"，
+    /// 消除 Target 欠载杂音；窗口关闭后恢复严格欠载语义
+    #[test]
+    fn dsd_pre_mute_window_delivers_0x69_silence_over_the_gap() {
+        let ring = DirectDsdRing::new(64);
+        // 未触发窗口：严格欠载语义（None）保持不变
+        assert!(ring.next_block().is_none());
+
+        // 模拟播放中记录的块几何 + 换源/seek 触发的 pre-mute 窗口
+        ring.last_delivered_len.store(1024, Ordering::Relaxed);
+        ring.trigger_pre_mute();
+        let block = ring.next_block().expect("pre-mute 窗口内应交付 0x69 静音块");
+        assert_eq!(block.len, 1024);
+        assert!(unsafe { std::slice::from_raw_parts(block.data, block.len) }
+            .iter()
+            .all(|&b| b == DSD_SILENCE_BYTE));
+
+        // 窗口关闭后恢复严格欠载语义，保证 Ended 判定不受影响
+        ring.pre_mute_until_ms.store(0, Ordering::Relaxed);
         assert!(ring.next_block().is_none());
     }
 }
