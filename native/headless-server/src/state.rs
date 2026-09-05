@@ -82,6 +82,10 @@ pub struct AppState {
     pub auto_advance_requested: Arc<std::sync::atomic::AtomicBool>,
     /// FFT 频谱订阅连接数（ws 维护）：归零时关闭引擎 FFT 定时器避免无消费空转
     pub fft_subscriber_count: Arc<std::sync::atomic::AtomicUsize>,
+    /// 正在播放曲目的服务端元数据快照（load/自动接续成功时更新）
+    pub now_playing: Arc<Mutex<Option<serde_json::Value>>>,
+    /// 已 stage 的下一曲元数据（generation, metadata）：boundary 切换时转正到 now_playing
+    pub staged_meta: Arc<Mutex<Option<(u64, serde_json::Value)>>>,
     /// 下一曲候选（B 层自动连播单槽；None = 未注册）
     pub pending_next: Arc<Mutex<Option<PendingNext>>>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
@@ -114,6 +118,8 @@ impl AppState {
         let auto_advance_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fft_subscriber_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_next = Arc::new(Mutex::new(None));
+        let now_playing: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let staged_meta: Arc<Mutex<Option<(u64, serde_json::Value)>>> = Arc::new(Mutex::new(None));
 
         // 回调可能在播放器内部线程触发，不能在这里再次 lock player。
         let callback: EventEmitter = {
@@ -121,6 +127,8 @@ impl AppState {
             let snapshot = Arc::clone(&snapshot);
             let output_recovery_requested = Arc::clone(&output_recovery_requested);
             let auto_advance_requested = Arc::clone(&auto_advance_requested);
+            let now_playing = Arc::clone(&now_playing);
+            let staged_meta = Arc::clone(&staged_meta);
             Arc::new(move |event: PlayerEvent| {
                 // 先 clone 一份当前快照，避免持有读锁跨越后续写锁操作
                 let current: Option<WsState> = snapshot.read().clone();
@@ -182,6 +190,13 @@ impl AppState {
                             state: PlayerState::Playing,
                         };
                         *snapshot.write() = Some(ws_state);
+                        // 无缝边界：已 stage 的候选元数据转正为 now-playing 快照，
+                        // 保证重开页面/无浏览器场景都能显示正确曲目
+                        if let Some((g, meta)) = staged_meta.lock().take() {
+                            if g == generation {
+                                *now_playing.lock() = Some(meta);
+                            }
+                        }
                         let _ = ws_tx.send(serde_json::json!({
                             "type": "directTrackBoundary",
                             "data": { "duration": duration, "generation": generation },
@@ -231,6 +246,8 @@ impl AppState {
             output_recovery_requested,
             auto_advance_requested,
             fft_subscriber_count,
+            now_playing,
+            staged_meta,
             pending_next,
             snapshot,
         })

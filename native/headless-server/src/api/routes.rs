@@ -310,6 +310,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/player/volume", axum::routing::post(volume_handler))
         .route("/api/v1/player/load", axum::routing::post(load_handler))
         .route("/api/v1/player/seek", axum::routing::post(seek_handler))
+        // 服务端权威“正在播放”快照（重开页面/无浏览器恢复曲目显示）
+        .route(
+            "/api/v1/player/now-playing",
+            axum::routing::get(now_playing_handler),
+        )
         // 下一曲候选预注册（B 层自动连播：浏览器关闭后服务端仍可接续）
         .route(
             "/api/v1/player/queue/next-candidate",
@@ -1262,6 +1267,7 @@ async fn load_handler(
 
         return match result {
             Ok(DirectLoadOutcome::Handoff(meta)) => {
+                update_now_playing(&state, &source, &meta);
                 Ok(direct_load_response(&source, auto_play, *meta))
             }
             Ok(DirectLoadOutcome::FullReconnect {
@@ -1276,7 +1282,10 @@ async fn load_handler(
                         .map_err(|e| ApiError::internal(e.to_string()))?
                 };
                 match committed_meta {
-                    Some(meta) => Ok(direct_load_response(&source, auto_play, meta)),
+                    Some(meta) => {
+                        update_now_playing(&state, &source, &meta);
+                        Ok(direct_load_response(&source, auto_play, meta))
+                    }
                     None => Ok(Json(PlayerResponse::ok(json!({
                         "status": "superseded",
                         "source": source,
@@ -1390,28 +1399,64 @@ async fn load_handler(
     };
 
     match committed_meta {
-        Some(meta) => Ok(Json(PlayerResponse::ok(json!({
-            "status": if auto_play { "playing" } else { "paused" },
-            "source": source,
-            "title": meta.title,
-            "artist": meta.artist,
-            "album": meta.album,
-            "duration": meta.duration_secs,
-            "sample_rate": meta.sample_rate,
-            "original_sample_rate": meta.original_sample_rate,
-            "channels": meta.channels,
-            "bits_per_sample": meta.bits_per_sample,
-            "bit_rate": meta.bit_rate,
-            "codec": meta.codec,
-            "cover": meta.cover,
-            "has_cover": meta.cover_raw.is_some() || meta.cover.is_some(),
-            "has_embedded_lyric": meta.embedded_lyric.is_some(),
-        })))),
+        Some(meta) => {
+            update_now_playing(&state, &source, &meta);
+            Ok(Json(PlayerResponse::ok(json!({
+                "status": if auto_play { "playing" } else { "paused" },
+                "source": source,
+                "title": meta.title,
+                "artist": meta.artist,
+                "album": meta.album,
+                "duration": meta.duration_secs,
+                "sample_rate": meta.sample_rate,
+                "original_sample_rate": meta.original_sample_rate,
+                "channels": meta.channels,
+                "bits_per_sample": meta.bits_per_sample,
+                "bit_rate": meta.bit_rate,
+                "codec": meta.codec,
+                "cover": meta.cover,
+                "has_cover": meta.cover_raw.is_some() || meta.cover.is_some(),
+                "has_embedded_lyric": meta.embedded_lyric.is_some(),
+            }))))
+        }
         None => Ok(Json(PlayerResponse::ok(json!({
             "status": "superseded",
             "source": source,
         })))),
     }
+}
+
+/// 更新服务端 now-playing 元数据快照（load 成功时调用，重开页面/无浏览器恢复用）
+fn update_now_playing(state: &AppState, source: &str, meta: &audio_engine_core::AudioMetadata) {
+    *state.now_playing.lock() = Some(json!({
+        "source": source,
+        "title": meta.title,
+        "artist": meta.artist,
+        "album": meta.album,
+        "cover": meta.cover,
+        "duration_secs": meta.duration_secs,
+        "sample_rate": meta.sample_rate,
+        "original_sample_rate": meta.original_sample_rate,
+        "channels": meta.channels,
+        "bits_per_sample": meta.bits_per_sample,
+        "bit_rate": meta.bit_rate,
+        "codec": meta.codec,
+    }));
+}
+
+/// 服务端权威“正在播放”快照：重开页面/无浏览器场景恢复曲目显示用。
+/// metadata 为 None 表示当前无已加载曲目（或 load 失败后的清理态）
+async fn now_playing_handler(State(state): State<AppState>) -> Json<PlayerResponse> {
+    let snap = state.snapshot();
+    let meta = state.now_playing.lock().clone();
+    Json(PlayerResponse::ok(json!({
+        "source": snap.current_source,
+        "metadata": meta,
+        "state": format!("{:?}", snap.state),
+        "position": snap.position,
+        "duration": snap.duration,
+        "playing": snap.state == audio_engine_core::PlayerState::Playing,
+    })))
 }
 
 enum SeekOutcome {
@@ -1616,6 +1661,27 @@ async fn direct_stage_next_handler(
     } else {
         DirectInput::Path(source.clone())
     };
+
+    // 预探测候选曲元数据：boundary 无缝切换后 now-playing 快照能立即显示新曲信息
+    // （stage 是后台预载，多一次探测不影响播放）
+    if let Some(meta) = spawn_isolated_blocking("direct-stage-probe", {
+        let physical_source = physical_source.path().to_string();
+        move || audio_engine_core::scanner::probe_fast(&physical_source, None).map(|s| {
+            json!({
+                "source": physical_source,
+                "title": s.title,
+                "artist": s.artist,
+                "album": s.album,
+                "cover": s.cover,
+                "duration_secs": s.duration,
+            })
+        })
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("Stage probe error: {e}")))?
+    {
+        *state.staged_meta.lock() = Some((generation, meta));
+    }
 
     let result = spawn_isolated_blocking("direct-stage-next-worker", move || {
         // DirectInput（含 memfd 的 File）随闭包存活整个 stage 过程：
