@@ -112,9 +112,14 @@ atom 的 Diretta/Direct 代码本体为本项目批次 1-5 之前的旧快照（
 
 ## 五、实施批次与验收
 
+> **实施状态（2026-09-05）：E-2/E-1/F 已全部实施**——
+> E-2：E3 `connectPrepare(true)`、E4 MTU 按 IP 缓存、E7 发现重试+广播备选（`fcd4802`）；E5 看门狗高码率阈值放宽（`5443b04`）；E6 能力查询的快速断开/静音应答核验后**已在原实现中**（`kQuerySilenceBlock` + `disconnect_flgset/true`），无需改动。
+> E-1 相关：批次 E 调参（cycle_time/THRED_MODE）见 E-1；F1 门控放宽 `de148d4`；F2 甄别结论：不适用（atom 的 preloader 接口与本项目已分叉）。
+> S：上游 0 新提交，无可合并内容；SOP 保留待下次上游更新时执行。
+
 | 批次 | 内容 | 风险 | 验收 |
 |---|---|---|---|
-| E-1 | E1 cycle_time 动态计算 + E2 THRED_MODE/参数对齐 | 中（SDK 调参） | 真机 A/B：DSD 长播稳定、CPU 占用、抖动对比 |
+| E-1 | E1 cycle_time 动态计算 + E2 THRED_MODE/参数对齐 | 中（SDK 调参） | 真机 A/B：DSD 长播稳定、CPU/抖动对比 |
 | E-2 | E3-E7 容错细节（强制重置/缓存/看门狗细化/双轮超时/杂项） | 低 | cargo 三件套 + 真机回归 |
 | F | F1 stage 门控放宽 + F2 甄别回移 | 低 | vitest + 真机 stage 场景 |
 | S | 按 §4.2 SOP 执行一次上游同步演练 | — | 全套验证 + 冒烟 |

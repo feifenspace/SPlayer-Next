@@ -638,6 +638,7 @@ Electron --headless 与 headless-server 由**同一晚相差 16 秒的两个 com
 | 2026-09-04 R2 | ① 新增 **F11**：headless 输出失败/断链无服务端恢复（Electron 有完整恢复链路，headless 吞事件且 Direct 链路无失活信号），插入批次 2；② 撤销 F7"持锁设备切换（网络握手级）"误判（`set_output_device` 仅存储设备串），select 延迟生效移入 F10-M11；③ 修正 F2 quad 机制描述（planes[2] 命中 FC 分支而非奇偶分支），快修表补 quad idx2 特例、按布局建表升级为推荐方案；④ 消除 §五脚注与批次表的顺序矛盾，重排批次并同步引用；⑤ §八 sourceError/outputFailed 载荷与实际枚举对齐；⑥ §九注明改动未提交状态 |
 | 2026-09-05 R3 | 批次 1-10 全部实施完毕（`bd76c9e`…`89c47cb` 共 11 提交）；新增 **§十一** §六-§九 收尾方案（批次 A-D）；§六/§九 逐项标注核实结论与排期 |
 | 2026-09-05 R4 | **批次 A-D 已全部实施**：批次 A（§九移除提交 `fa64298`、sendToMain warn 与 query_target_caps 契约注释 `3b18f7c`、`handoff_drained_source` 改名 `b608cf4`）；批次 B（FFT 订阅转发 + seeked 事件 `0e9d96d`）；批次 D（DirectTransport cfg 收敛净 −51 行 `293ca0a`）；批次 C（自动连播前端接线 `4990b9c`，浏览器手工验收待执行）。§六 待确认项全部销项 |
+| 2026-09-05 R5 | 新增 **批次 E/F**（对照 tinyLMS-old 与 splayer-atom，见 `hardening-and-upstream-sync-plan.md`）：E-2 排空等待/停滞阈值按码率放宽（`5443b04`）、E-1 传输周期按 MTU 动态计算 + THRED_MODE(289)（`fcd4802`）、F1 Diretta stage 门控放宽（`de148d4`）、F2 甄别为不适用；源码守护断言同步（`5443b04`）。上游同步 SOP 已文档化（`hardening-and-upstream-sync-plan.md` §4，取代 troubleshooting 故障 4 旧指引） |
 
 ## 十一、§六-§九 收尾方案（批次 A-D）
 
