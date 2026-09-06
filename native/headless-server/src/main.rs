@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
     let mut config = Config::load()?;
     args.apply_to(&mut config);
+    audio_engine_core::priority::configure_rt_priority(i32::from(config.audio.rt_priority));
 
     let _addr = start_server(config).await?;
 

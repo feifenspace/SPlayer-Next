@@ -1,6 +1,36 @@
-/// 音频线程 SCHED_FIFO 实时调度优先级（1-99，数值越高越优先）
-/// 设置为 70：高于普通系统 I/O 任务（通常 ≤50），低于内核级硬实时（≥80）
-const AUDIO_RT_PRIORITY: i32 = 70;
+/// 音频线程 SCHED_FIFO 实时调度优先级（1-99，数值越高越优先）。
+/// 默认 70：高于普通系统 I/O 任务（通常 ≤50），低于内核级硬实时（≥80）。
+/// 可经 `configure_rt_priority` 调整（蓝图 §3.2 要求 75~85，headless 配置注入）
+static AUDIO_RT_PRIORITY: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(70);
+
+/// 配置音频线程 RT 优先级（1-99，越界取默认 70）。须在音频线程启动前调用
+pub fn configure_rt_priority(priority: i32) {
+    let value = if (1..=99).contains(&priority) {
+        priority
+    } else {
+        tracing::warn!(priority, "RT 优先级越界，回退默认 70");
+        70
+    };
+    AUDIO_RT_PRIORITY.store(value, std::sync::atomic::Ordering::Release);
+}
+
+/// 解析内核 cpulist 格式（如 "2-3,5,8-9"）为 CPU ID 列表
+fn parse_cpulist(spec: &str) -> Vec<u32> {
+    let mut cpus = Vec::new();
+    for part in spec.split(',') {
+        let part = part.trim();
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(a), Ok(b)) = (start.trim().parse::<u32>(), end.trim().parse::<u32>()) {
+                if a <= b {
+                    cpus.extend(a..=b);
+                }
+            }
+        } else if let Ok(id) = part.parse::<u32>() {
+            cpus.push(id);
+        }
+    }
+    cpus
+}
 
 // ── Windows ─────────────────────────────────────────────────────────────────
 #[cfg(target_os = "windows")]
@@ -26,7 +56,8 @@ mod imp {
 // ── Linux ────────────────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::AUDIO_RT_PRIORITY;
+    use super::{parse_cpulist, AUDIO_RT_PRIORITY};
+    use std::sync::atomic::Ordering;
     use tracing::{debug, warn};
 
     /// 读取 Linux CPU 拓扑，返回"性能核"的 CPU ID 列表。
@@ -38,6 +69,15 @@ mod imp {
     ///   仅保留每个物理 core_id 的第一个逻辑线程（避开超线程虚拟核），以降低调度抖动。
     /// - 探测失败时返回空 Vec，调用方退化为不绑核。
     fn detect_performance_cores() -> Vec<u32> {
+        // 蓝图 §四：rt-tuning 脚本产出的隔离核优先（isolcpus 专核，无系统负载干扰）
+        if let Ok(spec) = std::fs::read_to_string("/sys/devices/system/cpu/isolated") {
+            let isolated = parse_cpulist(spec.trim());
+            if !isolated.is_empty() {
+                debug!("CPU 亲和力：使用隔离核 {:?}", isolated);
+                return isolated;
+            }
+        }
+
         // 先探测 CPU 数量
         let nproc = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_CONF) };
         if nproc <= 0 {
@@ -133,25 +173,33 @@ mod imp {
     /// 需要 CAP_SYS_NICE 或 /etc/security/limits.conf 配置 rtprio；
     /// 失败时静默降级，不影响音频功能。
     pub fn boost_current_audio_thread(name: &str) {
+        let priority = AUDIO_RT_PRIORITY.load(Ordering::Acquire);
         let param = libc::sched_param {
-            sched_priority: AUDIO_RT_PRIORITY,
+            sched_priority: priority,
         };
         let ret =
             unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
         if ret == 0 {
-            debug!(
-                thread = name,
-                priority = AUDIO_RT_PRIORITY,
-                "SCHED_FIFO 实时调度已启用"
-            );
+            debug!(thread = name, priority, "SCHED_FIFO 实时调度已启用");
         } else {
             warn!(
                 thread = name,
                 errno = ret,
-                "SCHED_FIFO 设置失败（需要 CAP_SYS_NICE 或 limits.conf 配置 rtprio≥{}），已降级为标准调度",
-                AUDIO_RT_PRIORITY
+                "SCHED_FIFO 设置失败（需要 CAP_SYS_NICE 或 limits.conf 配置 rtprio≥{priority}），已降级为标准调度"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_cpulist;
+
+    #[test]
+    fn cpulist_parses_kernel_isolated_format() {
+        assert_eq!(parse_cpulist("2-3"), vec![2, 3]);
+        assert_eq!(parse_cpulist("2,5,8-9"), vec![2, 5, 8, 9]);
+        assert_eq!(parse_cpulist(""), Vec::<u32>::new());
     }
 }
 

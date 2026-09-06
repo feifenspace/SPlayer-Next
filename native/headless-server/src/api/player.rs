@@ -89,6 +89,26 @@ pub(crate) async fn status_handler(State(state): State<AppState>) -> Result<Json
     })))
 }
 
+/// 输出设备列表（D.3 前置落地）：包装引擎 list_output_devices，
+/// ALSA MMAP 后端（B9）落地后在此追加 mmap 能力标志，响应形状不变
+pub(crate) async fn devices_handler() -> Result<Json<PlayerResponse>, ApiError> {
+    let devices = spawn_isolated_blocking("player-devices-worker", || {
+        audio_engine_core::audio_output::list_output_devices()
+    })
+    .await
+    .map_err(|e| ApiError::internal(e))?;
+    Ok(Json(PlayerResponse::ok(json!({
+        "devices": devices
+            .into_iter()
+            .map(|(id, name, is_default)| json!({
+                "id": id,
+                "name": name,
+                "is_default": is_default,
+            }))
+            .collect::<Vec<_>>(),
+    }))))
+}
+
 /// 播放
 pub(crate) async fn play_handler(
     State(state): State<AppState>,
