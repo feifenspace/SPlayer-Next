@@ -24,6 +24,7 @@ async fn create_test_library_app_state() -> (AppState, tempfile::TempDir) {
         web_root: None,
         diretta_target: None,
         proxy: None,
+        ..Config::default()
     };
 
     let state = AppState::new(&config).expect("Failed to create AppState");
@@ -313,7 +314,8 @@ FILE "CDImage.wav" WAVE
     // 2. 执行 CUE 同步
     {
         let mut conn = state.db.lock();
-        let count = db::sync_cue_tracks(&mut conn, &[cue_path.to_string_lossy().to_string()], None).unwrap();
+        let count = db::sync_cue_tracks(&mut conn, &[cue_path.to_string_lossy().to_string()], None)
+            .unwrap();
         assert_eq!(count, 2);
     }
 
@@ -324,7 +326,10 @@ FILE "CDImage.wav" WAVE
         assert_eq!(all_tracks.len(), 2);
         assert_eq!(all_tracks[0].title, "Track 1 Title");
         assert_eq!(all_tracks[0].artist.as_deref(), Some("Artist One"));
-        assert_eq!(all_tracks[0].album.as_ref().map(|a| a.name.as_str()), Some("Test CUE Album"));
+        assert_eq!(
+            all_tracks[0].album.as_ref().map(|a| a.name.as_str()),
+            Some("Test CUE Album")
+        );
         assert_eq!(all_tracks[0].duration, 200000); // 3分20秒 = 200s = 200000ms
 
         assert_eq!(all_tracks[1].title, "Track 2 Title");
@@ -338,8 +343,16 @@ FILE "CDImage.wav" WAVE
         assert_eq!(albums[0].track_count, 2);
 
         // 单轨获取
-        let t1 = db::get_track_by_path(&conn, &format!("cue://{}#track=01", cue_path.to_string_lossy())).unwrap().unwrap();
-        assert_eq!(t1.cue_audio_path.as_deref(), Some(wav_path.to_str().unwrap()));
+        let t1 = db::get_track_by_path(
+            &conn,
+            &format!("cue://{}#track=01", cue_path.to_string_lossy()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            t1.cue_audio_path.as_deref(),
+            Some(wav_path.to_str().unwrap())
+        );
         assert_eq!(t1.cue_start_ms, Some(0));
         assert_eq!(t1.cue_end_ms, Some(200000));
     }

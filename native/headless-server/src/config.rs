@@ -3,8 +3,48 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// 播放配置（蓝图 §3.1 纯内存播放）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PlaybackConfig {
+    /// L2 纯内存播放：载入时整轨物化进 mlock RAM，播放期零磁盘 IO（蓝图 §3.1）。
+    /// 默认关闭，行为与历史版本完全一致
+    pub ram_preload: bool,
+    /// 单曲 RAM 物化上限（字节）；超出上限的曲目回退路径/流式模式
+    pub ram_preload_max_bytes: u64,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            ram_preload: false,
+            ram_preload_max_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// 音频输出配置（蓝图 §3.2 RT 纪律；阶段三 B9 启用，先行带保守默认）
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// 播放线程 SCHED_FIFO 优先级（蓝图 §3.2 要求 75~85；70 为历史现行为）
+    pub rt_priority: u8,
+    /// 显式隔离核列表（如 "2,3"）；缺省时自动探测性能核
+    pub isolated_cores: Option<String>,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            rt_priority: 70,
+            isolated_cores: None,
+        }
+    }
+}
+
 /// 服务配置
 #[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// 监听地址（如 127.0.0.1:14558）
     pub listen_addr: String,
@@ -22,6 +62,10 @@ pub struct Config {
     pub diretta_target: Option<String>,
     /// 流媒体出网代理（如 http://127.0.0.1:7890 或 http://192.168.31.46:7890）
     pub proxy: Option<String>,
+    /// 播放配置
+    pub playback: PlaybackConfig,
+    /// 音频输出配置
+    pub audio: AudioConfig,
 }
 
 impl Default for Config {
@@ -35,6 +79,8 @@ impl Default for Config {
             web_root: None,
             diretta_target: None,
             proxy: None,
+            playback: PlaybackConfig::default(),
+            audio: AudioConfig::default(),
         }
     }
 }
@@ -63,6 +109,8 @@ impl Config {
         for path in paths {
             if std::fs::metadata(path).is_ok() {
                 let content = std::fs::read_to_string(path)?;
+                // 结构级 serde(default)：文件缺失的字段回落默认值，
+                // 新增配置项不破坏旧配置文件（部分合并）
                 config = serde_yaml::from_str(&content)?;
                 break;
             }
@@ -122,6 +170,14 @@ impl Config {
             .unwrap_or_else(|| default_data_dir().join("covers"))
     }
 
+    /// 单曲 RAM 物化上限（字节），硬上限 4GiB（蓝图 §3.1）
+    pub fn resolved_ram_preload_max_bytes(&self) -> usize {
+        const RAM_PRELOAD_HARD_CAP: u64 = 4 * 1024 * 1024 * 1024;
+        self.playback
+            .ram_preload_max_bytes
+            .min(RAM_PRELOAD_HARD_CAP) as usize
+    }
+
     /// 获取 CORS 白名单列表
     pub fn cors_origins(&self) -> Vec<String> {
         self.cors_origins
@@ -170,7 +226,10 @@ mod tests {
             database_path: Some(PathBuf::from("/custom/library.db")),
             ..Config::default()
         };
-        assert_eq!(config.resolved_database_path(), PathBuf::from("/custom/library.db"));
+        assert_eq!(
+            config.resolved_database_path(),
+            PathBuf::from("/custom/library.db")
+        );
     }
 
     #[test]
@@ -179,7 +238,10 @@ mod tests {
             cover_cache_dir: Some(PathBuf::from("/custom/covers")),
             ..Config::default()
         };
-        assert_eq!(config.resolved_cover_cache_dir(), PathBuf::from("/custom/covers"));
+        assert_eq!(
+            config.resolved_cover_cache_dir(),
+            PathBuf::from("/custom/covers")
+        );
     }
 
     #[test]
@@ -190,7 +252,9 @@ mod tests {
         assert!(is_cargo_target_dir(std::path::Path::new(
             "/proj/native/headless-server/target/debug/deps"
         )));
-        assert!(!is_cargo_target_dir(std::path::Path::new("/opt/splayer-headless")));
+        assert!(!is_cargo_target_dir(std::path::Path::new(
+            "/opt/splayer-headless"
+        )));
         assert!(!is_cargo_target_dir(std::path::Path::new(
             "/opt/splayer-headless/data"
         )));
@@ -200,6 +264,9 @@ mod tests {
     fn default_data_dir_skips_cargo_target() {
         // 测试二进制位于 target/debug/deps，应回退 CWD 相对路径而非写入 target/
         let dir = default_data_dir();
-        assert!(!is_cargo_target_dir(&dir), "数据目录不应落在 cargo target 内: {dir:?}");
+        assert!(
+            !is_cargo_target_dir(&dir),
+            "数据目录不应落在 cargo target 内: {dir:?}"
+        );
     }
 }

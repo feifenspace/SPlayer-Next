@@ -1,14 +1,81 @@
 //! 服务启动入口
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
 
 use headless_server::api::routes::build_router;
 use headless_server::config::Config;
 use headless_server::state::AppState;
+
+/// SPlayer-Next Headless Hi-Fi 音频服务
+#[derive(Debug, Parser)]
+#[command(name = "splayer-headless", version, about)]
+struct Cli {
+    /// 静态 Web UI 根目录（缺省自动探测）
+    #[arg(long, value_name = "DIR")]
+    web_root: Option<PathBuf>,
+    /// 监听地址（如 192.168.1.10:14558，设置后忽略 --host/--port）
+    #[arg(long, value_name = "ADDR")]
+    listen: Option<String>,
+    /// 监听主机（仅在 listen_addr 为默认值时生效）
+    #[arg(long, value_name = "HOST", default_value = "0.0.0.0")]
+    host: String,
+    /// 监听端口（仅在 listen_addr 为默认值时生效）
+    #[arg(long, value_name = "PORT", default_value_t = 14558)]
+    port: u16,
+    /// API Token（可选，为空则不校验）
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+    /// 数据目录（library.db 与 covers 的父目录）
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+    /// 数据库文件路径
+    #[arg(long, value_name = "PATH", alias = "db")]
+    database_path: Option<PathBuf>,
+    /// 封面缓存目录
+    #[arg(long, value_name = "DIR")]
+    cover_dir: Option<PathBuf>,
+    /// 默认连接的 Diretta Target 地址
+    #[arg(long, value_name = "TARGET")]
+    diretta_target: Option<String>,
+}
+
+impl Cli {
+    /// 参数覆盖配置文件（参数名与历史版本完全兼容）
+    fn apply_to(self, config: &mut Config) {
+        if let Some(web_root) = self.web_root {
+            config.web_root = Some(web_root);
+        }
+        if let Some(listen) = self.listen {
+            config.listen_addr = listen;
+        }
+        if let Some(token) = self.token {
+            config.api_token = Some(token);
+        }
+        if let Some(dir) = self.data_dir {
+            config.database_path = Some(dir.join("library.db"));
+            config.cover_cache_dir = Some(dir.join("covers"));
+        }
+        if let Some(db) = self.database_path {
+            config.database_path = Some(db);
+        }
+        if let Some(cover) = self.cover_dir {
+            config.cover_cache_dir = Some(cover);
+        }
+        if let Some(target) = self.diretta_target {
+            config.diretta_target = Some(target);
+        }
+        // 历史 quirk 保持：--host/--port 仅在 listen_addr 为默认值/空时生效
+        if config.listen_addr == "127.0.0.1:14558" || config.listen_addr.is_empty() {
+            config.listen_addr = format!("{}:{}", self.host, self.port);
+        }
+    }
+}
 
 /// 启动 HTTP 服务
 pub async fn start_server(config: Config) -> Result<SocketAddr> {
@@ -47,81 +114,9 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let args = Cli::parse();
     let mut config = Config::load()?;
-    let mut host = "0.0.0.0".to_string();
-    let mut port = 14558u16;
-
-    // 解析命令行参数
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--web-root" => {
-                if i + 1 < args.len() {
-                    config.web_root = Some(std::path::PathBuf::from(&args[i + 1]));
-                    i += 1;
-                }
-            }
-            "--listen" => {
-                if i + 1 < args.len() {
-                    config.listen_addr = args[i + 1].clone();
-                    i += 1;
-                }
-            }
-            "--host" => {
-                if i + 1 < args.len() {
-                    host = args[i + 1].clone();
-                    i += 1;
-                }
-            }
-            "--port" => {
-                if i + 1 < args.len() {
-                    if let Ok(p) = args[i + 1].parse() {
-                        port = p;
-                    }
-                    i += 1;
-                }
-            }
-            "--token" => {
-                if i + 1 < args.len() {
-                    config.api_token = Some(args[i + 1].clone());
-                    i += 1;
-                }
-            }
-            "--data-dir" => {
-                if i + 1 < args.len() {
-                    let dir = std::path::PathBuf::from(&args[i + 1]);
-                    config.database_path = Some(dir.join("library.db"));
-                    config.cover_cache_dir = Some(dir.join("covers"));
-                    i += 1;
-                }
-            }
-            "--database-path" | "--db" => {
-                if i + 1 < args.len() {
-                    config.database_path = Some(std::path::PathBuf::from(&args[i + 1]));
-                    i += 1;
-                }
-            }
-            "--cover-dir" => {
-                if i + 1 < args.len() {
-                    config.cover_cache_dir = Some(std::path::PathBuf::from(&args[i + 1]));
-                    i += 1;
-                }
-            }
-            "--diretta-target" => {
-                if i + 1 < args.len() {
-                    config.diretta_target = Some(args[i + 1].clone());
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    if config.listen_addr == "127.0.0.1:14558" || config.listen_addr.is_empty() {
-        config.listen_addr = format!("{}:{}", host, port);
-    }
+    args.apply_to(&mut config);
 
     let _addr = start_server(config).await?;
 

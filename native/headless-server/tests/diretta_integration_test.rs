@@ -19,6 +19,7 @@ async fn create_test_app_state() -> AppState {
         web_root: None,
         diretta_target: None,
         proxy: None,
+        ..Config::default()
     };
 
     AppState::new(&config).expect("Failed to create test AppState")
@@ -115,12 +116,16 @@ async fn test_diretta_stage_and_cancel_endpoints() {
         .uri("/api/v1/player/direct/stage_next")
         .method("POST")
         .header("Content-Type", "application/json")
-        .body(Body::from(r#"{"source": "test.flac", "duration_secs": 180.0}"#))
+        .body(Body::from(
+            r#"{"source": "test.flac", "duration_secs": 180.0}"#,
+        ))
         .unwrap();
 
     let stage_resp = app.clone().oneshot(stage_req).await.unwrap();
     assert_eq!(stage_resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(stage_resp.into_body(), usize::MAX).await.unwrap();
+    let body_bytes = axum::body::to_bytes(stage_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert!(body["success"].as_bool().unwrap());
     assert_eq!(body["data"]["staged"], false);
@@ -134,7 +139,9 @@ async fn test_diretta_stage_and_cancel_endpoints() {
 
     let cancel_resp = app.clone().oneshot(cancel_req).await.unwrap();
     assert_eq!(cancel_resp.status(), StatusCode::OK);
-    let body_bytes = axum::body::to_bytes(cancel_resp.into_body(), usize::MAX).await.unwrap();
+    let body_bytes = axum::body::to_bytes(cancel_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap();
     assert!(body["success"].as_bool().unwrap());
     assert_eq!(body["data"]["cancelled"], true);

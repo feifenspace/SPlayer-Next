@@ -15,6 +15,9 @@ audio-engine-core = { path = "../audio-engine-core", default-features = false, f
 # memfd_create（preload 模式纯内存流缓存）
 libc = "0.2"
 
+# CLI 参数解析
+clap = { version = "4", features = ["derive"] }
+
 # HTTP 框架
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
