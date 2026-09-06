@@ -55,8 +55,6 @@ impl DsdRate {
     }
 }
 
-
-
 /// 检查路径是否为支持的 DSD 音频文件
 pub fn is_dsd_path(path: &str) -> bool {
     let lower = path.to_lowercase();
@@ -90,25 +88,31 @@ pub fn reverse_byte(b: u8) -> u8 {
     BIT_REVERSE_LUT[b as usize]
 }
 
-/// 原地重排 1-byte 交错 DSD 流为 Diretta 要求的 InterleavedBlock32（L4R4）。
-/// 输入: [L0 R0 L1 R1 L2 R2 L3 R3]
-/// 输出: [L0 L1 L2 L3 R0 R1 R2 R3]
+/// 原地重排 1-byte 交错 DSD 流为 Diretta 要求的 InterleavedBlock32。
+/// 2ch（L4R4）: [L0 R0 L1 R1 L2 R2 L3 R3] → [L0 L1 L2 L3 R0 R1 R2 R3]
+/// N ch 推广: 每 4 个样本时间槽内按声道分组 [ch0_t0..t3, ch1_t0..t3, …]
 pub fn interleaved_1byte_to_block32_in_place(data: &mut [u8], channels: u16) -> anyhow::Result<()> {
-    anyhow::ensure!(channels == 2, "DSD Block32 转换仅支持立体声 2 声道");
-    let group_size = 8;
-    anyhow::ensure!(data.len() % group_size == 0, "DSD 数据未对齐到 8 字节边界");
+    anyhow::ensure!(channels > 0, "DSD Block32 转换声道数无效");
+    let n = usize::from(channels);
+    let group_size = 4 * n;
+    const MAX_GROUP: usize = 32; // SACD multichannel 上限 6ch → group ≤ 24
+    anyhow::ensure!(
+        group_size <= MAX_GROUP,
+        "DSD Block32 转换声道数过多: {channels}"
+    );
+    anyhow::ensure!(
+        data.len() % group_size == 0,
+        "DSD 数据未对齐到 {group_size} 字节边界"
+    );
+    let mut buf = [0u8; MAX_GROUP];
+    let buf = &mut buf[..group_size];
     for chunk in data.chunks_exact_mut(group_size) {
-        let mut buf = [0u8; 8];
-        buf[0] = chunk[0];
-        buf[1] = chunk[2];
-        buf[2] = chunk[4];
-        buf[3] = chunk[6];
-        buf[4] = chunk[1];
-        buf[5] = chunk[3];
-        buf[6] = chunk[5];
-        buf[7] = chunk[7];
-        chunk.copy_from_slice(&buf);
+        for t in 0..4 {
+            for ch in 0..n {
+                buf[ch * 4 + t] = chunk[t * n + ch];
+            }
+        }
+        chunk.copy_from_slice(buf);
     }
     Ok(())
 }
-

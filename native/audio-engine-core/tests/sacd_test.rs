@@ -106,15 +106,12 @@ fn test_synthetic_sacd_iso_parsing() {
     let t2_artist = b"The Beatles\0";
     iso_bytes[ttxt_off + p3 + 1..ttxt_off + p3 + 1 + t2_artist.len()].copy_from_slice(t2_artist);
 
-
-
     let mut file = File::create(&iso_path).unwrap();
     file.write_all(&iso_bytes).unwrap();
     file.flush().unwrap();
 
     let reader = IsoReader::open(&iso_path).unwrap();
     assert_eq!(reader.total_lsn(), 600);
-
 
     let disc = probe_sacd_iso(&iso_path).unwrap();
     assert_eq!(disc.album_title.as_deref(), Some("Abbey Road"));

@@ -322,6 +322,12 @@ export interface PlayerApi {
     source: string,
     durationSecs: number,
     generation?: number,
+    meta?: {
+      title?: string | null;
+      artist?: string | null;
+      album?: string | null;
+      cover?: string | null;
+    },
   ) => Promise<IpcResponse<boolean>>;
   /** 作废尚未进入音频 ring 的 Direct staged 下一音源 */
   cancelDirectNext: () => Promise<IpcResponse>;

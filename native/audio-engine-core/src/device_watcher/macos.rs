@@ -57,9 +57,8 @@ unsafe extern "C-unwind" fn property_changed(
         .ok()
         .and_then(|callbacks| callbacks.get(&context_id).cloned());
     if let Some(sender) = sender {
-        let addresses = unsafe {
-            std::slice::from_raw_parts(addresses.as_ptr(), address_count as usize)
-        };
+        let addresses =
+            unsafe { std::slice::from_raw_parts(addresses.as_ptr(), address_count as usize) };
         let default_changed = addresses
             .iter()
             .any(|address| address.mSelector == kAudioHardwarePropertyDefaultOutputDevice);

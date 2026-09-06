@@ -134,7 +134,10 @@ fn file_record_round_trips_path_mtime_size() {
     assert_eq!(record.path, "tests/fixtures/track.mp3");
     assert_eq!(record.mtime, 1_000_000);
     assert_eq!(record.size, 2_048);
-    assert_eq!(record.cover_path.as_deref(), Some("tests/fixtures/cover.jpg"));
+    assert_eq!(
+        record.cover_path.as_deref(),
+        Some("tests/fixtures/cover.jpg")
+    );
 }
 
 #[test]

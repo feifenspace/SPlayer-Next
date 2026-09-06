@@ -127,8 +127,7 @@ mod real {
             let log_min = MIN_FREQ.ln();
             let log_max = MAX_FREQ.ln();
             for i in 0..OUTPUT_BINS {
-                let freq_lo =
-                    (log_min + (log_max - log_min) * i as f32 / OUTPUT_BINS as f32).exp();
+                let freq_lo = (log_min + (log_max - log_min) * i as f32 / OUTPUT_BINS as f32).exp();
                 let freq_hi =
                     (log_min + (log_max - log_min) * (i + 1) as f32 / OUTPUT_BINS as f32).exp();
                 let bin_lo = ((freq_lo / freq_per_bin).floor() as usize).max(min_bin);
@@ -195,11 +194,8 @@ mod real {
             let frequency = 1_000.0;
             let samples: Vec<f32> = (0..FFT_SIZE)
                 .flat_map(|i| {
-                    let phase = 2.0
-                        * std::f32::consts::PI
-                        * frequency
-                        * i as f32
-                        / FFT_SAMPLE_RATE as f32;
+                    let phase =
+                        2.0 * std::f32::consts::PI * frequency * i as f32 / FFT_SAMPLE_RATE as f32;
                     let sample = phase.sin();
                     [sample, sample]
                 })
@@ -212,8 +208,7 @@ mod real {
                 .max_by(|(_, a), (_, b)| a.total_cmp(b))
                 .map(|(index, _)| index)
                 .unwrap();
-            let expected = ((frequency.ln() - MIN_FREQ.ln())
-                / (MAX_FREQ.ln() - MIN_FREQ.ln())
+            let expected = ((frequency.ln() - MIN_FREQ.ln()) / (MAX_FREQ.ln() - MIN_FREQ.ln())
                 * OUTPUT_BINS as f32) as usize;
             assert!(
                 peak.abs_diff(expected) <= 1,

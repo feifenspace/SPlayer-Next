@@ -64,7 +64,9 @@ export class ElectronPlayerClient implements IPlayerClient {
     source: string,
     durationSecs: number,
     generation?: number,
+    meta?: { title?: string | null; artist?: string | null; album?: string | null; cover?: string | null },
   ): Promise<IpcResponse<boolean>> {
+    void meta;
     return this.api.stageDirectNext(source, durationSecs, generation);
   }
 

@@ -211,7 +211,6 @@ pub fn default_device_id() -> Option<String> {
     .unwrap_or_default()
 }
 
-
 /// 按设备 ID（`None` 为默认设备）解析设备与输出配置。
 /// 设备支持 `requested_sample_rate` 时按该速率打开，否则使用设备默认配置。
 /// 样本格式优先沿用设备默认格式：PipeWire 等后端上报的 supported 列表包含
@@ -369,7 +368,6 @@ where
             }
             on_failure();
         },
-
         None,
     )?;
     Ok(stream)

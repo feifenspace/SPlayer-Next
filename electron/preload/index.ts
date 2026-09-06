@@ -133,8 +133,12 @@ const api = {
     // 订阅主进程推送的播放事件
     onEvent: (callback: (event: unknown) => void) => subscribe("player:event", callback),
     // Diretta Source Direct 无缝预载下一曲
-    stageDirectNext: (source: string, durationSecs: number, generation = 0) =>
-      ipcRenderer.invoke("player:stageDirectNext", source, durationSecs, generation),
+    stageDirectNext: (
+      source: string,
+      durationSecs: number,
+      generation = 0,
+      _meta?: { title?: string | null; artist?: string | null; album?: string | null; cover?: string | null },
+    ) => ipcRenderer.invoke("player:stageDirectNext", source, durationSecs, generation),
     // 作废尚未进入音频 ring 的 Direct staged 下一音源
     cancelDirectNext: () => ipcRenderer.invoke("player:cancelDirectNext"),
     // directTrackBoundary 后确认 queue/media 已推进到下一曲

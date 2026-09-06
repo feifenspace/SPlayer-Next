@@ -143,11 +143,7 @@ extern "C" {
     /// 5. write_thread 按 seq 顺序串行调用 frame_decoded_callback
     ///
     /// **线程安全**：libdstdec 内部用锁保护 job 队列，可在任意线程调用。
-    fn dst_decoder_decode(
-        dst_decoder: *mut DstDecoderT,
-        frame_data: *mut u8,
-        frame_size: usize,
-    );
+    fn dst_decoder_decode(dst_decoder: *mut DstDecoderT, frame_data: *mut u8, frame_size: usize);
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -158,15 +154,20 @@ extern "C" {
 ///
 /// # 设计
 ///
-/// - `decoded_frames`：解码后的 DSD 帧队列（按 seq 顺序入队，主线程出队消费）
+/// - `decoded_frames`：解码后的 DSD 帧队列（按 seq 顺序入队，主线程出队消费），
+///   bool 标记该帧解码失败（内容为 libdstdec 的 0x55 垫帧，不可信）
 /// - `error_count`：累计错误帧数（用于诊断）
+/// - `pending_errored`：write 线程先回调 on_frame_error 再回调 on_frame_decoded
+///   （同一线程顺序执行，见 dst_decoder.c write_thread），此计数将错误标记
+///   与紧随其后的解码帧配对
 ///
 /// 用 `Mutex` 保护，因为：
 /// - write_thread（FFI 回调上下文）写入 decoded_frames
 /// - 主线程读取 decoded_frames
 struct DstDecoderState {
-    decoded_frames: VecDeque<Vec<u8>>,
+    decoded_frames: VecDeque<(Vec<u8>, bool)>,
     error_count: u32,
+    pending_errored: u32,
 }
 
 impl DstDecoderState {
@@ -174,6 +175,7 @@ impl DstDecoderState {
         Self {
             decoded_frames: VecDeque::new(),
             error_count: 0,
+            pending_errored: 0,
         }
     }
 }
@@ -201,7 +203,11 @@ unsafe extern "C" fn on_frame_decoded(
     let slice = std::slice::from_raw_parts(frame_data, frame_size);
     let frame = slice.to_vec();
     if let Ok(mut guard) = state.lock() {
-        guard.decoded_frames.push_back(frame);
+        let errored = guard.pending_errored > 0;
+        if errored {
+            guard.pending_errored -= 1;
+        }
+        guard.decoded_frames.push_back((frame, errored));
     }
 }
 
@@ -215,7 +221,7 @@ unsafe extern "C" fn on_frame_error(
     frame_count: c_int,
     frame_error_code: c_int,
     frame_error_message: *const c_char,
-    _userdata: *mut c_void,
+    userdata: *mut c_void,
 ) {
     let msg = if frame_error_message.is_null() {
         "(no message)".to_string()
@@ -228,10 +234,14 @@ unsafe extern "C" fn on_frame_error(
         "DST decode error: frame_seq={}, code={}, msg={}",
         frame_count, frame_error_code, msg
     );
-    // 错误帧也会通过 on_frame_decoded 输出静音数据（libdstdec 的行为：
-    // 解码失败时 out 缓冲区仍按 MAX_DSDBITS_INFRAME/8*ch 大小填零并送入 write_thread）
-    // 故此处只统计错误数，不修改 decoded_frames 队列
-    // （若未来需要更精细的错误处理，可在 state 加 error_count 字段）
+    // 解码失败的帧仍会经 on_frame_decoded 递送，但内容是 libdstdec 的
+    // 0x55 全幅垫帧（dst_fram.c 解码失败 memset），必须交由上层以 0x69 覆写
+    let state = &*(userdata as *const Mutex<DstDecoderState>);
+    if let Ok(mut guard) = state.lock() {
+        let count = frame_count.max(0) as u32;
+        guard.error_count += count;
+        guard.pending_errored += count;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -336,11 +346,7 @@ impl DstDecoder {
         // SAFETY: dst_decoder_decode 会拷贝 frame_data 到内部 buffer_pool，
         // 调用返回后即可释放。decoder 指针在 new() 时验证非空。
         unsafe {
-            dst_decoder_decode(
-                self.decoder,
-                dst_frame.as_ptr() as *mut u8,
-                dst_frame.len(),
-            );
+            dst_decoder_decode(self.decoder, dst_frame.as_ptr() as *mut u8, dst_frame.len());
         }
         self.submitted_count += 1;
     }
@@ -349,14 +355,16 @@ impl DstDecoder {
     ///
     /// # 返回
     ///
-    /// - `Some(Vec<u8>)`：解码后的 DSD 字节（按声道交错，MSB-first）
-    ///   长度 = `MAX_DSDBITS_INFRAME / 8 * channel_count`（= 588*64/8 * ch = 4704 * ch）
+    /// - `Some((Vec<u8>, errored))`：解码后的 DSD 字节（按声道交错，MSB-first），
+    ///   长度 = `MAX_DSDBITS_INFRAME / 8 * channel_count`（= 588*64/8 * ch = 4704 * ch）；
+    ///   `errored = true` 表示该帧解码失败，内容是 libdstdec 的 0x55 全幅垫帧，
+    ///   调用方必须覆写为 0x69 静音后再交付
     /// - `None`：当前无已解码帧（可稍后重试，或调用 [`flush`] 后再取）
     ///
     /// # 顺序保证
     ///
     /// libdstdec 的 write_thread 按 seq 顺序串行调用回调，故出队顺序与 submit 顺序一致。
-    pub fn next_decoded(&self) -> Option<Vec<u8>> {
+    pub fn next_decoded(&self) -> Option<(Vec<u8>, bool)> {
         if let Ok(mut guard) = self.state.lock() {
             guard.decoded_frames.pop_front()
         } else {

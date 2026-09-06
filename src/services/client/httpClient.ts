@@ -816,6 +816,7 @@ export class HttpPlayerClient implements IPlayerClient {
     source: string,
     durationSecs: number,
     generation = 0,
+    meta?: { title?: string | null; artist?: string | null; album?: string | null; cover?: string | null },
   ): Promise<IpcResponse<boolean>> {
     const res = await this.request<{ staged: boolean }>("/api/v1/player/direct/stage_next", {
       method: "POST",
@@ -823,6 +824,10 @@ export class HttpPlayerClient implements IPlayerClient {
         source,
         duration_secs: durationSecs,
         generation,
+        title: meta?.title ?? null,
+        artist: meta?.artist ?? null,
+        album: meta?.album ?? null,
+        cover: meta?.cover ?? null,
       }),
     });
     if (!res.success) return { success: false, error: res.error };

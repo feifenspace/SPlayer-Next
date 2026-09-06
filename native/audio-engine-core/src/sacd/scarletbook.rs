@@ -355,7 +355,12 @@ fn parse_master_toc(reader: &mut IsoReader) -> Result<MasterToc> {
 fn parse_master_text(
     reader: &mut IsoReader,
     _master_toc: &MasterToc,
-) -> Result<(Option<String>, Option<String>, Option<String>, Option<String>)> {
+) -> Result<(
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+)> {
     let buf = reader
         .read_sectors(START_OF_MASTER_TOC, MASTER_TOC_LEN)
         .context("重读 Master TOC 区域以提取 SACDText 失败")?;
@@ -483,7 +488,10 @@ fn parse_area_toc(
     // 校验首扇区 id
     let id = &buf[0..8];
     if id != b"TWOCHTOC" && id != b"MULCHTOC" {
-        bail!("Area TOC id 校验失败: {:?}（期望 TWOCHTOC 或 MULCHTOC）", id);
+        bail!(
+            "Area TOC id 校验失败: {:?}（期望 TWOCHTOC 或 MULCHTOC）",
+            id
+        );
     }
 
     // area_toc_t 字段偏移（按 scarletbook.h 结构体定义累加）：
@@ -759,44 +767,55 @@ pub fn probe_sacd_iso<P: AsRef<Path>>(iso_path: P) -> Result<SacdDisc> {
     let (album_title, album_artist, album_publisher, album_copyright) =
         parse_master_text(&mut reader, &master_toc)?;
 
-    // 3. 选择区域：优先 TWOCH，回落 MULCH
-    let (area_start, area_size, area_type) = if master_toc.area_1_toc_size > 0 {
+    // 3. 区域选择：优先 TWOCH；TOC 解析失败或 0 轨（空/损坏区域）回落 MULCH（H2.1）
+    let area_candidates = [
         (
             master_toc.area_1_toc_1_start,
             master_toc.area_1_toc_size,
             "twoch",
-        )
-    } else if master_toc.area_2_toc_size > 0 {
+        ),
         (
             master_toc.area_2_toc_1_start,
             master_toc.area_2_toc_size,
             "mulch",
-        )
-    } else {
+        ),
+    ];
+    let mut selected = None;
+    for (area_start, area_size, area_type) in area_candidates {
+        if area_size == 0 || area_start == 0 {
+            continue;
+        }
+        match parse_area_toc(&mut reader, area_start, area_size) {
+            Ok((area_toc, tracklist, text_block_off)) if area_toc.track_count > 0 => {
+                selected = Some((
+                    area_start,
+                    area_size,
+                    area_type,
+                    area_toc,
+                    tracklist,
+                    text_block_off,
+                ));
+                break;
+            }
+            Ok((area_toc, ..)) => tracing::info!(
+                area = %area_type,
+                track_count = %area_toc.track_count,
+                "SACD 区域无轨道，回落下一区域"
+            ),
+            Err(e) => tracing::info!(
+                area = %area_type,
+                error = %e,
+                "SACD 区域 TOC 解析失败，回落下一区域"
+            ),
+        }
+    }
+    let Some((area_start, area_size, area_type, area_toc, tracklist, text_block_off)) = selected
+    else {
         bail!(
-            "Master TOC 中 area_1_toc_size 与 area_2_toc_size 均为 0，无可用区域: {}",
+            "无可用 SACD 区域（TWOCH/MULCH 均缺失、空轨或损坏）: {}",
             iso_path_ref.display()
         );
     };
-
-    if area_start == 0 {
-        bail!(
-            "区域 {} 的 TOC 起始 LSN 为 0（无效镜像）: {}",
-            area_type,
-            iso_path_ref.display()
-        );
-    }
-
-    // 4. 解析 Area TOC + 轨道表 + 文本块偏移
-    let (area_toc, tracklist, text_block_off) =
-        parse_area_toc(&mut reader, area_start, area_size)?;
-
-    if area_toc.track_count == 0 {
-        bail!(
-            "Area TOC track_count = 0（无轨道）: {}",
-            iso_path_ref.display()
-        );
-    }
 
     let track_count = area_toc.track_count;
     let _track_start = area_toc.track_start;
@@ -827,10 +846,7 @@ pub fn probe_sacd_iso<P: AsRef<Path>>(iso_path: P) -> Result<SacdDisc> {
         let duration_frames = tracklist.duration_frames[i];
         let duration_secs = duration_frames as f64 / SACD_FRAME_RATE as f64;
 
-        let (title, artist) = track_texts
-            .get(i)
-            .cloned()
-            .unwrap_or((None, None));
+        let (title, artist) = track_texts.get(i).cloned().unwrap_or((None, None));
 
         tracks.push(SacdTrack {
             track_num: (i + 1) as u32,

@@ -15,8 +15,8 @@ pub use cover::{
     extract_cover_thumbnail_with_directory_cover, extract_directory_cover_thumbnail,
     extract_folder_cover_thumbnail, find_directory_cover, make_thumbnail_jpeg, read_attached_pic,
 };
-pub use folder_cover::find_folder_cover as legacy_find_folder_cover;
 pub use editor::{read_tags, write_tags, TagWriteRequest};
+pub use folder_cover::find_folder_cover as legacy_find_folder_cover;
 pub use lyrics::{extract_embedded_lyric, find_all_external_lyrics, ExternalLyric};
 
 /// 音频元数据（包含封面路径和歌词）
@@ -102,10 +102,21 @@ pub fn extract_file_tags(path: &str, reader: &AudioReader) -> Tags {
     // 而 Lofty 能准确读取末尾的 ID3v2 chunk（包含原生 UTF-16LE / UTF-8 中文标签）
     let lofty_tags = editor::read_tags(path).ok();
 
-    let mut title = lofty_tags.as_ref().and_then(|t| t.title.clone()).and_then(clean_and_repair_tag);
-    let mut artist = lofty_tags.as_ref().and_then(|t| t.artist.clone()).and_then(clean_and_repair_tag);
-    let mut album = lofty_tags.as_ref().and_then(|t| t.album.clone()).and_then(clean_and_repair_tag);
-    let mut track = lofty_tags.as_ref().and_then(|t| t.track_number.map(|n| n as u16));
+    let mut title = lofty_tags
+        .as_ref()
+        .and_then(|t| t.title.clone())
+        .and_then(clean_and_repair_tag);
+    let mut artist = lofty_tags
+        .as_ref()
+        .and_then(|t| t.artist.clone())
+        .and_then(clean_and_repair_tag);
+    let mut album = lofty_tags
+        .as_ref()
+        .and_then(|t| t.album.clone())
+        .and_then(clean_and_repair_tag);
+    let mut track = lofty_tags
+        .as_ref()
+        .and_then(|t| t.track_number.map(|n| n as u16));
     let mut comment = None;
 
     // 2. 若 Lofty 缺失字段，从 FFmpeg 容器 metadata 回退补全
@@ -188,8 +199,9 @@ pub fn clean_title_from_filename(path: &str) -> Option<String> {
     }
     if num_end > 0 && num_end <= 3 && num_end < bytes.len() {
         let after_num = &s[num_end..];
-        let trimmed_after = after_num
-            .trim_start_matches(|c: char| c == '.' || c == '_' || c == '-' || c == ' ' || c == '、');
+        let trimmed_after = after_num.trim_start_matches(|c: char| {
+            c == '.' || c == '_' || c == '-' || c == ' ' || c == '、'
+        });
         if !trimmed_after.is_empty() {
             s = trimmed_after;
         }
@@ -230,7 +242,17 @@ fn is_generic_dir_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "" | "." | ".." | "music" | "music2" | "test" | "download" | "downloads" | "audio" | "media" | "root" | "home"
+        "" | "."
+            | ".."
+            | "music"
+            | "music2"
+            | "test"
+            | "download"
+            | "downloads"
+            | "audio"
+            | "media"
+            | "root"
+            | "home"
     )
 }
 
@@ -307,7 +329,10 @@ fn decode_latin1_as_gbk(text: &str) -> Option<String> {
             total_high += 1;
             if i + 1 < bytes.len() {
                 let c2 = bytes[i + 1];
-                if c1 >= 0x81 && c1 <= 0xfe && ((c2 >= 0x40 && c2 <= 0x7e) || (c2 >= 0x80 && c2 <= 0xfe)) {
+                if c1 >= 0x81
+                    && c1 <= 0xfe
+                    && ((c2 >= 0x40 && c2 <= 0x7e) || (c2 >= 0x80 && c2 <= 0xfe))
+                {
                     gbk_score += 1;
                     i += 1;
                     total_high += 1;
@@ -460,11 +485,17 @@ mod tests {
     fn test_clean_title_and_path_inference() {
         let path = "/media/music2/蔡琴/机遇（绿色版）/01._机遇Ⅰ.wav";
         assert_eq!(clean_title_from_filename(path), Some("机遇Ⅰ".to_string()));
-        assert_eq!(infer_album_from_path(path), Some("机遇（绿色版）".to_string()));
+        assert_eq!(
+            infer_album_from_path(path),
+            Some("机遇（绿色版）".to_string())
+        );
         assert_eq!(infer_artist_from_path(path), Some("蔡琴".to_string()));
 
         let path2 = "/music/张学友/吻别/02. 每天爱你多一些.flac";
-        assert_eq!(clean_title_from_filename(path2), Some("每天爱你多一些".to_string()));
+        assert_eq!(
+            clean_title_from_filename(path2),
+            Some("每天爱你多一些".to_string())
+        );
         assert_eq!(infer_album_from_path(path2), Some("吻别".to_string()));
         assert_eq!(infer_artist_from_path(path2), Some("张学友".to_string()));
     }
@@ -484,4 +515,3 @@ mod tests {
         assert_eq!(clean_and_repair_tag(raw_jiyu), Some("机遇Ⅰ".to_string()));
     }
 }
-

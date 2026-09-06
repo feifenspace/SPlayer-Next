@@ -1,6 +1,4 @@
-use audio_engine_core::dsd::{
-    is_dsd_path, reverse_byte, Dsd2PcmDecimator, DsdRate, DsfReader,
-};
+use audio_engine_core::dsd::{is_dsd_path, reverse_byte, Dsd2PcmDecimator, DsdRate, DsfReader};
 use std::io::Write;
 
 #[test]
@@ -119,5 +117,3 @@ fn test_dsd2pcm_decimator() {
         assert!(sample >= -1.0 && sample <= 1.0);
     }
 }
-
-

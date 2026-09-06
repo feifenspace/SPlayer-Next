@@ -9,10 +9,10 @@ use tracing::{debug, info};
 
 use crate::audio_output::{AudioOutput, OutputFailureCallback};
 use crate::decoder;
-#[cfg(any(feature = "diretta", test))]
-use crate::direct_runtime::{DirectMonitor, DirectPlayback};
 #[cfg(feature = "diretta")]
 use crate::direct_runtime::DirectStageHandle;
+#[cfg(any(feature = "diretta", test))]
+use crate::direct_runtime::{DirectMonitor, DirectPlayback};
 use crate::equalizer::{Equalizer, EQ_BAND_COUNT};
 use crate::fft::FftAnalyzer;
 use crate::playback::PlaybackHandle;
@@ -26,7 +26,7 @@ mod transition;
 #[cfg(test)]
 use events::playback_completion_event;
 pub use events::{EventEmitter, PlayerEvent, PlayerState};
-pub use transition::{LoadedPlayback, SeekTake};
+pub use transition::{LoadedPlayback, OldThreads, SeekTake};
 
 /// 内部播放器，管理音频输出、解码和状态
 pub struct InnerPlayer {
@@ -281,7 +281,9 @@ impl InnerPlayer {
 
     #[cfg(feature = "diretta")]
     pub fn direct_stage_handle(&self) -> Option<DirectStageHandle> {
-        self.direct_playback.as_ref().map(DirectPlayback::stage_handle)
+        self.direct_playback
+            .as_ref()
+            .map(DirectPlayback::stage_handle)
     }
 
     #[cfg(feature = "diretta")]
@@ -869,7 +871,9 @@ mod tests {
             player.set_fade_duration(200).unwrap_err(),
             player.set_normalization_enabled(true).unwrap_err(),
             player.set_equalizer_enabled(true).unwrap_err(),
-            player.set_equalizer_bands(&[1.0; EQ_BAND_COUNT]).unwrap_err(),
+            player
+                .set_equalizer_bands(&[1.0; EQ_BAND_COUNT])
+                .unwrap_err(),
             player.set_preamp_gain(1.0).unwrap_err(),
             player.set_speed(1.1).unwrap_err(),
             player.set_pitch(1).unwrap_err(),
@@ -922,7 +926,11 @@ mod tests {
             .unwrap()
             .expect("Direct seek 应取得 Direct runtime");
         assert!(player.direct_playback.is_none());
-        assert!(player.set_volume(0.5).unwrap_err().to_string().contains("[Direct]"));
+        assert!(player
+            .set_volume(0.5)
+            .unwrap_err()
+            .to_string()
+            .contains("[Direct]"));
 
         let mut playback = take.playback;
         assert_eq!(playback.seek_while_paused(42.0).unwrap(), 42.0);
@@ -935,8 +943,6 @@ mod tests {
         assert_eq!(player.position(), 42.0);
         assert_eq!(player.state(), PlayerState::Playing);
     }
-
-
 
     #[test]
     fn direct_entry_refuses_preexisting_sample_processing() {

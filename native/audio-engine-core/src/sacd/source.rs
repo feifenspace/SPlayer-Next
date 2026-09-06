@@ -39,7 +39,9 @@ use tempfile::NamedTempFile;
 use tracing::{debug, info, warn};
 
 use super::iso_reader::{IsoReader, SACD_LSN_SIZE};
-use super::scarletbook::{probe_sacd_iso, FrameFormat, SacdDisc, SACD_FRAME_RATE, SACD_SAMPLING_FREQUENCY};
+use super::scarletbook::{
+    probe_sacd_iso, FrameFormat, SacdDisc, SACD_FRAME_RATE, SACD_SAMPLING_FREQUENCY,
+};
 
 // ─────────────────────────────────────────────────────────────────
 // 常量（与 scarletbook.h 严格对齐）
@@ -505,8 +507,8 @@ pub fn extract_dst_frames(
         bail!("SACD 轨道 length_lsn = 0（无效）");
     }
 
-    // 一次性读取整条轨道的所有扇区（SACD 轨道通常几十 MB，可接受）
-    // 对应 C 代码中 `sacd_read_block_raw(sacd, start_lsn, length_lsn, read_buffer)`
+    // 一次性读取整条轨道的所有扇区（仅剩 cursor 死代码路径在用；
+    // 播放路径走 extract_track_to_dsdiff_file 的分块流式提取，内存 O(1)）
     let all_sectors = reader
         .read_sectors(start_lsn as u64, length_lsn as u64)
         .with_context(|| {
@@ -533,161 +535,18 @@ pub fn extract_dst_frames(
         }
         let sector = &all_sectors[sector_start..sector_end];
 
-        // ---- 1. 解析 audio_frame_header_t（1 字节，little-endian bitfield）----
-        // dst_encoded = byte & 0x01
-        // frame_info_count = (byte >> 2) & 0x07
-        // packet_info_count = (byte >> 5) & 0x07
-        let header_byte = sector[0];
-        let dst_encoded = (header_byte & 0x01) != 0;
-        let frame_info_count = ((header_byte >> 2) & 0x07) as usize;
-        let packet_info_count = ((header_byte >> 5) & 0x07) as usize;
-
-        let mut cursor = 1usize; // 跳过 header
-
-        // ---- 2. 解析 audio_packet_info_t[packet_info_count]（每个 2 字节，little-endian manual）----
-        // frame_start = (byte[0] >> 7) & 1
-        // data_type   = (byte[0] >> 3) & 7
-        // packet_length = (byte[0] & 7) << 8 | byte[1]
-        if cursor + packet_info_count * 2 > SACD_LSN_SIZE {
-            bail!("SACD 扇区 {} packet_info 越界", j);
-        }
-        let mut packets: Vec<(u8, u8, usize)> = Vec::with_capacity(packet_info_count); // (frame_start, data_type, packet_length)
-        for _ in 0..packet_info_count {
-            let b0 = sector[cursor];
-            let b1 = sector[cursor + 1];
-            let frame_start = (b0 >> 7) & 0x01;
-            let data_type = (b0 >> 3) & 0x07;
-            let packet_length = (((b0 & 0x07) as usize) << 8) | (b1 as usize);
-            packets.push((frame_start, data_type, packet_length));
-            cursor += 2;
-        }
-
-        // ---- 3. 解析 audio_frame_info_t[frame_info_count] ----
-        // DST：每条 4 字节（timecode[3] + channel/sector byte[1]）
-        // 非 DST：每条 3 字节（仅 timecode[3]）
-        let frame_info_size = if dst_encoded { 4 } else { 3 };
-        if cursor + frame_info_count * frame_info_size > SACD_LSN_SIZE {
-            bail!("SACD 扇区 {} frame_info 越界", j);
-        }
-        // 仅 DST 需要 sector_count 和 channel_count；保留 frame_info 第 4 字节供后续读取
-        let mut frame_infos: Vec<u8> = Vec::with_capacity(frame_info_count);
-        for i in 0..frame_info_count {
-            let base = cursor + i * frame_info_size;
-            if dst_encoded {
-                // 第 4 字节是 channel/sector 字节
-                frame_infos.push(sector[base + 3]);
-            } else {
-                // 非 DST 无 channel/sector 字节，用占位值
-                frame_infos.push(0);
-            }
-        }
-        cursor += frame_info_count * frame_info_size;
-
-        // ---- 4. packet_info_count 上限校验（C 代码 line 791）----
-        if packet_info_count as u8 > MAX_PACKETS_PER_SECTOR {
-            warn!(
-                sector = j,
-                packet_info_count,
-                "SACD 扇区 packet_info_count > 7，跳过该扇区"
-            );
+        if process_sacd_sector(
+            sector,
+            j,
+            j == last_sector_idx,
+            disc_channel_count,
+            &mut assembler,
+            |frame| {
+                frames.push(frame);
+                Ok(())
+            },
+        )? {
             sector_bad_reads = true;
-            assembler.started = false;
-            continue;
-        }
-
-        // ---- 5. 遍历 packets，组装帧（C 代码 line 800-888）----
-        // frame_info_idx 在每个扇区开始时重置（C 代码 line 800-801）
-        let mut frame_info_idx = 0usize;
-
-        for (frame_start, data_type, packet_length) in &packets {
-            // 包长度上限校验（C 代码 line 805-809）
-            if *packet_length > MAX_PACKET_SIZE {
-                sector_bad_reads = true;
-                // continue 到下一包（注意：read_buffer_ptr 仍需前进，见下方）
-                // 但这里不直接 continue，因为还需要推进 cursor
-            }
-
-            match *data_type {
-                DATA_TYPE_AUDIO => {
-                    if *frame_start == 1 {
-                        // 帧起始：检查前一帧是否完整，若完整则输出（C 代码 line 818-826）
-                        if assembler.started && assembler.size() > 0 && assembler.is_complete() {
-                            let frame = assembler.take_frame();
-                            if !frame.is_empty() {
-                                frames.push(frame);
-                            }
-                        }
-
-                        // 开始新帧：从 frame_info[frame_info_idx] 读取 sector_count 和 channel_count
-                        // （C 代码 line 841-848）
-                        if frame_info_idx < frame_infos.len() {
-                            let info_byte = frame_infos[frame_info_idx];
-                            let sector_count = parse_sector_count(info_byte);
-                            // DST 模式：从 frame_info 解析 channel_count（2/5/6）
-                            // DSD 3-in-14/16 模式：frame_info 无 channel 字节，
-                            //                使用光盘级 disc_channel_count
-                            let channel_count = if dst_encoded {
-                                parse_channel_count(info_byte)
-                            } else {
-                                disc_channel_count
-                            };
-                            assembler.start_new(dst_encoded, sector_count, channel_count);
-                            // frame_info_idx 仅在 frame_start=1 时递增（C 代码 line 852）
-                            frame_info_idx += 1;
-                        } else {
-                            // frame_info 不足：跳过该帧
-                            warn!(
-                                sector = j,
-                                frame_info_idx,
-                                frame_info_count,
-                                "SACD frame_info 索引越界，跳过帧起始"
-                            );
-                        }
-                    }
-
-                    // 追加音频包数据（C 代码 line 854-873）
-                    if assembler.started && *packet_length <= MAX_PACKET_SIZE {
-                        if cursor + *packet_length > SACD_LSN_SIZE {
-                            warn!(
-                                sector = j,
-                                cursor,
-                                packet_length,
-                                "SACD 音频包数据越界，跳过"
-                            );
-                        } else {
-                            let packet_data = &sector[cursor..cursor + *packet_length];
-                            if !assembler.append_packet(packet_data) {
-                                sector_bad_reads = true;
-                                warn!(
-                                    sector = j,
-                                    size = assembler.size(),
-                                    packet_length,
-                                    "SACD DST 帧缓冲溢出，丢弃当前帧"
-                                );
-                            }
-                        }
-                    }
-                }
-                DATA_TYPE_SUPPLEMENTARY | DATA_TYPE_PADDING => {
-                    // 跳过（C 代码 line 876-878）
-                }
-                _ => {
-                    // 未知类型，跳过
-                }
-            }
-
-            // read_buffer_ptr 对所有包类型前进（C 代码 line 886）
-            cursor += *packet_length;
-        }
-
-        // ---- 6. 最后一个扇区：输出残留的完整帧（C 代码 line 896-914）----
-        if j == last_sector_idx {
-            if assembler.started && assembler.size() > 0 && assembler.is_complete() {
-                let frame = assembler.take_frame();
-                if !frame.is_empty() {
-                    frames.push(frame);
-                }
-            }
         }
     }
 
@@ -702,18 +561,181 @@ pub fn extract_dst_frames(
     if sector_bad_reads {
         warn!(
             frames_count = frames.len(),
-            num_sectors,
-            "SACD DST 帧提取完成，但部分扇区存在坏读"
+            num_sectors, "SACD DST 帧提取完成，但部分扇区存在坏读"
         );
     } else {
         debug!(
             frames_count = frames.len(),
-            num_sectors,
-            "SACD DST 帧提取完成"
+            num_sectors, "SACD DST 帧提取完成"
         );
     }
 
     Ok(frames)
+}
+
+/// 处理单个 SACD audio 扇区：解析 header / packet_info / frame_info，把音频包
+/// 喂给帧组装器，完整帧经 `sink` 交付。返回该扇区是否发生坏读。
+/// 供一次性提取（`extract_dst_frames`）与分块流式写（`extract_track_to_dsdiff_file`）共用。
+fn process_sacd_sector(
+    sector: &[u8],
+    sector_idx: u32,
+    is_last_sector: bool,
+    disc_channel_count: u8,
+    assembler: &mut DstFrameAssembler,
+    mut sink: impl FnMut(Vec<u8>) -> Result<()>,
+) -> Result<bool> {
+    let mut sector_bad = false;
+
+    // ---- 1. 解析 audio_frame_header_t（1 字节，little-endian bitfield）----
+    // dst_encoded = byte & 0x01
+    // frame_info_count = (byte >> 2) & 0x07
+    // packet_info_count = (byte >> 5) & 0x07
+    let header_byte = sector[0];
+    let dst_encoded = (header_byte & 0x01) != 0;
+    let frame_info_count = ((header_byte >> 2) & 0x07) as usize;
+    let packet_info_count = ((header_byte >> 5) & 0x07) as usize;
+
+    let mut cursor = 1usize; // 跳过 header
+
+    // ---- 2. 解析 audio_packet_info_t[packet_info_count]（每个 2 字节，little-endian manual）----
+    // frame_start = (byte[0] >> 7) & 1
+    // data_type   = (byte[0] >> 3) & 7
+    // packet_length = (byte[0] & 7) << 8 | byte[1]
+    if cursor + packet_info_count * 2 > SACD_LSN_SIZE {
+        bail!("SACD 扇区 {} packet_info 越界", sector_idx);
+    }
+    let mut packets: Vec<(u8, u8, usize)> = Vec::with_capacity(packet_info_count); // (frame_start, data_type, packet_length)
+    for _ in 0..packet_info_count {
+        let b0 = sector[cursor];
+        let b1 = sector[cursor + 1];
+        let frame_start = (b0 >> 7) & 0x01;
+        let data_type = (b0 >> 3) & 0x07;
+        let packet_length = (((b0 & 0x07) as usize) << 8) | (b1 as usize);
+        packets.push((frame_start, data_type, packet_length));
+        cursor += 2;
+    }
+
+    // ---- 3. 解析 audio_frame_info_t[frame_info_count] ----
+    // DST：每条 4 字节（timecode[3] + channel/sector byte[1]）
+    // 非 DST：每条 3 字节（仅 timecode[3]）
+    let frame_info_size = if dst_encoded { 4 } else { 3 };
+    if cursor + frame_info_count * frame_info_size > SACD_LSN_SIZE {
+        bail!("SACD 扇区 {} frame_info 越界", sector_idx);
+    }
+    // 仅 DST 需要 sector_count 和 channel_count；保留 frame_info 第 4 字节供后续读取
+    let mut frame_infos: Vec<u8> = Vec::with_capacity(frame_info_count);
+    for i in 0..frame_info_count {
+        let base = cursor + i * frame_info_size;
+        if dst_encoded {
+            // 第 4 字节是 channel/sector 字节
+            frame_infos.push(sector[base + 3]);
+        } else {
+            // 非 DST 无 channel/sector 字节，用占位值
+            frame_infos.push(0);
+        }
+    }
+    cursor += frame_info_count * frame_info_size;
+
+    // ---- 4. packet_info_count 上限校验（C 代码 line 791）----
+    if packet_info_count as u8 > MAX_PACKETS_PER_SECTOR {
+        warn!(
+            sector = sector_idx,
+            packet_info_count, "SACD 扇区 packet_info_count > 7，跳过该扇区"
+        );
+        assembler.started = false;
+        return Ok(true);
+    }
+
+    // ---- 5. 遍历 packets，组装帧（C 代码 line 800-888）----
+    // frame_info_idx 在每个扇区开始时重置（C 代码 line 800-801）
+    let mut frame_info_idx = 0usize;
+
+    for (frame_start, data_type, packet_length) in &packets {
+        // 包长度上限校验（C 代码 line 805-809）
+        if *packet_length > MAX_PACKET_SIZE {
+            sector_bad = true;
+        }
+
+        match *data_type {
+            DATA_TYPE_AUDIO => {
+                if *frame_start == 1 {
+                    // 帧起始：检查前一帧是否完整，若完整则输出（C 代码 line 818-826）
+                    if assembler.started && assembler.size() > 0 && assembler.is_complete() {
+                        let frame = assembler.take_frame();
+                        if !frame.is_empty() {
+                            sink(frame)?;
+                        }
+                    }
+
+                    // 开始新帧：从 frame_info[frame_info_idx] 读取 sector_count 和 channel_count
+                    // （C 代码 line 841-848）
+                    if frame_info_idx < frame_infos.len() {
+                        let info_byte = frame_infos[frame_info_idx];
+                        let sector_count = parse_sector_count(info_byte);
+                        // DST 模式：从 frame_info 解析 channel_count（2/5/6）
+                        // DSD 3-in-14/16 模式：frame_info 无 channel 字节，
+                        //                使用光盘级 disc_channel_count
+                        let channel_count = if dst_encoded {
+                            parse_channel_count(info_byte)
+                        } else {
+                            disc_channel_count
+                        };
+                        assembler.start_new(dst_encoded, sector_count, channel_count);
+                        // frame_info_idx 仅在 frame_start=1 时递增（C 代码 line 852）
+                        frame_info_idx += 1;
+                    } else {
+                        // frame_info 不足：跳过该帧
+                        warn!(
+                            sector = sector_idx,
+                            frame_info_idx,
+                            frame_info_count,
+                            "SACD frame_info 索引越界，跳过帧起始"
+                        );
+                    }
+                }
+
+                // 追加音频包数据（C 代码 line 854-873）
+                if assembler.started && *packet_length <= MAX_PACKET_SIZE {
+                    if cursor + *packet_length > SACD_LSN_SIZE {
+                        warn!(
+                            sector = sector_idx,
+                            cursor, packet_length, "SACD 音频包数据越界，跳过"
+                        );
+                    } else {
+                        let packet_data = &sector[cursor..cursor + *packet_length];
+                        if !assembler.append_packet(packet_data) {
+                            sector_bad = true;
+                            warn!(
+                                sector = sector_idx,
+                                size = assembler.size(),
+                                packet_length,
+                                "SACD DST 帧缓冲溢出，丢弃当前帧"
+                            );
+                        }
+                    }
+                }
+            }
+            DATA_TYPE_SUPPLEMENTARY | DATA_TYPE_PADDING => {
+                // 跳过（C 代码 line 876-878）
+            }
+            _ => {
+                // 未知类型，跳过
+            }
+        }
+
+        // read_buffer_ptr 对所有包类型前进（C 代码 line 886）
+        cursor += *packet_length;
+    }
+
+    // ---- 6. 最后一个扇区：输出残留的完整帧（C 代码 line 896-914）----
+    if is_last_sector && assembler.started && assembler.size() > 0 && assembler.is_complete() {
+        let frame = assembler.take_frame();
+        if !frame.is_empty() {
+            sink(frame)?;
+        }
+    }
+
+    Ok(sector_bad)
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -740,13 +762,16 @@ pub fn extract_dst_frames(
 pub fn extract_track_to_dsdiff_cursor(source: &str) -> Result<(Cursor<Vec<u8>>, SacdDisc)> {
     // 1. 解析虚拟路径
     let vp = parse_sacd_virtual_path(source).ok_or_else(|| {
-        anyhow!("不是 SACD 虚拟路径（期望 7 字段，第 2 字段以 Track 开头）: {}", source)
+        anyhow!(
+            "不是 SACD 虚拟路径（期望 7 字段，第 2 字段以 Track 开头）: {}",
+            source
+        )
     })?;
 
     // 2. 探测 ISO
     let iso_path = Path::new(&vp.iso_path);
-    let disc = probe_sacd_iso(iso_path)
-        .with_context(|| format!("探测 SACD ISO 失败: {}", vp.iso_path))?;
+    let disc =
+        probe_sacd_iso(iso_path).with_context(|| format!("探测 SACD ISO 失败: {}", vp.iso_path))?;
 
     // 3. 找到对应轨道
     let track = disc
@@ -774,11 +799,7 @@ pub fn extract_track_to_dsdiff_cursor(source: &str) -> Result<(Cursor<Vec<u8>>, 
 
     // 5. 根据帧格式生成 DSDIFF
     let dsdiff = match disc.frame_format {
-        FrameFormat::Dst => build_dsdiff(
-            SACD_SAMPLING_FREQUENCY,
-            disc.channel_count,
-            &frames,
-        ),
+        FrameFormat::Dst => build_dsdiff(SACD_SAMPLING_FREQUENCY, disc.channel_count, &frames),
         FrameFormat::Dsd3In14 | FrameFormat::Dsd3In16 => {
             // 将多帧 Vec<u8> 拼接为单一连续 raw DSD 字节流
             // 每帧长度 = channel_count * FRAME_SIZE_64 = channel_count * 4704
@@ -845,13 +866,16 @@ pub fn extract_track_to_dsdiff_cursor(source: &str) -> Result<(Cursor<Vec<u8>>, 
 pub fn extract_track_to_dsdiff_file(source: &str) -> Result<(NamedTempFile, SacdDisc)> {
     // 1. 解析虚拟路径
     let vp = parse_sacd_virtual_path(source).ok_or_else(|| {
-        anyhow!("不是 SACD 虚拟路径（期望 7 字段，第 2 字段以 Track 开头）: {}", source)
+        anyhow!(
+            "不是 SACD 虚拟路径（期望 7 字段，第 2 字段以 Track 开头）: {}",
+            source
+        )
     })?;
 
     // 2. 探测 ISO
     let iso_path = Path::new(&vp.iso_path);
-    let disc = probe_sacd_iso(iso_path)
-        .with_context(|| format!("探测 SACD ISO 失败: {}", vp.iso_path))?;
+    let disc =
+        probe_sacd_iso(iso_path).with_context(|| format!("探测 SACD ISO 失败: {}", vp.iso_path))?;
 
     // 3. 找到对应轨道
     let track = disc
@@ -866,52 +890,162 @@ pub fn extract_track_to_dsdiff_file(source: &str) -> Result<(NamedTempFile, Sacd
             )
         })?;
 
-    // 4. 提取帧（DST 压缩 / DSD 3-in-14/16 未压缩）
+    // 4-9. 分块流式提取：整轨不再进内存（原实现峰值 ≈ 扇区 + 帧 + DSDIFF 三份，
+    // 长轨可达 GB 级）。头部一次性写死（FVER+PROP），payload 逐帧直写临时文件，
+    // FRM8 form 尺寸与 payload chunk 尺寸结束时回填
     let mut reader = IsoReader::open(iso_path)
         .with_context(|| format!("打开 SACD ISO 失败: {}", vp.iso_path))?;
     let start_lsn = track.start_lsn;
     let length_lsn = track.length_lsn;
-    let frames = extract_dst_frames(&mut reader, start_lsn, length_lsn, disc.channel_count)
-        .with_context(|| format!("提取 SACD 帧失败 track={}", vp.track_num))?;
+    let is_dst = disc.frame_format == FrameFormat::Dst;
 
-    // 5. 根据帧格式生成 DSDIFF（Vec<u8>，临时存在内存中）
-    let dsdiff = match disc.frame_format {
-        FrameFormat::Dst => build_dsdiff(
-            SACD_SAMPLING_FREQUENCY,
-            disc.channel_count,
-            &frames,
-        ),
-        FrameFormat::Dsd3In14 | FrameFormat::Dsd3In16 => {
-            let mut raw_dsd: Vec<u8> = Vec::with_capacity(frames.iter().map(|f| f.len()).sum());
-            for f in &frames {
-                raw_dsd.extend_from_slice(f);
-            }
-            build_dsdiff_raw(SACD_SAMPLING_FREQUENCY, disc.channel_count, &raw_dsd)
-        }
-    };
-
-    let dsdiff_size = dsdiff.len();
-    let frames_count = frames.len();
-
-    // 6. 立即释放 frames Vec，减少峰值内存（frames + dsdiff 同时在内存中）
-    drop(frames);
-
-    // 7. 创建临时文件并写入 DSDIFF
     let mut tmp = tempfile::Builder::new()
         .prefix("tinylms-sacd-")
         .suffix(".dff")
         .tempfile()
         .with_context(|| "创建 SACD 临时文件失败")?;
+    let mut file = tmp.as_file();
 
-    tmp.write_all(&dsdiff)
-        .with_context(|| "写入 SACD DSDIFF 到临时文件失败")?;
-    tmp.as_file().sync_all()
-        .with_context(|| "sync SACD 临时文件失败")?;
+    let mut header = Vec::with_capacity(160);
+    write_tag(&mut header, b"FRM8");
+    header.extend_from_slice(&0u64.to_be_bytes()); // form_size 占位
+    write_tag(&mut header, b"DSD ");
+    // FVER chunk
+    write_tag(&mut header, b"FVER");
+    header.extend_from_slice(&4u64.to_be_bytes());
+    header.extend_from_slice(&DSDIFF_VERSION.to_be_bytes());
+    // PROP chunk（SND + FS + CHNL + CMPR）
+    let mut prop_body = Vec::with_capacity(64);
+    write_tag(&mut prop_body, b"SND ");
+    let mut fs_chunk = Vec::new();
+    write_chunk(
+        &mut fs_chunk,
+        b"FS  ",
+        &SACD_SAMPLING_FREQUENCY.to_be_bytes(),
+    );
+    prop_body.extend_from_slice(&fs_chunk);
+    let mut chnl_body = Vec::new();
+    let ids = channel_ids(disc.channel_count);
+    write_be_u16(&mut chnl_body, ids.len() as u16);
+    for id in &ids {
+        chnl_body.extend_from_slice(*id);
+    }
+    let mut chnl_chunk = Vec::new();
+    write_chunk(&mut chnl_chunk, b"CHNL", &chnl_body);
+    prop_body.extend_from_slice(&chnl_chunk);
+    let mut cmpr_body = Vec::with_capacity(8);
+    if is_dst {
+        write_tag(&mut cmpr_body, b"DST ");
+    } else {
+        write_tag(&mut cmpr_body, b"DSD ");
+    }
+    cmpr_body.push(3);
+    if is_dst {
+        cmpr_body.extend_from_slice(b"DST");
+    } else {
+        cmpr_body.extend_from_slice(b"DSD");
+    }
+    let mut cmpr_chunk = Vec::new();
+    write_chunk(&mut cmpr_chunk, b"CMPR", &cmpr_body);
+    prop_body.extend_from_slice(&cmpr_chunk);
+    let mut prop_chunk = Vec::new();
+    write_chunk(&mut prop_chunk, b"PROP", &prop_body);
+    header.extend_from_slice(&prop_chunk);
+    // payload chunk（DST = DSTF* + FRTE；DSD = raw 流），尺寸占位
+    if is_dst {
+        write_tag(&mut header, b"DST ");
+    } else {
+        write_tag(&mut header, b"DSD ");
+    }
+    header.extend_from_slice(&0u64.to_be_bytes()); // payload size 占位
+    file.write_all(&header)
+        .with_context(|| "写入 SACD DSDIFF 头部失败")?;
+    let fixed_form_body_len = (header.len() - 12) as u64;
+    let payload_size_offset = (header.len() - 8) as u64;
 
-    // 8. 释放 dsdiff Vec，此后只有临时文件在磁盘上
-    drop(dsdiff);
+    const BATCH_SECTORS: u32 = 128;
+    let mut assembler = DstFrameAssembler::new();
+    let mut sector_bad_reads = false;
+    let mut frame_count: u32 = 0;
+    let mut payload_body_len: u64 = 0;
+    let mut lsn = start_lsn;
+    let mut remaining = length_lsn;
 
-    // 9. seek 回文件开头，供 AudioReader 从头读取
+    while remaining > 0 {
+        let batch = remaining.min(BATCH_SECTORS);
+        let batch_start = lsn;
+        let sectors = reader
+            .read_sectors(lsn as u64, batch as u64)
+            .with_context(|| {
+                format!("读取 SACD 轨道扇区失败 lsn={batch_start} 剩余={remaining}")
+            })?;
+        lsn += batch;
+        remaining -= batch;
+        let count = (sectors.len() / SACD_LSN_SIZE) as u32;
+        for j in 0..count {
+            let sector = &sectors[j as usize * SACD_LSN_SIZE..(j + 1) as usize * SACD_LSN_SIZE];
+            let is_last = remaining == 0 && j == count - 1;
+            let bad = process_sacd_sector(
+                sector,
+                batch_start + j,
+                is_last,
+                disc.channel_count,
+                &mut assembler,
+                |frame| {
+                    if is_dst {
+                        // DSTF chunk（逐帧直写，奇长度补 1 字节 pad）
+                        file.write_all(b"DSTF")?;
+                        file.write_all(&(frame.len() as u64).to_be_bytes())?;
+                        file.write_all(&frame)?;
+                        if frame.len() % 2 == 1 {
+                            file.write_all(&[0])?;
+                        }
+                        payload_body_len += (12 + frame.len() + (frame.len() % 2)) as u64;
+                    } else {
+                        file.write_all(&frame)?;
+                        payload_body_len += frame.len() as u64;
+                    }
+                    frame_count += 1;
+                    Ok(())
+                },
+            )
+            .with_context(|| format!("提取 SACD 帧失败 track={}", vp.track_num))?;
+            sector_bad_reads |= bad;
+        }
+    }
+
+    if frame_count == 0 {
+        bail!(
+            "SACD 帧提取完成但无帧输出（sector_bad_reads={sector_bad_reads}，start_lsn={start_lsn}，length_lsn={length_lsn}）"
+        );
+    }
+
+    // DST 模式尾部追加 FRTE chunk（body 6 字节，偶数无 pad）
+    if is_dst {
+        let mut frte = Vec::with_capacity(18);
+        write_tag(&mut frte, b"FRTE");
+        frte.extend_from_slice(&6u64.to_be_bytes());
+        frte.extend_from_slice(&frame_count.to_be_bytes());
+        frte.extend_from_slice(&(SACD_FRAME_RATE as u16).to_be_bytes());
+        file.write_all(&frte)
+            .with_context(|| "写入 SACD DSDIFF FRTE 失败")?;
+        payload_body_len += frte.len() as u64;
+    }
+
+    // 回填 FRM8 form 尺寸与 payload chunk 尺寸
+    let form_size = fixed_form_body_len + 12 + payload_body_len;
+    file.seek(SeekFrom::Start(4))
+        .with_context(|| "seek SACD DSDIFF form 尺寸位失败")?;
+    file.write_all(&form_size.to_be_bytes())
+        .with_context(|| "回填 SACD DSDIFF form 尺寸失败")?;
+    file.seek(SeekFrom::Start(payload_size_offset))
+        .with_context(|| "seek SACD DSDIFF payload 尺寸位失败")?;
+    file.write_all(&payload_body_len.to_be_bytes())
+        .with_context(|| "回填 SACD DSDIFF payload 尺寸失败")?;
+
+    file.sync_all().with_context(|| "sync SACD 临时文件失败")?;
+
+    // seek 回文件开头，供 AudioReader 从头读取
     tmp.seek(SeekFrom::Start(0))
         .with_context(|| "seek SACD 临时文件到开头失败")?;
 
@@ -919,11 +1053,11 @@ pub fn extract_track_to_dsdiff_file(source: &str) -> Result<(NamedTempFile, Sacd
         iso_path = %vp.iso_path,
         track_num = vp.track_num,
         frame_format = ?disc.frame_format,
-        frames = frames_count,
+        frames = frame_count,
         channel_count = disc.channel_count,
-        dsdiff_size,
+        dsdiff_size = 12 + form_size,
         temp_path = %tmp.path().display(),
-        "SACD 轨道已提取为临时文件 DSDIFF（OOM 修复：避免内存 Cursor）",
+        "SACD 轨道已流式提取为临时文件 DSDIFF（分块读扇区，内存 O(1)）",
     );
 
     // P4 DEBUG：将生成的 DSDIFF 写入磁盘以便 ffprobe 调试
@@ -1041,9 +1175,7 @@ mod tests {
             .position(|w| w == b"FRTE")
             .expect("应有 FRTE chunk");
         let frte_offset = frte_pos + 4; // 跳过 "FRTE"
-        let size = u64::from_be_bytes(
-            dsdiff[frte_offset..frte_offset + 8].try_into().unwrap(),
-        );
+        let size = u64::from_be_bytes(dsdiff[frte_offset..frte_offset + 8].try_into().unwrap());
         assert_eq!(size, 6); // num_frames(4) + frame_rate(2)
         let num_frames = u32::from_be_bytes(
             dsdiff[frte_offset + 8..frte_offset + 12]
@@ -1126,9 +1258,15 @@ mod tests {
         assert!(s.contains("SND "), "原始 DSDIFF 应包含 SND chunk");
         assert!(s.contains("FS  "), "原始 DSDIFF 应包含 FS chunk");
         assert!(s.contains("CHNL"), "原始 DSDIFF 应包含 CHNL chunk");
-        assert!(s.contains("CMPR"), "原始 DSDIFF 必须包含 CMPR chunk（FFmpeg iff.c 识别 codec 必需）");
+        assert!(
+            s.contains("CMPR"),
+            "原始 DSDIFF 必须包含 CMPR chunk（FFmpeg iff.c 识别 codec 必需）"
+        );
         assert!(s.contains("DSD "), "原始 DSDIFF 应包含 DSD chunk");
-        assert!(!s.contains("FRTE"), "原始 DSDIFF 不应包含 FRTE chunk（仅 DST 格式生成）");
+        assert!(
+            !s.contains("FRTE"),
+            "原始 DSDIFF 不应包含 FRTE chunk（仅 DST 格式生成）"
+        );
         assert!(!s.contains("DSTF"), "原始 DSDIFF 不应包含 DSTF chunk");
 
         // 验证 CMPR chunk 的 body：tag="DSD " + count(1B=3) + "DSD"
@@ -1138,7 +1276,9 @@ mod tests {
             .expect("应有 CMPR chunk");
         let cmpr_size_offset = cmpr_pos + 4;
         let cmpr_size = u64::from_be_bytes(
-            dsdiff[cmpr_size_offset..cmpr_size_offset + 8].try_into().unwrap(),
+            dsdiff[cmpr_size_offset..cmpr_size_offset + 8]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(cmpr_size, 8); // "DSD "(4) + count(1) + "DSD"(3) = 8 字节
         let cmpr_body_offset = cmpr_size_offset + 8;
@@ -1156,7 +1296,9 @@ mod tests {
         // rposition 返回最后一次匹配位置，对应 form body 末尾的 DSD chunk
         let dsd_size_offset = dsd_chunk_pos + 4;
         let dsd_size = u64::from_be_bytes(
-            dsdiff[dsd_size_offset..dsd_size_offset + 8].try_into().unwrap(),
+            dsdiff[dsd_size_offset..dsd_size_offset + 8]
+                .try_into()
+                .unwrap(),
         );
         assert_eq!(dsd_size as usize, raw_dsd.len());
         let dsd_body_offset = dsd_size_offset + 8;

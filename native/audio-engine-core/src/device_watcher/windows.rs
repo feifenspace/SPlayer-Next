@@ -31,7 +31,9 @@ struct DeviceNotificationClient {
 
 impl DeviceNotificationClient {
     fn notify(&self, default_changed: bool) {
-        let _ = self.commands.try_send(WatchCommand::Changed(default_changed));
+        let _ = self
+            .commands
+            .try_send(WatchCommand::Changed(default_changed));
     }
 }
 
@@ -202,17 +204,26 @@ mod tests {
                 .OnDeviceStateChanged(PCWSTR::null(), DEVICE_STATE_ACTIVE)
                 .unwrap();
         }
-        assert!(matches!(receiver.try_recv(), Ok(WatchCommand::Changed(false))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WatchCommand::Changed(false))
+        ));
 
         unsafe {
             client.OnDeviceAdded(PCWSTR::null()).unwrap();
         }
-        assert!(matches!(receiver.try_recv(), Ok(WatchCommand::Changed(false))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WatchCommand::Changed(false))
+        ));
 
         unsafe {
             client.OnDeviceRemoved(PCWSTR::null()).unwrap();
         }
-        assert!(matches!(receiver.try_recv(), Ok(WatchCommand::Changed(false))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WatchCommand::Changed(false))
+        ));
 
         unsafe {
             client
@@ -239,6 +250,9 @@ mod tests {
                 .OnDefaultDeviceChanged(eRender, eConsole, PCWSTR::null())
                 .unwrap();
         }
-        assert!(matches!(receiver.try_recv(), Ok(WatchCommand::Changed(true))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WatchCommand::Changed(true))
+        ));
     }
 }

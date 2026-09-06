@@ -133,8 +133,14 @@ pub fn probe_fast_with_directory_cover(
                 .and_then(|dir| crate::metadata::extract_folder_cover_thumbnail(path, dir));
             return Some(ScannedTrack {
                 path: path.to_string(),
-                title: disc.album_title.clone().or_else(|| first_track.and_then(|t| t.title.clone())),
-                artist: disc.album_artist.clone().or_else(|| first_track.and_then(|t| t.artist.clone())),
+                title: disc
+                    .album_title
+                    .clone()
+                    .or_else(|| first_track.and_then(|t| t.title.clone())),
+                artist: disc
+                    .album_artist
+                    .clone()
+                    .or_else(|| first_track.and_then(|t| t.artist.clone())),
                 album: disc.album_title.clone(),
                 track: Some(1),
                 duration: total_dur,
@@ -443,7 +449,8 @@ pub fn scan_directories(
             .file_name()
             .map(|n| n.to_string_lossy().into_owned());
 
-        match probe_fast_with_directory_cover(path_str, cover_cache_dir, directory_cover.as_deref()) {
+        match probe_fast_with_directory_cover(path_str, cover_cache_dir, directory_cover.as_deref())
+        {
             Some(mut track) => {
                 track.file_size = *size;
                 track.mtime = *mtime;
@@ -576,7 +583,10 @@ pub fn probe_sacd_tracks(iso_path: &str, cover_cache_dir: Option<&str>) -> Vec<S
 
         tracks.push(ScannedTrack {
             path: virtual_path,
-            title: t.title.clone().or_else(|| Some(format!("Track {:02}", t.track_num))),
+            title: t
+                .title
+                .clone()
+                .or_else(|| Some(format!("Track {:02}", t.track_num))),
             artist: t.artist.clone().or_else(|| disc.album_artist.clone()),
             album: disc.album_title.clone(),
             track: Some(t.track_num as u16),

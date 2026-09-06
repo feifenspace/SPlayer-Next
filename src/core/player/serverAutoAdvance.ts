@@ -60,12 +60,10 @@ export const maybeRegisterNextCandidate = (): void => {
   // 本曲候选已注册可用音源：不再重算（在线直链解析/预载切换不做反复覆盖）
   if (registeredNext?.track.id === candidate.track.id && registeredForSource !== null) return;
 
-  // 音源解析：优先预载链路的已解析 URL（在线源），回退本地/CUE。
-  // 裸 track id 不能作为候选——服务端只认 URL/绝对路径/cue://，注册了也必在曲终加载失败
+  // 音源解析：优先预载链路的已解析 URL（在线源），回退 track.path。
+  // cueAudioPath 是母版路径（展示/库字段），作加载源会从母版 0:00 出声，永远不进候选
   const resolvedSource =
-    peekNextTrackPreload(candidate.track)?.source?.source ??
-    candidate.track.cueAudioPath ??
-    candidate.track.path;
+    peekNextTrackPreload(candidate.track)?.source?.source ?? candidate.track.path;
   if (resolvedSource) {
     registerCandidate(candidate, buildStagingSource(candidate.track, resolvedSource));
     return;

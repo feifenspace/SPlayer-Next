@@ -9,8 +9,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, ensure, Context, Result};
 use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
+use anyhow::{bail, ensure, Context, Result};
 
 /// DSD 专用静音字节（PDM 零电平）。
 ///
@@ -76,10 +76,9 @@ impl DirectDsdReader {
         if let Some(sacd_info) = crate::sacd::parse_sacd_virtual_path(&path_str) {
             return Self::open_sacd(&sacd_info.iso_path, &path_str);
         }
-        let lower = path_str.to_lowercase();
-        if lower.ends_with(".iso") {
-            let virtual_path = format!("{}|Track01|0.0|0|0|0|0", path_str);
-            return Self::open_sacd(&path_str, &virtual_path);
+        // 裸 ISO 无法定位轨道（零 LSN 虚拟轨必失败），fail loud 拒绝（H2.4）
+        if path_str.to_lowercase().ends_with(".iso") {
+            bail!("SACD ISO 需经曲库虚拟轨播放，不支持裸路径: {path_str}");
         }
 
         let mut file = File::open(path).context("打开 Source Direct DSD 文件失败")?;
@@ -113,7 +112,6 @@ impl DirectDsdReader {
         })
     }
 
-
     pub fn format(&self) -> DirectDsdFormat {
         self.format
     }
@@ -142,7 +140,6 @@ impl DirectDsdReader {
             DirectDsdLayout::Sacd { source } => source.duration_secs,
         }
     }
-
 
     pub fn seek_seconds(&mut self, position_secs: f64) -> Result<f64> {
         ensure!(
@@ -215,7 +212,6 @@ impl DirectDsdReader {
             }
         };
 
-
         Ok(actual_bits as f64 / bit_rate as f64)
     }
 
@@ -232,7 +228,10 @@ impl DirectDsdReader {
                     return Ok(None);
                 }
                 let channels = usize::from(self.format.channels);
-                ensure!(*skip_per_channel < *block_size, "DSF seek block offset 无效");
+                ensure!(
+                    *skip_per_channel < *block_size,
+                    "DSF seek block offset 无效"
+                );
                 let valid_per_channel =
                     (*remaining_per_channel).min(*block_size - *skip_per_channel);
                 ensure!(
@@ -304,7 +303,6 @@ impl DirectDsdReader {
             }
         }
     }
-
 
     fn open_dsf(mut file: File, file_len: usize) -> Result<Self> {
         let mut header = [0_u8; 28];
@@ -619,7 +617,10 @@ const PRE_MUTE_WINDOW_MS: u64 = 80;
 /// 进程内单调毫秒时钟（pre-mute 窗口用，不受系统墙钟跳变影响）
 fn mono_millis() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 const SLOT_FREE: u8 = 0;
 const SLOT_FILLING: u8 = 1;
@@ -673,10 +674,13 @@ enum DirectDsdCommand {
     },
     ReplaceLocal {
         source: String,
+        start_secs: f64,
         response: mpsc::SyncSender<Result<DirectDsdFormat>>,
     },
     StageLocal {
         path: PathBuf,
+        start_secs: f64,
+        duration_micros: u64,
         generation: u64,
         response: mpsc::SyncSender<Result<()>>,
     },
@@ -743,7 +747,10 @@ impl DirectDsdRing {
     /// 状态变化通知：取一次锁再释放后 notify，保证不会丢失在等待方进入之前。
     /// 供 SDK 回调线程调用：仅一次短暂锁 + futex wake，无分配，实时安全。
     fn notify_state(&self) {
-        let _guard = self.signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self
+            .signal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.signal_cv.notify_all();
     }
 
@@ -757,7 +764,10 @@ impl DirectDsdRing {
     /// 谓词只依赖 ring 自身状态；等待方返回后应回到命令循环保持命令响应性。
     fn wait_for(&self, predicate: impl Fn(&Self) -> bool, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let mut guard = self.signal.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self
+            .signal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
             if predicate(self) {
                 return true;
@@ -931,14 +941,23 @@ struct StagedDsdSource {
 
 fn prepare_staged_dsd_source(
     path: &Path,
+    start_secs: f64,
     current_format: DirectDsdFormat,
+    duration_micros: u64,
     generation: u64,
 ) -> Result<StagedDsdSource> {
-    let reader = DirectDsdReader::open_local(path)?;
+    let mut reader = DirectDsdReader::open_local(path)?;
+    if start_secs > 0.0 {
+        reader.seek_seconds(start_secs)?;
+    }
     let format = reader.format();
-    let duration_micros = (reader.duration_secs() * 1_000_000.0)
-        .round()
-        .clamp(0.0, u64::MAX as f64) as u64;
+    let duration_micros = if duration_micros > 0 {
+        duration_micros
+    } else {
+        (reader.duration_secs() * 1_000_000.0)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64
+    };
     ensure!(
         same_dsd_transport(current_format, format),
         "[Direct] staged Native DSD wire format 与当前 Diretta connection 不一致"
@@ -974,11 +993,15 @@ fn install_staged_dsd_slot(
 
 fn replace_dsd_ring(
     source: &str,
+    start_secs: f64,
     ring: &DirectDsdRing,
     current_format: DirectDsdFormat,
     wire_bit_order: DirectDsdBitOrder,
 ) -> Result<(DirectDsdReader, DirectDsdFormat)> {
     let mut reader = DirectDsdReader::open_local(Path::new(source))?;
+    if start_secs > 0.0 {
+        reader.seek_seconds(start_secs)?;
+    }
     let new_format = reader.format();
     ensure!(
         same_dsd_transport(current_format, new_format),
@@ -1016,9 +1039,7 @@ pub struct DirectDsdMonitor {
 
 impl DirectDsdMonitor {
     pub fn consumed_position(&self) -> f64 {
-        self.ring
-            .consumed_bits_per_channel
-            .load(Ordering::Acquire) as f64
+        self.ring.consumed_bits_per_channel.load(Ordering::Acquire) as f64
             / f64::from(self.bit_rate)
     }
 
@@ -1085,11 +1106,26 @@ pub struct DirectDsdStageHandle {
 }
 
 impl DirectDsdStageHandle {
-    pub fn stage_local(&self, path: &Path, _duration_secs: f64, generation: u64) -> Result<()> {
+    pub fn stage_local(
+        &self,
+        path: &Path,
+        start_secs: f64,
+        duration_secs: f64,
+        generation: u64,
+    ) -> Result<()> {
+        let duration_micros = if duration_secs > 0.0 {
+            (duration_secs * 1_000_000.0)
+                .round()
+                .clamp(0.0, u64::MAX as f64) as u64
+        } else {
+            0
+        };
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
             .send(DirectDsdCommand::StageLocal {
                 path: path.to_owned(),
+                start_secs,
+                duration_micros,
                 generation,
                 response: response_tx,
             })
@@ -1131,7 +1167,8 @@ impl DirectDsdSource {
         };
         let format = reader.format();
         let ring = Arc::new(DirectDsdRing::new(reader.max_output_len()));
-        ring.duration_micros.store(duration_micros, Ordering::Release);
+        ring.duration_micros
+            .store(duration_micros, Ordering::Release);
         fill_slot(&mut reader, &ring.slots[0], format.bit_order)?
             .context("Native DSD 音源没有可播放 payload")?;
 
@@ -1192,9 +1229,14 @@ impl DirectDsdSource {
                             next_slot = 1 % producer_ring.slots.len();
                             continue;
                         }
-                        Ok(DirectDsdCommand::ReplaceLocal { source, response }) => {
+                        Ok(DirectDsdCommand::ReplaceLocal {
+                            source,
+                            start_secs,
+                            response,
+                        }) => {
                             let result = replace_dsd_ring(
                                 &source,
+                                start_secs,
                                 &producer_ring,
                                 active_format,
                                 wire_bit_order,
@@ -1215,10 +1257,18 @@ impl DirectDsdSource {
                         }
                         Ok(DirectDsdCommand::StageLocal {
                             path,
+                            start_secs,
+                            duration_micros,
                             generation,
                             response,
                         }) => {
-                            match prepare_staged_dsd_source(&path, active_format, generation) {
+                            match prepare_staged_dsd_source(
+                                &path,
+                                start_secs,
+                                active_format,
+                                duration_micros,
+                                generation,
+                            ) {
                                 Ok(candidate) => {
                                     staged = Some(candidate);
                                     let _ = response.send(Ok(()));
@@ -1424,11 +1474,16 @@ impl DirectDsdSource {
             .context("等待 Native DSD seek 结果失败")?
     }
 
-    pub fn replace_drained_local(&mut self, source: &str) -> Result<DirectDsdFormat> {
+    pub fn replace_drained_local(
+        &mut self,
+        source: &str,
+        start_secs: f64,
+    ) -> Result<DirectDsdFormat> {
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
             .send(DirectDsdCommand::ReplaceLocal {
                 source: source.to_owned(),
+                start_secs,
                 response: response_tx,
             })
             .context("提交 Native DSD handoff 失败")?;
@@ -1815,9 +1870,7 @@ mod tests {
         assert_eq!(actual, 0.0);
         let mut data = ptr::null();
         let mut len = 0_usize;
-        assert!(unsafe {
-            direct_dsd_next_block(source.callback_context(), &mut data, &mut len)
-        });
+        assert!(unsafe { direct_dsd_next_block(source.callback_context(), &mut data, &mut len) });
         assert_eq!(source.consumed_position(), 0.0);
         unsafe { direct_dsd_release_block(source.callback_context()) };
         let expected_position = 64.0 / 2_822_400.0;
@@ -1838,10 +1891,11 @@ mod tests {
         assert_eq!(source.callback_context(), context_before);
         let mut data = ptr::null();
         let mut len = 0_usize;
-        assert!(unsafe {
-            direct_dsd_next_block(source.callback_context(), &mut data, &mut len)
-        });
-        assert_eq!(unsafe { std::slice::from_raw_parts(data, len) }, expected_tail);
+        assert!(unsafe { direct_dsd_next_block(source.callback_context(), &mut data, &mut len) });
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(data, len) },
+            expected_tail
+        );
         unsafe { direct_dsd_release_block(source.callback_context()) };
     }
 
@@ -1850,21 +1904,23 @@ mod tests {
         let (first_bytes, _) = dsf_fixture(64);
         let (mut second_bytes, _) = dsf_fixture(64);
         let second_raw = [
-            0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
-            0xab, 0xcd, 0xef,
+            0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xab,
+            0xcd, 0xef,
         ];
         let raw_start = second_bytes.len() - second_raw.len();
         second_bytes[raw_start..].copy_from_slice(&second_raw);
         let expected = [
-            0xaa, 0xbb, 0xcc, 0xdd, 0x55, 0x66, 0x77, 0x88, 0x11, 0x22, 0x33, 0x44, 0x99,
-            0xab, 0xcd, 0xef,
+            0xaa, 0xbb, 0xcc, 0xdd, 0x55, 0x66, 0x77, 0x88, 0x11, 0x22, 0x33, 0x44, 0x99, 0xab,
+            0xcd, 0xef,
         ];
         let first = TempDsdFile::new("dsf", &first_bytes);
         let second = TempDsdFile::new("dsf", &second_bytes);
         let mut source = DirectDsdSource::open_local(&first.path).unwrap();
         let context = source.callback_context();
 
-        let format = source.replace_drained_local(&second.path.to_string_lossy()).unwrap();
+        let format = source
+            .replace_drained_local(&second.path.to_string_lossy(), 0.0)
+            .unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(format.bit_rate, 2_822_400);
         assert_eq!(format.channels, 2);
@@ -1872,9 +1928,7 @@ mod tests {
 
         let mut data = ptr::null();
         let mut len = 0_usize;
-        assert!(unsafe {
-            direct_dsd_next_block(source.callback_context(), &mut data, &mut len)
-        });
+        assert!(unsafe { direct_dsd_next_block(source.callback_context(), &mut data, &mut len) });
         assert_eq!(unsafe { std::slice::from_raw_parts(data, len) }, expected);
         unsafe { direct_dsd_release_block(source.callback_context()) };
 
@@ -1895,7 +1949,9 @@ mod tests {
         let mut source = DirectDsdSource::open_local(&dsf.path).unwrap();
         let context = source.callback_context();
 
-        let format = source.replace_drained_local(&dff.path.to_string_lossy()).unwrap();
+        let format = source
+            .replace_drained_local(&dff.path.to_string_lossy(), 0.0)
+            .unwrap();
         assert_eq!(source.callback_context(), context);
         assert_eq!(format.bit_order, DirectDsdBitOrder::MsbFirst);
         assert!(!source.failed());
@@ -1947,7 +2003,7 @@ mod tests {
         let monitor = source.monitor();
         source
             .stage_handle()
-            .stage_local(&second.path, 2.0, 9)
+            .stage_local(&second.path, 0.0, 0.0, 9)
             .unwrap();
 
         let mut collected = Vec::new();
@@ -1956,9 +2012,7 @@ mod tests {
         while collected.len() < target_len && std::time::Instant::now() < deadline {
             let mut data = ptr::null();
             let mut len = 0_usize;
-            if unsafe {
-                direct_dsd_next_block(source.callback_context(), &mut data, &mut len)
-            } {
+            if unsafe { direct_dsd_next_block(source.callback_context(), &mut data, &mut len) } {
                 collected.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
             } else {
                 thread::sleep(Duration::from_millis(1));
@@ -1972,6 +2026,44 @@ mod tests {
         assert_eq!(monitor.transition_count(), 1);
         assert_eq!(monitor.boundary_generation(), 9);
         assert!((monitor.duration() - 64.0 / 2_822_400.0).abs() < 0.000_001);
+    }
+
+    /// CUE 虚拟轨 staging 语义：带 start_secs 的 staged 源从轨内偏移出样，
+    /// 而非物理文件 0:00（H1.1 回归；DSD reader 自带字节精确 seek）
+    #[test]
+    fn staged_dsd_source_locates_to_the_requested_start_offset() {
+        let (first_bytes, first_expected) = dsf_fixture(64);
+        let (second_bytes, second_expected) = dsf_fixture(64);
+        let first = TempDsdFile::new("dsf", &first_bytes);
+        let second = TempDsdFile::new("dsf", &second_bytes);
+        let source = DirectDsdSource::open_local(&first.path).unwrap();
+        let monitor = source.monitor();
+        // 32 bit：seek_seconds 的 32bit 组对齐落点，交付 second 的后半
+        let start_secs = 32.0 / 2_822_400.0;
+        source
+            .stage_handle()
+            .stage_local(&second.path, start_secs, 0.0, 9)
+            .unwrap();
+
+        let mut collected = Vec::new();
+        let target_len = first_expected.len() + second_expected[8..].len();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while collected.len() < target_len && std::time::Instant::now() < deadline {
+            let mut data = ptr::null();
+            let mut len = 0_usize;
+            if unsafe { direct_dsd_next_block(source.callback_context(), &mut data, &mut len) } {
+                collected.extend_from_slice(unsafe { std::slice::from_raw_parts(data, len) });
+                unsafe { direct_dsd_release_block(source.callback_context()) };
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        let mut expected = first_expected;
+        expected.extend_from_slice(&second_expected[8..]);
+        assert_eq!(collected, expected);
+        assert_eq!(monitor.transition_count(), 1);
+        assert_eq!(monitor.boundary_generation(), 9);
     }
 
     #[test]
@@ -1991,7 +2083,9 @@ mod tests {
         // 模拟播放中记录的块几何 + 换源/seek 触发的 pre-mute 窗口
         ring.last_delivered_len.store(1024, Ordering::Relaxed);
         ring.trigger_pre_mute();
-        let block = ring.next_block().expect("pre-mute 窗口内应交付 0x69 静音块");
+        let block = ring
+            .next_block()
+            .expect("pre-mute 窗口内应交付 0x69 静音块");
         assert_eq!(block.len, 1024);
         assert!(unsafe { std::slice::from_raw_parts(block.data, block.len) }
             .iter()

@@ -130,7 +130,14 @@ const stageCandidate = (
 
   void (async () => {
     try {
-      const result = await window.api.player.stageDirectNext(source, duration, generation);
+      // 候选元数据随 stage 直传（H1.5）：boundary 转正时 now-playing 立即正确，
+      // 不再依赖服务端 probe（probe 无法解析管道/CUE 虚拟格式）
+      const result = await window.api.player.stageDirectNext(source, duration, generation, {
+        title: track.title ?? null,
+        artist: track.artists.map((artist) => artist.name).join(" / ") || null,
+        album: track.album?.name ?? null,
+        cover: track.cover ?? null,
+      });
       if (!result.success || !result.data) {
         // 非 Direct runtime 或引擎拒绝（如 PCM→DSD 需重协商）：本曲内不再尝试
         stageUnavailable = true;
@@ -210,12 +217,17 @@ export const advanceGaplessBoundary = async (
   void coverLoader.loadCoverForTrack(track);
   extractColorFromUrl(track.cover ?? track.coverOriginal ?? null);
 
-  // 向引擎 commit；source 需与 stage 时一致，优先读预载缓存中已解析音源
+  // 向引擎 commit；source 需与 stage 时一致，优先读预载缓存中已解析音源。
+  // cueAudioPath 是母版路径，作 commit 源会重放整张母版，永不使用
   const peeked = peekNextTrackPreload(track);
   const commitSource = peeked?.source
     ? buildStagingSource(track, peeked.source.source)
-    : (track.cueAudioPath ?? track.path ?? track.id);
-  await window.api.player.commitDirectBoundary(commitSource, status.duration / 1000).catch(() => {});
+    : track.path;
+  if (commitSource) {
+    await window.api.player
+      .commitDirectBoundary(commitSource, status.duration / 1000)
+      .catch(() => {});
+  }
 
   // 预载缓存已消费，为新的当前曲调度下一下一曲预载
   invalidateNextTrackPreload();

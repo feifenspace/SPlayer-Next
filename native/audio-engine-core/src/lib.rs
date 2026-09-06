@@ -36,16 +36,16 @@ pub mod shared;
 pub mod source;
 pub mod tempo;
 
+pub use direct_runtime::{DirectLoadOutcome, LoadSuperseded};
 pub use error::AudioEngineError;
 pub use ffmpeg_audio::{self, HttpCancelHandle};
 pub use fft::FftAnalyzer;
-pub use direct_runtime::{DirectLoadOutcome, LoadSuperseded};
 pub use metadata::{
     cover_thumb_path, db_to_linear, extract_embedded_lyric, extract_replay_gain,
     find_all_external_lyrics, make_thumbnail_jpeg, AudioMetadata, StreamInfo,
 };
 pub use player::{
-    DIRECT_FADE_DRAIN_MIN_BLOCKS, DIRECT_FADE_DRAIN_TIMEOUT, EventEmitter, InnerPlayer, PlayerEvent,
-    PlayerState,
+    EventEmitter, InnerPlayer, PlayerEvent, PlayerState, DIRECT_FADE_DRAIN_MIN_BLOCKS,
+    DIRECT_FADE_DRAIN_TIMEOUT,
 };
 pub use shared::{AudioChunk, PopResult, Shared};

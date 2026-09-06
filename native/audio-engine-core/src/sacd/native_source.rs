@@ -35,7 +35,6 @@ use super::source::parse_sacd_virtual_path;
 
 use crate::dsd::interleaved_1byte_to_block32_in_place;
 
-
 // ─────────────────────────────────────────────────────────────────
 // 常量（与 source.rs 严格对齐）
 // ─────────────────────────────────────────────────────────────────
@@ -201,7 +200,7 @@ pub struct SacdNativeSource {
     dst_decoder: Option<DstDecoder>,
 
     /// 已就绪的 DSD 帧队列（1-byte 交错 + MSB-first，待 Block32 转换）
-    decoded_queue: VecDeque<Vec<u8>>,
+    decoded_queue: VecDeque<(Vec<u8>, bool)>,
 
     /// 流结束标志
     eof: bool,
@@ -258,12 +257,8 @@ impl SacdNativeSource {
         let channels = disc_channel_count as u16;
         let duration_secs = vp.duration_secs;
 
-        // 仅支持 stereo（interleaved_1byte_to_block32_in_place 当前仅支持 2 声道）
-        ensure!(
-            channels == 2,
-            "SACD 原生路径当前仅支持 stereo（2 声道），实际声道数: {}",
-            channels
-        );
+        // 声道数取 ISO area 实际值（H2.1）：multichannel ISO 不再被硬性拒绝；
+        // Target 不支持该声道数时由 Diretta open 的格式协商显式报错
 
         let iso_reader = IsoReader::open(iso_path_ref)
             .with_context(|| format!("打开 SACD ISO 失败: {}", iso_path_ref.display()))?;
@@ -306,14 +301,17 @@ impl SacdNativeSource {
         })
     }
 
-
     /// 解析当前扇区，把音频包喂给 frame_assembler，输出完整帧列表。
     ///
     /// 逻辑移植自 `source.rs::extract_dst_frames` 的单扇区处理段（line 524-688）。
     fn parse_current_sector(&mut self) -> Result<Vec<Vec<u8>>> {
         let mut frames_out: Vec<Vec<u8>> = Vec::new();
         let sector = self.sector_buf.as_slice();
-        ensure!(sector.len() == SACD_LSN_SIZE, "扇区长度异常: {}", sector.len());
+        ensure!(
+            sector.len() == SACD_LSN_SIZE,
+            "扇区长度异常: {}",
+            sector.len()
+        );
 
         // ---- 1. 解析 audio_frame_header_t（1 字节 LE bitfield）----
         let header_byte = sector[0];
@@ -414,8 +412,7 @@ impl SacdNativeSource {
                         if !self.frame_assembler.append_packet(packet_data) {
                             warn!(
                                 size = self.frame_assembler.size(),
-                                packet_length,
-                                "SACD DST 帧缓冲溢出，丢弃当前帧"
+                                packet_length, "SACD DST 帧缓冲溢出，丢弃当前帧"
                             );
                         }
                     }
@@ -452,8 +449,8 @@ impl SacdNativeSource {
                 if let Some(decoder) = &mut self.dst_decoder {
                     decoder.submit(&frame);
                     // 立即 poll 已就绪的解码帧（避免队列无限膨胀）
-                    while let Some(dsd_frame) = decoder.next_decoded() {
-                        self.decoded_queue.push_back(dsd_frame);
+                    while let Some((dsd_frame, errored)) = decoder.next_decoded() {
+                        self.decoded_queue.push_back((dsd_frame, errored));
                     }
                 } else {
                     warn!("DST 帧收到但解码器未初始化，丢弃");
@@ -461,7 +458,7 @@ impl SacdNativeSource {
             }
             FrameFormat::Dsd3In14 | FrameFormat::Dsd3In16 => {
                 // 原始 DSD 字节，无需解码
-                self.decoded_queue.push_back(frame);
+                self.decoded_queue.push_back((frame, false));
             }
         }
         Ok(())
@@ -486,17 +483,36 @@ impl SacdNativeSource {
         Ok(true)
     }
 
+    /// DST 错误帧处理：libdstdec 解码失败时递送的垫帧是 0x55 全幅 Nyquist
+    /// 方波（dst_fram.c memset），覆写为 0x69 DSD 静音后照常进入输出链（H2.3）
+    fn silence_errored_frame(&self, mut dsd_frame: Vec<u8>, errored: bool) -> Vec<u8> {
+        if !errored {
+            return dsd_frame;
+        }
+        let len = dsd_frame.len();
+        dsd_frame
+            .iter_mut()
+            .for_each(|byte| *byte = DSD_SILENCE_BYTE);
+        warn!(
+            target: "audio::decoder::dsd::sacd",
+            len,
+            total_errors = self.dst_decoder.as_ref().map(|d| d.error_count()).unwrap_or(0),
+            "DST 错误帧已覆写为 0x69 静音"
+        );
+        dsd_frame
+    }
+
     /// 把 1-byte 交错 + MSB-first 的 DSD 帧转为 InterleavedBlock32 格式。
     ///
-    /// - 输入：`[L0 R0 L1 R1 …]`（DST 解码或 DSD 3-in-14/16 原始输出）
-    /// - 输出：`[L0 L1 L2 L3 R0 R1 R2 R3 …]`（Diretta Block32）
+    /// - 输入：`[ch0 ch1 … chN-1] × t`（DST 解码或 DSD 3-in-14/16 原始输出）
+    /// - 输出：`[ch0_t0..t3, ch1_t0..t3, …]`（Diretta Block32，组宽 4×声道数）
     ///
-    /// 末块若不足 8 字节倍数，用 `0x69`（DSD 静音）padding。
+    /// 末块若不足组宽倍数，用 `0x69`（DSD 静音）padding。
     fn convert_to_block32(&self, mut dsd_frame: Vec<u8>) -> Result<Vec<u8>> {
-        let rem = dsd_frame.len() % 8;
+        let group = 4 * usize::from(self.channels);
+        let rem = dsd_frame.len() % group;
         if rem != 0 {
-            let pad = 8 - rem;
-            dsd_frame.extend(std::iter::repeat(DSD_SILENCE_BYTE).take(pad));
+            dsd_frame.extend(std::iter::repeat(DSD_SILENCE_BYTE).take(group - rem));
         }
         interleaved_1byte_to_block32_in_place(&mut dsd_frame, self.channels)?;
         Ok(dsd_frame)
@@ -509,8 +525,10 @@ impl SacdNativeSource {
     /// - `Ok(None)`：EOF
     pub fn next_block(&mut self) -> Result<Option<Vec<u8>>> {
         // 1. 优先消费已就绪的解码帧
-        if let Some(dsd_frame) = self.decoded_queue.pop_front() {
-            return Ok(Some(self.convert_to_block32(dsd_frame)?));
+        if let Some((dsd_frame, errored)) = self.decoded_queue.pop_front() {
+            return Ok(Some(self.convert_to_block32(
+                self.silence_errored_frame(dsd_frame, errored),
+            )?));
         }
 
         // 2. 持续读取扇区 + 解析 + 解码，直到有帧就绪或 EOF
@@ -529,21 +547,25 @@ impl SacdNativeSource {
             }
 
             // 检查是否有解码帧就绪
-            if let Some(dsd_frame) = self.decoded_queue.pop_front() {
-                return Ok(Some(self.convert_to_block32(dsd_frame)?));
+            if let Some((dsd_frame, errored)) = self.decoded_queue.pop_front() {
+                return Ok(Some(self.convert_to_block32(
+                    self.silence_errored_frame(dsd_frame, errored),
+                )?));
             }
         }
 
         // 3. EOF：flush DST 解码器，取出剩余解码帧
         if let Some(decoder) = &mut self.dst_decoder {
             decoder.flush();
-            while let Some(dsd_frame) = decoder.next_decoded() {
-                self.decoded_queue.push_back(dsd_frame);
+            while let Some((dsd_frame, errored)) = decoder.next_decoded() {
+                self.decoded_queue.push_back((dsd_frame, errored));
             }
         }
 
-        if let Some(dsd_frame) = self.decoded_queue.pop_front() {
-            return Ok(Some(self.convert_to_block32(dsd_frame)?));
+        if let Some((dsd_frame, errored)) = self.decoded_queue.pop_front() {
+            return Ok(Some(self.convert_to_block32(
+                self.silence_errored_frame(dsd_frame, errored),
+            )?));
         }
 
         Ok(None)
@@ -581,9 +603,8 @@ impl SacdNativeSource {
 
         // 重建 DST 解码器（旧解码器 flush 后已销毁，无法复用）
         if self.frame_format == FrameFormat::Dst {
-            self.dst_decoder = Some(
-                DstDecoder::new(self.disc_channel_count).context("重建 DST 解码器失败")?,
-            );
+            self.dst_decoder =
+                Some(DstDecoder::new(self.disc_channel_count).context("重建 DST 解码器失败")?);
         }
 
         debug!(
@@ -619,9 +640,9 @@ mod tests {
         // 2 channels: bits[1:0] = 00 or 11
         assert_eq!(parse_channel_count(0b000_00_00), 2); // 0x00
         assert_eq!(parse_channel_count(0b000_11_11), 2); // 0x0F
-        // 5 channels: bit0=1, bit1=0
+                                                         // 5 channels: bit0=1, bit1=0
         assert_eq!(parse_channel_count(0b000_00_01), 5); // 0x01
-        // 6 channels: bit0=0, bit1=1
+                                                         // 6 channels: bit0=0, bit1=1
         assert_eq!(parse_channel_count(0b000_00_10), 6); // 0x02
     }
 

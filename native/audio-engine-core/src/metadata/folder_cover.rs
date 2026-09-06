@@ -8,8 +8,20 @@ use std::path::{Path, PathBuf};
 
 /// 按优先级排列的封面文件名关键词列表（不含扩展名，大小写不敏感）
 const COVER_NAMES: &[&str] = &[
-    "cover", "folder", "front", "album", "cd", "cd1", "cd2", "cdimage",
-    "back", "disc", "封面", "封套", "试音极品", "试音",
+    "cover",
+    "folder",
+    "front",
+    "album",
+    "cd",
+    "cd1",
+    "cd2",
+    "cdimage",
+    "back",
+    "disc",
+    "封面",
+    "封套",
+    "试音极品",
+    "试音",
 ];
 
 /// 支持的图片扩展名
@@ -17,7 +29,8 @@ const COVER_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp"];
 
 /// 常见的封面子目录名称
 const COVER_SUB_DIRS: &[&str] = &[
-    "Artwork", "Scans", "Covers", "Pictures", "封面", "artwork", "scans", "covers", "pictures", "scan", "pic",
+    "Artwork", "Scans", "Covers", "Pictures", "封面", "artwork", "scans", "covers", "pictures",
+    "scan", "pic",
 ];
 
 /// 在音频/CUE文件所在目录及子目录、上级目录查找封面图片。
@@ -33,7 +46,11 @@ const COVER_SUB_DIRS: &[&str] = &[
 /// @returns 找到的封面图片路径，未找到返回 None
 pub fn find_folder_cover(audio_path: &str) -> Option<PathBuf> {
     let audio = Path::new(audio_path);
-    let dir = if audio.is_dir() { audio } else { audio.parent()? };
+    let dir = if audio.is_dir() {
+        audio
+    } else {
+        audio.parent()?
+    };
 
     if !dir.is_dir() {
         return None;
@@ -69,7 +86,11 @@ pub fn find_folder_cover(audio_path: &str) -> Option<PathBuf> {
     // 4. 检查上级目录 (处理 CUE 或音频位于子目录的情况)
     if let Some(parent) = dir.parent() {
         let parent_name = parent.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if !parent_name.is_empty() && parent_name != "music" && parent_name != "media" && parent_name != "/" {
+        if !parent_name.is_empty()
+            && parent_name != "music"
+            && parent_name != "media"
+            && parent_name != "/"
+        {
             if let Some(path) = search_dir_for_cover(parent, false) {
                 return Some(path);
             }

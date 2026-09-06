@@ -9,8 +9,8 @@ pub mod source;
 pub use iso_reader::{IsoReader, SACD_LSN_SIZE};
 pub use native_source::SacdNativeSource;
 pub use scarletbook::{
-    decode_sacd_text, probe_sacd_iso, FrameFormat, SacdDisc, SacdTrack,
-    SACD_FRAME_RATE, SACD_SAMPLING_FREQUENCY, START_OF_MASTER_TOC,
+    decode_sacd_text, probe_sacd_iso, FrameFormat, SacdDisc, SacdTrack, SACD_FRAME_RATE,
+    SACD_SAMPLING_FREQUENCY, START_OF_MASTER_TOC,
 };
 pub use source::{extract_track_to_dsdiff_file, parse_sacd_virtual_path, SacdVirtualPath};
 

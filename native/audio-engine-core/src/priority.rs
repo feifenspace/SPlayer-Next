@@ -51,9 +51,7 @@ mod imp {
         let mut has_freq_info = false;
 
         for cpu in 0..nproc {
-            let path = format!(
-                "/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
-            );
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq");
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(freq) = content.trim().parse::<u64>() {
                     freq_map[cpu] = Some(freq);
@@ -81,9 +79,7 @@ mod imp {
         let mut seen_core_ids = std::collections::HashSet::new();
         let mut physical_cores: Vec<u32> = Vec::new();
         for cpu in 0..nproc {
-            let path = format!(
-                "/sys/devices/system/cpu/cpu{cpu}/topology/core_id"
-            );
+            let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/core_id");
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(core_id) = content.trim().parse::<u32>() {
                     if seen_core_ids.insert(core_id) {
@@ -117,9 +113,8 @@ mod imp {
         for &cpu in &perf_cores {
             unsafe { libc::CPU_SET(cpu as usize, &mut cpu_set) };
         }
-        let ret = unsafe {
-            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpu_set)
-        };
+        let ret =
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpu_set) };
         if ret == 0 {
             debug!(thread = name, cores = ?perf_cores, "CPU 亲和力：已绑定到性能核");
         } else {
@@ -141,15 +136,14 @@ mod imp {
         let param = libc::sched_param {
             sched_priority: AUDIO_RT_PRIORITY,
         };
-        let ret = unsafe {
-            libc::pthread_setschedparam(
-                libc::pthread_self(),
-                libc::SCHED_FIFO,
-                &param,
-            )
-        };
+        let ret =
+            unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
         if ret == 0 {
-            debug!(thread = name, priority = AUDIO_RT_PRIORITY, "SCHED_FIFO 实时调度已启用");
+            debug!(
+                thread = name,
+                priority = AUDIO_RT_PRIORITY,
+                "SCHED_FIFO 实时调度已启用"
+            );
         } else {
             warn!(
                 thread = name,

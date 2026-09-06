@@ -162,16 +162,20 @@ pub fn probe_metadata(
     cancel_handle: HttpCancelHandle,
 ) -> Result<AudioMetadata> {
     if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
-        let cover = cover_cache_dir.and_then(|dir| {
-            crate::metadata::extract_folder_cover_thumbnail(&sacd.iso_path, dir)
-        });
+        let cover = cover_cache_dir
+            .and_then(|dir| crate::metadata::extract_folder_cover_thumbnail(&sacd.iso_path, dir));
+        // 声道数读 ISO area 实际值（H2.1），失败即报错不猜测
+        let disc = crate::sacd::probe_sacd_iso(&sacd.iso_path)
+            .map_err(|e| anyhow::anyhow!("SACD ISO 探测失败（{}）: {e}", sacd.iso_path))?;
+        let channels = u16::from(disc.channel_count);
+        let bit_rate = 2_822_400 * i64::from(channels);
         return Ok(AudioMetadata {
             duration_secs: sacd.duration_secs,
             sample_rate: 2_822_400,
             original_sample_rate: 2_822_400,
-            channels: 2,
+            channels,
             bits_per_sample: 1,
-            bit_rate: 2_822_400 * 2,
+            bit_rate,
             codec: "sacd_dsd".to_string(),
             title: Some(format!("Track {:02}", sacd.track_num)),
             artist: None,
@@ -183,7 +187,6 @@ pub fn probe_metadata(
             external_lyrics: Vec::new(),
         });
     }
-
 
     Ok(prepare_decode(source, cover_cache_dir, cancel_handle)?.into_metadata())
 }
@@ -198,7 +201,34 @@ pub fn prepare_decode(
     cancel_handle: HttpCancelHandle,
 ) -> Result<PreparedDecoder> {
     let (reader, cancel_handle) = open_source(source, cancel_handle)?;
+    prepare_from_opened(reader, cancel_handle, source, cover_cache_dir)
+}
 
+/// L2 纯内存播放：整曲已物化进 RAM 缓冲的解码准备。
+/// `source` 仍传原始路径/CUE 管道路径，仅用于标签、封面、歌词与 CUE 时长解析
+/// （载入期一次性磁盘读，播放期零 IO）；CUE 轨在 Reader 内做 demuxer 级定位
+pub fn prepare_decode_from_ram(
+    ram: crate::ram_buffer::RamTrackBuffer,
+    source: &str,
+    cover_cache_dir: Option<&str>,
+) -> Result<PreparedDecoder> {
+    let mut reader = AudioReader::new(ram).context("打开 RAM 物化音源失败")?;
+    if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
+        if cue.start_time > 0.0 {
+            reader
+                .seek(Duration::from_secs_f64(cue.start_time), SeekMode::Accurate)
+                .with_context(|| format!("RAM 音源 CUE 定位失败: {source}"))?;
+        }
+    }
+    prepare_from_opened(reader, None, source, cover_cache_dir)
+}
+
+fn prepare_from_opened(
+    reader: AudioReader,
+    cancel_handle: Option<HttpCancelHandle>,
+    source: &str,
+    cover_cache_dir: Option<&str>,
+) -> Result<PreparedDecoder> {
     let info = reader.source_info();
     let cue_info = crate::cue::parse_cue_virtual_path(source);
     let mut duration_secs = reader.duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
@@ -440,7 +470,6 @@ fn open_source(
         return Ok((reader, None));
     }
 
-
     let (reader, cancel) = if source.starts_with("http://") || source.starts_with("https://") {
         let http = HttpAudioSource::new_with_cancel_handle(source, &cancel_handle)?;
         let reader =
@@ -498,7 +527,10 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
     // CUE 边界限制（最大解码播放样本总数）
     let max_player_samples = data.cue_info.as_ref().and_then(|cue| {
         if cue.duration > 0.0 {
-            Some((cue.duration * shared.sample_rate() as f64 * shared.channels() as f64).round() as u64)
+            Some(
+                (cue.duration * shared.sample_rate() as f64 * shared.channels() as f64).round()
+                    as u64,
+            )
         } else {
             None
         }
@@ -516,7 +548,10 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
 
         if let Some(max) = max_player_samples {
             if total_player_samples >= max {
-                debug!("CUE 分轨播放已达指定时长上限 ({} samples)，结束当前音轨解码", max);
+                debug!(
+                    "CUE 分轨播放已达指定时长上限 ({} samples)，结束当前音轨解码",
+                    max
+                );
                 break;
             }
         }

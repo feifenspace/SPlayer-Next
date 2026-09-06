@@ -71,7 +71,9 @@ impl DirectMonitor {
             Self::Dsd(value) => value.consumed_position(),
             #[cfg(test)]
             Self::Fake(value) => {
-                value.position_micros.load(std::sync::atomic::Ordering::Acquire) as f64
+                value
+                    .position_micros
+                    .load(std::sync::atomic::Ordering::Acquire) as f64
                     / 1_000_000.0
             }
         }
@@ -180,7 +182,7 @@ impl DirectStageHandle {
         if source.starts_with("http://") || source.starts_with("https://") {
             bail!("[Direct] 当前 gapless staging 仅支持本地 seekable 音源");
         }
-        let (path_str, _start, cue_dur) =
+        let (path_str, start, cue_dur) =
             if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
                 (
                     cue.physical_path,
@@ -201,7 +203,6 @@ impl DirectStageHandle {
                         duration_secs
                     },
                 )
-
             } else {
                 (source.to_owned(), 0.0, duration_secs)
             };
@@ -220,13 +221,13 @@ impl DirectStageHandle {
                 if is_dsd {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
-                value.stage_local(path, cue_dur, generation)
+                value.stage_local(path, start, cue_dur, generation)
             }
             Self::Dsd(value) => {
                 if !is_dsd {
                     bail!("[Direct] Native DSD → PCM 需要重新协商 Diretta connection");
                 }
-                value.stage_local(path, cue_dur, generation)
+                value.stage_local(path, start, cue_dur, generation)
             }
         }
     }
@@ -335,6 +336,8 @@ pub struct DirectPlayback {
     duration: f64,
     seek_base: f64,
     seek_transition_count: u64,
+    /// 当前源在物理文件内的起始偏移（CUE 虚拟轨 > 0）：seek 目标与 seek_base 换算基准
+    start_offset: f64,
     #[cfg(feature = "diretta")]
     selector: String,
     #[cfg(feature = "diretta")]
@@ -375,7 +378,6 @@ impl DirectPlayback {
                         duration
                     },
                 )
-
             } else {
                 (source.to_owned(), 0.0, duration)
             };
@@ -390,15 +392,23 @@ impl DirectPlayback {
             || path_str.contains(".iso|")
             || path_str.contains(".ISO|");
 
-        let (transport, seek_base) =
-            if is_dsd {
-                let (connection, actual_position) =
-                    DirettaDirectDsdConnection::open_local_at(selector, path, cue_start + position_secs)?;
-                (DirectTransport::Dsd(connection), (actual_position - cue_start).max(0.0))
-            } else {
+        let (transport, seek_base) = if is_dsd {
+            let (connection, actual_position) = DirettaDirectDsdConnection::open_local_at(
+                selector,
+                path,
+                cue_start + position_secs,
+            )?;
+            (
+                DirectTransport::Dsd(connection),
+                (actual_position - cue_start).max(0.0),
+            )
+        } else {
             let (connection, actual_position) =
                 DirettaDirectConnection::open_local_at(selector, path, cue_start + position_secs)?;
-            (DirectTransport::Pcm(connection), (actual_position - cue_start).max(0.0))
+            (
+                DirectTransport::Pcm(connection),
+                (actual_position - cue_start).max(0.0),
+            )
         };
 
         let final_duration = match &transport {
@@ -421,6 +431,7 @@ impl DirectPlayback {
             duration: final_duration,
             seek_base,
             seek_transition_count: 0,
+            start_offset: cue_start,
             selector: selector.to_owned(),
             source: source.to_owned(),
             transport,
@@ -441,10 +452,69 @@ impl DirectPlayback {
         duration: f64,
         auto_play: bool,
     ) -> Result<Self> {
+        Self::open_reader_with_offset(selector, source, reader, duration, 0.0, 0.0, auto_play)
+    }
+
+    /// 以 Reader 打开并做启动验证（L2 纯内存播放路径）。
+    /// `start_offset_secs` 为源在 Reader 内容内的起点（CUE 轨 = 母版内偏移，
+    /// 非 CUE 传 0）：demuxer 级精确定位，且作为后续 seek 的坐标基准。
+    /// 消费方需已把整曲物化进 Reader（读侧全量可用，无供数等待）
+    #[cfg(feature = "diretta")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_reader_verified(
+        selector: &str,
+        source: &str,
+        reader: Box<dyn crate::direct_pcm::ReadSeek>,
+        duration: f64,
+        start_offset_secs: f64,
+        auto_play: bool,
+        load_token: &std::sync::atomic::AtomicU64,
+        token: u64,
+    ) -> Result<Self> {
+        let mut playback = Self::open_reader_with_offset(
+            selector,
+            source,
+            reader,
+            duration,
+            start_offset_secs,
+            start_offset_secs,
+            auto_play,
+        )?;
+        if !auto_play {
+            return Ok(playback);
+        }
+        match playback.wait_for_direct_start(load_token, token) {
+            Ok(true) => Ok(playback),
+            Ok(false) => {
+                let _ = playback.pause();
+                bail!("[Device] Diretta 连接未开始消费音频");
+            }
+            Err(error) => {
+                let _ = playback.pause();
+                Err(error)
+            }
+        }
+    }
+
+    /// Reader 打开核心：position_secs 为 demuxer 级定位目标，start_offset 为
+    /// 轨内坐标基准（seek_base / 后续 seek 换算使用）
+    #[cfg(feature = "diretta")]
+    fn open_reader_with_offset(
+        selector: &str,
+        source: &str,
+        reader: Box<dyn crate::direct_pcm::ReadSeek>,
+        duration: f64,
+        position_secs: f64,
+        start_offset_secs: f64,
+        auto_play: bool,
+    ) -> Result<Self> {
         let (transport, seek_base) = {
             let (connection, actual_position) =
-                DirettaDirectConnection::open_reader_at(selector, reader, 0.0)?;
-            (DirectTransport::Pcm(connection), actual_position.max(0.0))
+                DirettaDirectConnection::open_reader_at(selector, reader, position_secs)?;
+            (
+                DirectTransport::Pcm(connection),
+                (actual_position - start_offset_secs).max(0.0),
+            )
         };
         let final_duration = match &transport {
             DirectTransport::Pcm(value) => {
@@ -457,6 +527,7 @@ impl DirectPlayback {
             duration: final_duration,
             seek_base,
             seek_transition_count: 0,
+            start_offset: start_offset_secs,
             selector: selector.to_owned(),
             source: source.to_owned(),
             transport,
@@ -474,7 +545,7 @@ impl DirectPlayback {
         duration: f64,
         cancel: crate::ffmpeg_audio::HttpCancelHandle,
     ) -> Result<DirectFormat> {
-        let (path_str, _cue_start, cue_dur) =
+        let (path_str, cue_start, cue_dur) =
             if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
                 (
                     cue.physical_path,
@@ -495,7 +566,6 @@ impl DirectPlayback {
                         duration
                     },
                 )
-
             } else {
                 (source.to_owned(), 0.0, duration)
             };
@@ -509,47 +579,53 @@ impl DirectPlayback {
             || path_str.contains(".iso|")
             || path_str.contains(".ISO|");
 
+        // set_duration 必须先于 replace：slot 的 boundary_duration 在 replace 内发布，
+        // 后设只改 ring 值会在边界消费时被旧时长覆盖
         let format = match &mut self.transport {
             DirectTransport::Pcm(value) => {
                 if is_dsd {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_drained_local_source(&path_str, cancel)?;
                 value.set_duration(cue_dur);
+                let format = value.replace_drained_local_source(&path_str, cue_start, cancel)?;
                 DirectFormat::Pcm(format)
             }
             DirectTransport::Dsd(value) => {
                 if !is_dsd {
                     bail!("[Direct] Native DSD → PCM 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_drained_local_source(&path_str)?;
+                let format = value.replace_drained_local_source(&path_str, cue_start)?;
                 DirectFormat::Dsd(format)
             }
         };
         self.source = source.to_owned();
         self.duration = cue_dur;
+        self.start_offset = cue_start;
         self.seek_base = 0.0;
         self.seek_transition_count = self.monitor().transition_count();
         Ok(format)
     }
+    /// 轨内 seek（position_secs 为轨内相对位置）：物理定位需加 start_offset，
+    /// 返回值与 seek_base 同步换算回轨内坐标
     pub fn seek_while_paused(&mut self, position_secs: f64) -> Result<f64> {
+        let physical_target = self.start_offset + position_secs.max(0.0);
         let actual_position = match &mut self.transport {
             #[cfg(feature = "diretta")]
-            DirectTransport::Pcm(value) => value.seek_while_paused(position_secs)?,
+            DirectTransport::Pcm(value) => value.seek_while_paused(physical_target)?,
             #[cfg(feature = "diretta")]
-            DirectTransport::Dsd(value) => value.seek_while_paused(position_secs)?,
+            DirectTransport::Dsd(value) => value.seek_while_paused(physical_target)?,
             #[cfg(all(test, not(feature = "diretta")))]
             DirectTransport::Fake(value) => {
                 value
                     .position_micros
                     .store(0, std::sync::atomic::Ordering::Release);
-                position_secs
+                physical_target
             }
         };
 
-        self.seek_base = actual_position;
+        self.seek_base = actual_position - self.start_offset;
         self.seek_transition_count = self.monitor().transition_count();
-        Ok(actual_position)
+        Ok(self.seek_base)
     }
 
     pub fn play(&mut self) -> Result<()> {
@@ -667,8 +743,11 @@ impl DirectPlayback {
         duration: f64,
         cancel: crate::ffmpeg_audio::HttpCancelHandle,
     ) -> Result<DirectFormat> {
-        let _ = (source, cancel);
+        let _ = cancel;
         self.duration = duration;
+        self.start_offset = crate::cue::parse_cue_virtual_path(source)
+            .map(|cue| cue.start_time)
+            .unwrap_or(0.0);
         self.seek_base = 0.0;
         Ok(DirectFormat::Pcm(DirectPcmFormat {
             sample_rate: 44_100,
@@ -747,6 +826,9 @@ impl DirectPlayback {
     pub fn commit_gapless_boundary(&mut self, source: &str, duration: f64) {
         self.source = source.to_owned();
         self.duration = duration;
+        self.start_offset = crate::cue::parse_cue_virtual_path(source)
+            .map(|cue| cue.start_time)
+            .unwrap_or(0.0);
         self.seek_base = 0.0;
         self.seek_transition_count = self.monitor().transition_count();
     }
@@ -780,6 +862,7 @@ impl DirectPlayback {
             duration,
             seek_base: 0.0,
             seek_transition_count: 0,
+            start_offset: 0.0,
             transport: DirectTransport::Fake(state),
         }
     }

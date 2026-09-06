@@ -167,9 +167,8 @@ mod imp {
         let target = selector_target(target_id).unwrap_or(target_id);
         let c_target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
         let mut raw = SPlayerDirettaTargetCaps::default();
-        let ok = unsafe {
-            splayer_diretta_query_target_caps(c_target.as_ptr(), &mut raw as *mut _)
-        };
+        let ok =
+            unsafe { splayer_diretta_query_target_caps(c_target.as_ptr(), &mut raw as *mut _) };
         if !ok {
             return Err(last_error("failed to query Diretta target capabilities"));
         }
@@ -237,7 +236,11 @@ mod imp {
                     } else {
                         name
                     },
-                    ipv6_addr: if ipv6_addr.is_empty() { id.clone() } else { ipv6_addr },
+                    ipv6_addr: if ipv6_addr.is_empty() {
+                        id.clone()
+                    } else {
+                        ipv6_addr
+                    },
                     full_addr: if full_addr.is_empty() { id } else { full_addr },
                     if_idx: device.if_idx,
                     target_name,
@@ -298,8 +301,7 @@ mod imp {
             let target = selector_target(selector)
                 .ok_or_else(|| anyhow!("invalid Diretta output selector"))?;
             let target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
-            let (source, actual_position) =
-                DirectPcmSource::open_reader_at(reader, position_secs)?;
+            let (source, actual_position) = DirectPcmSource::open_reader_at(reader, position_secs)?;
             let format = source.format();
             let raw = unsafe {
                 splayer_diretta_open_direct(
@@ -344,9 +346,11 @@ mod imp {
         pub fn replace_drained_local_source(
             &mut self,
             source: &str,
+            start_secs: f64,
             cancel: crate::ffmpeg_audio::HttpCancelHandle,
         ) -> Result<DirectPcmFormat> {
-            self.source.replace_drained_local(source, cancel)
+            self.source
+                .replace_drained_local(source, start_secs, cancel)
         }
 
         pub fn failed(&self) -> bool {
@@ -481,8 +485,9 @@ mod imp {
         pub fn replace_drained_local_source(
             &mut self,
             source: &str,
+            start_secs: f64,
         ) -> Result<DirectDsdFormat> {
-            self.source.replace_drained_local(source)
+            self.source.replace_drained_local(source, start_secs)
         }
 
         pub fn failed(&self) -> bool {
