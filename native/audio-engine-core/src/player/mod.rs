@@ -324,6 +324,25 @@ impl InnerPlayer {
         Ok(())
     }
 
+    /// alsammap 位纯真门槛（B1.1，语义平移自 validate_direct_entry）：
+    /// 音量≠100% 或 DSP 开启时拒绝 MMAP 直出，调用方据此自动降级 cpal 路径
+    pub fn validate_alsammap_entry(&self) -> Result<()> {
+        if (self.target_volume - 1.0).abs() > f32::EPSILON {
+            anyhow::bail!("位纯真直出要求软件音量为 100%；当前音量将降级 cpal 输出");
+        }
+        if self.normalization_enabled {
+            anyhow::bail!("位纯真直出不允许 ReplayGain/Normalization；当前设置将降级 cpal 输出");
+        }
+        if self.equalizer.lock().enabled() {
+            anyhow::bail!("位纯真直出不允许 EQ；当前设置将降级 cpal 输出");
+        }
+        let tempo = self.tempo.lock();
+        if (tempo.speed() - 1.0).abs() > f32::EPSILON || tempo.pitch() != 0 {
+            anyhow::bail!("位纯真直出不允许 tempo/pitch 处理；请先恢复原速原调");
+        }
+        Ok(())
+    }
+
     fn reject_direct_sample_change(&self, action: &str) -> Result<()> {
         if self.direct_active() || self.direct_mode_selected() {
             anyhow::bail!(

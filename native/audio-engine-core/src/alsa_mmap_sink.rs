@@ -23,6 +23,15 @@ use crate::audio_output::OutputFailureCallback;
 use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
 use crate::source::DecoderSource;
 
+/// 全进程累计 XRUN 计数（B9.6）：供 B2.2 观测钩子周期采样，
+/// 汇入 §六.2 拷机判据（xrun_count=0）
+static XRUN_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 进程启动以来累计的 ALSA MMAP XRUN 次数
+pub fn xrun_total() -> u64 {
+    XRUN_TOTAL.load(Ordering::Acquire)
+}
+
 /// 连续致命错误阈值：超过后判定输出链路故障并上报（触发 OutputStalled 重建链路）
 const MAX_CONTIGUOUS_ERRORS: u32 = 50;
 /// 设备事件等待上限（毫秒）：决定 play/pause 指令的响应延迟上界
@@ -253,6 +262,7 @@ fn write_loop(
             State::XRun => {
                 // 修正蓝图示例缺陷 3：XRUN 先 prepare 再重试，不作为错误中断
                 xrun_count += 1;
+                XRUN_TOTAL.fetch_add(1, Ordering::Release);
                 pcm.prepare()?;
                 continue;
             }
@@ -274,6 +284,7 @@ fn write_loop(
             Err(err) => {
                 if pcm.state() == State::XRun {
                     xrun_count += 1;
+                    XRUN_TOTAL.fetch_add(1, Ordering::Release);
                     pcm.prepare()?;
                     continue;
                 }
@@ -349,6 +360,35 @@ fn write_loop(
 
 /// 整数源解码的 f32 归一化是除以 2^(n-1)，回写必须乘同系数：
 /// 乘 32767/8388607 会引入 0.003% 失真，破坏位纯真（§六.1 回录哈希不过）
+/// 枚举 ALSA hw 直出设备（"hw:X,Y"），供 devices 端点合成 alsammap 条目。
+/// 枚举失败（权限/无声卡）返回空列表，best-effort 不构成错误
+pub fn list_hw_devices() -> Vec<(String, String)> {
+    let Some(iface) = std::ffi::CString::new("pcm").ok() else {
+        return Vec::new();
+    };
+    let Ok(iter) = alsa::device_name::HintIter::new(None, &iface) else {
+        return Vec::new();
+    };
+    iter.filter_map(|hint| {
+        if matches!(hint.direction, Some(Direction::Capture)) {
+            return None;
+        }
+        let name = hint.name?;
+        if !name.starts_with("hw:") {
+            return None;
+        }
+        let desc = hint
+            .desc
+            .unwrap_or_else(|| name.clone())
+            .lines()
+            .next()
+            .unwrap_or(&name)
+            .to_owned();
+        Some((name, desc))
+    })
+    .collect()
+}
+
 fn to_i16(v: f32) -> i16 {
     (v * 32768.0).round().clamp(-32768.0, 32767.0) as i16
 }

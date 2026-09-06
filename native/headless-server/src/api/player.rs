@@ -92,8 +92,18 @@ pub(crate) async fn status_handler(State(state): State<AppState>) -> Result<Json
 /// 输出设备列表（D.3 前置落地）：包装引擎 list_output_devices，
 /// ALSA MMAP 后端（B9）落地后在此追加 mmap 能力标志，响应形状不变
 pub(crate) async fn devices_handler() -> Result<Json<PlayerResponse>, ApiError> {
-    let devices = spawn_isolated_blocking("player-devices-worker", || {
-        audio_engine_core::audio_output::list_output_devices()
+    let devices = spawn_isolated_blocking("player-devices-worker", move || {
+        let mut devices = audio_engine_core::audio_output::list_output_devices();
+        // ALSA MMAP 直出设备并入同一列表：id 带 alsammap: 前缀即可直接选用，
+        // UI 无需改版（B9 后追加的能力可见性）
+        for (name, desc) in audio_engine_core::alsa_mmap_sink::list_hw_devices() {
+            devices.push((
+                format!("alsammap:{name}"),
+                format!("{desc} · ALSA MMAP 直出"),
+                false,
+            ));
+        }
+        devices
     })
     .await
     .map_err(|e| ApiError::internal(e))?;
@@ -104,6 +114,7 @@ pub(crate) async fn devices_handler() -> Result<Json<PlayerResponse>, ApiError> 
                 "id": id,
                 "name": name,
                 "is_default": is_default,
+                "mmap": id.starts_with("alsammap:"),
             }))
             .collect::<Vec<_>>(),
     }))))
@@ -354,7 +365,17 @@ fn reserve_player_for_load(
     handle: audio_engine_core::HttpCancelHandle,
 ) -> Result<LoadReservation, ApiError> {
     let mut player = state.player.lock();
-    let device_name = player.selected_device().map(String::from);
+    let mut device_name = player.selected_device().map(String::from);
+    // B1.1 位纯真门槛：alsammap 选择下音量≠100%/DSP 开启时自动降级 cpal
+    // 默认设备（文档 B9.4）；音量恢复 100% 后下一次 load 自动回到 MMAP
+    if let Some(ref selector) = device_name {
+        if selector.starts_with("alsammap:") {
+            if let Err(reason) = player.validate_alsammap_entry() {
+                tracing::warn!(selector = %selector, reason = %reason, "alsammap 降级 cpal 默认设备");
+                device_name = None;
+            }
+        }
+    }
     let direct_selector = device_name
         .as_deref()
         .filter(|v| audio_engine_core::diretta::selector_target(v).is_some())
