@@ -695,6 +695,11 @@ extern "C" bool splayer_diretta_query_target_caps(const char* target_id,
     // MS mode 位图
     out_caps->support_ms_mode = info.supportMSmode;
 
+    // Sink 延迟（B7.2，单位 100 微秒）
+    out_caps->latency_buffer_x100us = info.latencyBuffer;
+    out_caps->latency_max_x100us = info.latencyMax;
+    out_caps->latency_hw_x100us = info.latencyHw;
+
     // 9. 固件版本（Find::FwVersion），失败不致命
     std::string fw_version;
     if (find.FwVersion(target, fw_version)) {

@@ -111,6 +111,12 @@ typedef struct {
     // MS (Multi-Stream) 模式支持位图
     // bit0: MS1, bit1: MS2, bit2: MS3(DDS)
     uint16_t support_ms_mode;
+
+    // Sink 延迟（B7.2，单位 100 微秒）：进度按 DAC 实际出声时刻校准、
+    // pre-mute 窗自适应的数据来源
+    uint16_t latency_buffer_x100us;  // sink 缓冲延迟
+    uint16_t latency_max_x100us;     // sink 最大延迟
+    uint16_t latency_hw_x100us;      // sink 硬件延迟
 } SPlayerDirettaTargetCaps;
 
 // 查询目标设备能力（同步阻塞，约 2-3 秒）

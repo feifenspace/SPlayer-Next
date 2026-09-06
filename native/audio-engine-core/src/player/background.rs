@@ -88,6 +88,34 @@ impl InnerPlayer {
     }
 
     /// 启动位置推送定时器（在独立线程中运行，每 200ms 推送一次位置）
+    /// B2.2 观测钩子：每 150 tick（约 30s）采样一次 RSS 与位置，
+    /// 作为 §六.2 拷机（RSS 平稳）与 §六.4 内存审计的数据源
+    fn observation_tick(position_secs: f64, ticks: &mut u32) {
+        *ticks += 1;
+        if *ticks % 150 != 0 {
+            return;
+        }
+        let rss_mib = std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| {
+                s.split_whitespace()
+                    .nth(1)
+                    .and_then(|p| p.parse::<u64>().ok())
+            })
+            .map(|pages| pages * 4096 / 1024 / 1024);
+
+        #[cfg(target_os = "linux")]
+        tracing::info!(
+            target: "audio::obs",
+            position_secs,
+            rss_mib,
+            xrun_total = crate::alsa_mmap_sink::xrun_total(),
+            "播放观测采样"
+        );
+        #[cfg(not(target_os = "linux"))]
+        tracing::info!(target: "audio::obs", position_secs, rss_mib, "播放观测采样");
+    }
+
     pub(super) fn start_position_timer(&mut self) {
         self.stop_position_timer();
 
@@ -110,6 +138,7 @@ impl InnerPlayer {
                 let mut last_consumed = 0.0_f64;
                 let mut first_consumed_seen = false;
                 let mut stall_ticks: u32 = 0;
+                let mut obs_ticks: u32 = 0;
                 while !stop_flag.load(Ordering::Relaxed) {
                     let transition_count = monitor.transition_count();
                     if transition_count != last_transition_count {
@@ -128,6 +157,7 @@ impl InnerPlayer {
                     };
                     let duration = monitor.duration();
                     cb(PlayerEvent::Position { position, duration });
+                    Self::observation_tick(position, &mut obs_ticks);
                     if monitor.failed() {
                         cb(PlayerEvent::SourceError);
                         cb(PlayerEvent::StateChanged {
@@ -187,10 +217,12 @@ impl InnerPlayer {
             let mut last_consumed = shared.samples_consumed_count();
             let mut stall_ticks: u32 = 0;
 
+            let mut obs_ticks: u32 = 0;
             while !stop_flag.load(Ordering::Relaxed) {
                 let consumed = shared.samples_consumed_count();
                 let position = seek_base + shared.consumed_position();
                 cb(PlayerEvent::Position { position, duration });
+                Self::observation_tick(position, &mut obs_ticks);
 
                 // 检测播放结束：all_consumed 表示输出回调已消费完所有数据
                 if shared.is_all_consumed() {

@@ -89,6 +89,12 @@ pub struct DirettaTargetCapabilities {
 
     /// MS 模式支持位图
     pub support_ms_mode: u16,
+    /// Sink 缓冲延迟（100µs 单位，B7.2）：进度按 DAC 实际出声时刻校准的数据来源
+    pub latency_buffer_x100us: u16,
+    /// Sink 最大延迟（100µs 单位）
+    pub latency_max_x100us: u16,
+    /// Sink 硬件延迟（100µs 单位）
+    pub latency_hw_x100us: u16,
 }
 
 pub fn selector_target(selector: &str) -> Option<&str> {
@@ -201,6 +207,9 @@ mod imp {
             mtu_max: raw.mtu_max,
             max_packet_size: u32::from(raw.max_size),
             support_ms_mode: raw.support_ms_mode,
+            latency_buffer_x100us: raw.latency_buffer_x100us,
+            latency_max_x100us: raw.latency_max_x100us,
+            latency_hw_x100us: raw.latency_hw_x100us,
         })
     }
 

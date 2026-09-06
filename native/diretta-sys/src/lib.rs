@@ -72,10 +72,15 @@ pub struct SPlayerDirettaTargetCaps {
     pub max_size: u16,
 
     pub support_ms_mode: u16,
+
+    pub latency_buffer_x100us: u16,
+    pub latency_max_x100us: u16,
+    pub latency_hw_x100us: u16,
 }
 
 impl Default for SPlayerDirettaTargetCaps {
     fn default() -> Self {
+
         // 固定宽度 C 结构：全零即"未知/不支持"
         // SAFETY: 结构体仅由 POD（整数与 c_char 数组）组成，全零位模式有效
         unsafe { std::mem::zeroed() }
