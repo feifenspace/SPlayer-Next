@@ -98,10 +98,8 @@ const _: fn() = || {
 };
 
 /// Direct 关流排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
-#[cfg(any(feature = "diretta", test))]
 pub const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
 /// Direct 关流排空的事件等待上限（超时兜底，正常远快于此值）
-#[cfg(any(feature = "diretta", test))]
 pub const DIRECT_FADE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
 
 impl InnerPlayer {

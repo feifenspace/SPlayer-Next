@@ -609,7 +609,7 @@ impl DirectPlayback {
     /// 返回值与 seek_base 同步换算回轨内坐标
     pub fn seek_while_paused(&mut self, position_secs: f64) -> Result<f64> {
         let physical_target = self.start_offset + position_secs.max(0.0);
-        let actual_position = match &mut self.transport {
+        let actual_position: f64 = match &mut self.transport {
             #[cfg(feature = "diretta")]
             DirectTransport::Pcm(value) => value.seek_while_paused(physical_target)?,
             #[cfg(feature = "diretta")]
@@ -621,6 +621,8 @@ impl DirectPlayback {
                     .store(0, std::sync::atomic::Ordering::Release);
                 physical_target
             }
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         };
 
         self.seek_base = actual_position - self.start_offset;
@@ -641,6 +643,8 @@ impl DirectPlayback {
                     .store(true, std::sync::atomic::Ordering::Release);
                 Ok(())
             }
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
 
@@ -657,6 +661,8 @@ impl DirectPlayback {
                     .store(false, std::sync::atomic::Ordering::Release);
                 Ok(())
             }
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
 
@@ -710,6 +716,7 @@ impl DirectPlayback {
 
     /// open_local + 启动验证：auto_play 时等待首块被消费，失败/超时先优雅暂停
     /// 再报错（连接随本值 drop 关闭）。非播放加载（auto_play=false）跳过验证
+    #[cfg(feature = "diretta")]
     pub fn open_verified_local(
         selector: &str,
         source: &str,
@@ -774,6 +781,8 @@ impl DirectPlayback {
                 sample_format: crate::direct_pcm::DirectPcmSampleFormat::Signed16,
                 memory_path: crate::direct_pcm::DirectPcmMemoryPath::ZeroCopyPacked,
             }),
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
 
@@ -785,6 +794,8 @@ impl DirectPlayback {
             DirectTransport::Dsd(value) => DirectMonitor::Dsd(value.monitor()),
             #[cfg(all(test, not(feature = "diretta")))]
             DirectTransport::Fake(value) => DirectMonitor::Fake(std::sync::Arc::clone(value)),
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
 

@@ -15,7 +15,7 @@ ffmpeg_audio = { version = "0.3.1", default-features = false, features = [
 ] }
 libc = "0.2"
 parking_lot = "0.12"
-diretta-sys = { path = "../diretta-sys" }
+diretta-sys = { path = "../diretta-sys", optional = true }
 
 # 错误处理
 anyhow = { workspace = true }
@@ -88,7 +88,7 @@ pulseaudio = ["cpal/pulseaudio"]
 napi = ["pipewire", "pulseaudio"]
 headless = ["diretta"]
 windows_device = []
-diretta = []
+diretta = ["dep:diretta-sys"]
 
 [dev-dependencies]
 base64 = "0.22"

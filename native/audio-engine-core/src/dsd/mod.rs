@@ -6,6 +6,7 @@
 //! 3. Diretta 零拷贝 Native DSD 直通与通用 PCM 抽取降采样 (DSD-to-PCM)。
 
 pub mod dff;
+pub mod dop_pack;
 pub mod dsd2pcm;
 pub mod dsf;
 
@@ -88,7 +89,7 @@ pub fn reverse_byte(b: u8) -> u8 {
     BIT_REVERSE_LUT[b as usize]
 }
 
-/// 原地重排 1-byte 交错 DSD 流为 Diretta 要求的 InterleavedBlock32。
+// 原地重排 1-byte 交错 DSD 流为 Diretta 要求的 InterleavedBlock32。
 /// 2ch（L4R4）: [L0 R0 L1 R1 L2 R2 L3 R3] → [L0 L1 L2 L3 R0 R1 R2 R3]
 /// N ch 推广: 每 4 个样本时间槽内按声道分组 [ch0_t0..t3, ch1_t0..t3, …]
 pub fn interleaved_1byte_to_block32_in_place(data: &mut [u8], channels: u16) -> anyhow::Result<()> {

@@ -1638,7 +1638,7 @@ struct DirectPcmFadeState {
     sample_bits: AtomicU8,
     /// 有效位宽（s24-in-s32 传输槽时为 24，其余等于 sample_bits）
     valid_bits: AtomicU8,
-    /// 淡出窗长度（样本数，约 20ms）
+    /// 淡出窗长度（样本数，升余弦 10ms）
     window_samples: AtomicUsize,
 }
 
@@ -1656,14 +1656,15 @@ impl DirectPcmFadeState {
         }
     }
 
-    /// 启动淡出：按采样率换算约 20ms 的线性渐零窗，随后块为静音
+    /// 启动淡出：按采样率换算 10ms 升余弦渐零窗（§3.5），随后块为静音
     fn begin_fade_out(&self, sample_bits: u8, valid_bits: u8, sample_rate: u32) {
         if self.silent.load(Ordering::Acquire) {
             return;
         }
         self.sample_bits.store(sample_bits, Ordering::Release);
         self.valid_bits.store(valid_bits, Ordering::Release);
-        let window = (sample_rate as usize).saturating_mul(20) / 1000;
+        // 蓝图 §3.5：升余弦淡出窗 10ms（原线性 20ms）
+        let window = (sample_rate as usize).saturating_mul(10) / 1000;
         self.window_samples.store(window.max(1), Ordering::Release);
         let current = self.gain_end_micro.load(Ordering::Acquire);
         self.gain_start_micro.store(current, Ordering::Release);
@@ -1828,7 +1829,9 @@ impl DirectPcmRing {
             if i >= window {
                 end_gain
             } else {
-                start_gain + (end_gain - start_gain) * (i as f64) / (window as f64)
+                // 升余弦（B3.1）：端点斜率为零，消除线性包络折角的高频调制杂散
+                let phase = std::f64::consts::PI * i as f64 / window as f64;
+                end_gain + (start_gain - end_gain) * 0.5 * (1.0 + phase.cos())
             }
         };
         let scale = |i: usize, sample: i64| -> i64 {
