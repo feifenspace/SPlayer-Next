@@ -40,7 +40,7 @@ usage() {
     echo "用法: $0 [选项]"
     echo
     echo "选项:"
-    echo "  --arch <variant>       CPU 微架构: v1, v2, v3, v4, zen4, auto, all (默认交互选择或 v2)"
+    echo "  --arch <variant>       CPU 微架构: v2, v3, v4, zen4, auto, all (默认交互选择或 v2)"
     echo "  --sdk-dir <path>       指定 DirettaHostSDK 路径"
     echo "  --sdk-version <ver>    指定 Diretta SDK 版本（如 150/149/148）"
     echo "  --output-dir <path>    发布包输出根目录（默认 /home/songlian）"
@@ -161,7 +161,7 @@ ARG_COUNT=$#
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)
-            [[ $# -ge 2 ]] || fatal "--arch 需要参数 (v1, v2, v3, v4, zen4, auto, all)"
+            [[ $# -ge 2 ]] || fatal "--arch 需要参数 (v2, v3, v4, zen4, auto, all)"
             TARGET_CPU_ARCH="$2"
             shift 2
             ;;
@@ -297,10 +297,6 @@ package_single_arch() {
     local arch_desc=""
 
     case "$arch_var" in
-        v1)
-            rust_target_cpu="x86-64"
-            arch_desc="x86-64 基线版（无 SSE4.2/POPCNT/CMPXCHG16B 要求，支持 J1900/Atom x5 系/v1 级老 CPU）"
-            ;;
         v2)
             rust_target_cpu="x86-64-v2"
             arch_desc="x86-64-v2 通用兼容版（广泛支持 J4125/N5105/N100/虚拟机等无 AVX2 设备）"
