@@ -82,14 +82,21 @@ pub(crate) async fn diretta_select_handler(
             || trimmed == "system-default"
         {
             None
-        } else if trimmed.starts_with("diretta:") || trimmed.starts_with("diretta@") {
+        } else if trimmed.starts_with("diretta:")
+            || trimmed.starts_with("diretta@")
+            || trimmed.starts_with("alsammap:")
+        {
+            // alsammap: 本地直出选择器（B9），非 Diretta 目标，原样保留
             Some(trimmed.to_string())
         } else {
             Some(format!("diretta:{}", trimmed))
         }
     });
 
+    // alsammap 本地设备不做 Diretta 可达性探测（本地 ALSA 打开失败会在
+    // load 时显式报错）
     let reachable = match &dev_name {
+        Some(target) if target.starts_with("alsammap:") => true,
         Some(target) => {
             let target = target.clone();
             // DKS 探测内部无超时（3 轮发现重试 + MTU 测量），Target 被占用/半死时
