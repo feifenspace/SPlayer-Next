@@ -75,6 +75,10 @@ pub struct LoadMeta {
 // REST 路由入口
 // -------------------------------------------------------------------
 
+/// 服务端控制协议版本（A2.6）：客户端启动时校验 range，不兼容报结构化错误。
+/// 语义化破坏时 +1；v2 为当前版本（v1 裸格式兼容层退役后唯一版本）
+pub const PROTOCOL_VERSION: u32 = 2;
+
 /// 健康/状态查询
 pub(crate) async fn status_handler(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let snapshot: PlayerSnapshot = state.snapshot();
@@ -90,6 +94,7 @@ pub(crate) async fn status_handler(State(state): State<AppState>) -> Result<Json
         "version": env!("CARGO_PKG_VERSION"),
         "commit": env!("SPLAYER_BUILD_COMMIT"),
         "source_dirty": env!("SPLAYER_BUILD_DIRTY") == "true",
+        "protocol": { "version": PROTOCOL_VERSION },
     })))
 }
 

@@ -1385,6 +1385,34 @@ pub fn set_server_state(conn: &Connection, key: &str, value: &str) -> Result<()>
 // -------------------------------------------------------------------
 
 /// 记录播放历史
+/// 查询某曲目最近一次播放会话：(行 id, started_at, listened_ms)。
+/// 统计会话合并（G.2）用：同曲 reload 在窗口内续写同一行而非新增重复计数
+pub fn latest_play_session(conn: &Connection, track_id: &str) -> Result<Option<(i64, u64, u64)>> {
+    conn.query_row(
+        "SELECT rowid, started_at, listened_ms FROM play_history \
+         WHERE track_id = ?1 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+        [track_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)? as u64,
+                row.get::<_, i64>(2)? as u64,
+            ))
+        },
+    )
+    .optional()
+    .map_err(anyhow::Error::from)
+}
+
+/// 向既有会话行追加收听时长
+pub fn extend_play_history(conn: &Connection, rowid: i64, add_ms: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE play_history SET listened_ms = listened_ms + ?1 WHERE rowid = ?2",
+        params![add_ms as i64, rowid],
+    )?;
+    Ok(())
+}
+
 pub fn record_play_history(
     conn: &Connection,
     track_id: &str,

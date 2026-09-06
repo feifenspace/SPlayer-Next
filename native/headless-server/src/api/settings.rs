@@ -91,6 +91,10 @@ pub struct HistoryQuery {
 }
 
 /// 记录播放历史
+/// 统计会话阈值（G.2）：<5s 的记录视为误触丢弃；同曲 10 分钟内续写会话
+const MIN_SESSION_MS: u64 = 5000;
+const SESSION_CONTINUE_WINDOW_MS: u64 = 10 * 60 * 1000;
+
 pub(crate) async fn stats_record_handler(
     State(state): State<AppState>,
     Json(payload): Json<RecordHistoryRequest>,
@@ -116,6 +120,32 @@ pub(crate) async fn stats_record_handler(
         .unwrap_or_else(|_| "{}".to_string());
 
     let conn = state.db.lock();
+
+    // 统计会话语义（G.2，对齐 atom headlessPlayStats）：与 Control 数量解耦
+    if listened_ms < MIN_SESSION_MS {
+        return Ok(Json(PlayerResponse::ok(json!({
+            "recorded": false,
+            "reason": "too_short",
+        }))));
+    }
+
+    // 同曲 reload 延续：距上一会话结束 10 分钟内的同曲记录续写同一行，
+    // 多端/重开页面不再产生重复计数
+    if let Ok(Some((rowid, prev_started, prev_listened))) =
+        crate::db::latest_play_session(&conn, &track_id)
+    {
+        let prev_end = prev_started.saturating_add(prev_listened);
+        if started_at >= prev_started
+            && started_at.saturating_sub(prev_end) <= SESSION_CONTINUE_WINDOW_MS
+        {
+            crate::db::extend_play_history(&conn, rowid, listened_ms)?;
+            return Ok(Json(PlayerResponse::ok(json!({
+                "recorded": true,
+                "merged": true,
+            }))));
+        }
+    }
+
     crate::db::record_play_history(
         &conn,
         &track_id,
