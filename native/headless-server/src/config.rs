@@ -12,6 +12,10 @@ pub struct PlaybackConfig {
     pub ram_preload: bool,
     /// 单曲 RAM 物化上限（字节）；超出上限的曲目回退路径/流式模式
     pub ram_preload_max_bytes: u64,
+    /// DSD 传输模式（B6.2）：native = Diretta 原生 DSD（默认）；
+    /// dop = DSD 打包为 DoP v1.1 经 PCM Direct（v1 级 CPU/不支持原生 DSD 的
+    /// Target 用）；auto = 暂同 native
+    pub dsd_transport: String,
 }
 
 impl Default for PlaybackConfig {
@@ -19,6 +23,7 @@ impl Default for PlaybackConfig {
         Self {
             ram_preload: false,
             ram_preload_max_bytes: 2 * 1024 * 1024 * 1024,
+            dsd_transport: "native".to_string(),
         }
     }
 }

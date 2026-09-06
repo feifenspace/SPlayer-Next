@@ -7,6 +7,7 @@
 
 pub mod dff;
 pub mod dop_pack;
+pub mod dop_wav;
 pub mod dsd2pcm;
 pub mod dsf;
 

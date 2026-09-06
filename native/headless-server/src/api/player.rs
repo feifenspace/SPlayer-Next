@@ -504,6 +504,7 @@ fn probe_direct_source(
     source_for_direct: &str,
     stream_mode: bool,
     is_dsd: bool,
+    use_dop: bool,
     ram_preload: bool,
     ram_max_bytes: usize,
     meta_duration_secs: Option<f64>,
@@ -521,8 +522,14 @@ fn probe_direct_source(
 > {
     let is_http =
         source_for_direct.starts_with("http://") || source_for_direct.starts_with("https://");
-    // L2 纯内存播放：本地 PCM 源整曲物化进 RAM（DSD/在线源走各自通道）
-    let ram = if ram_preload && !is_http && !is_dsd {
+    // B6.2 DoP：dsd_transport=dop 时 DSD 源整曲转 DoP WAV 进 RAM，
+    // 经 PCM Direct 播放（绕开 SDK 原生 DSD 通道）；否则 DSD 走原生直通
+    let ram = if use_dop && !is_http {
+        Some(audio_engine_core::dsd::dop_wav::convert_dsd_to_dop_ram(
+            source_for_direct,
+            ram_max_bytes,
+        )?)
+    } else if ram_preload && !is_http && !is_dsd {
         materialize_ram_buffer(source_for_direct, ram_max_bytes)?
     } else {
         None
@@ -763,11 +770,13 @@ async fn run_direct_load(
         let stream_mode = is_http && source_mode == "stream" && !is_dsd;
         let ram_preload = state_for_task.config.playback.ram_preload;
         let ram_max_bytes = state_for_task.config.resolved_ram_preload_max_bytes();
+        let use_dop = is_dsd && state_for_task.config.playback.dsd_transport == "dop";
 
         let (physical_source, mut metadata, ram_source) = probe_direct_source(
             &source_for_direct,
             stream_mode,
             is_dsd,
+            use_dop,
             ram_preload,
             ram_max_bytes,
             meta_duration_secs,

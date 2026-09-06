@@ -40,7 +40,7 @@ usage() {
     echo "用法: $0 [选项]"
     echo
     echo "选项:"
-    echo "  --arch <variant>       CPU 微架构: v2, v3, v4, zen4, auto, all (默认交互选择或 v2)"
+    echo "  --arch <variant>       CPU 微架构: v1, v2, v3, v4, zen4, auto, all (默认交互选择或 v2)"
     echo "  --sdk-dir <path>       指定 DirettaHostSDK 路径"
     echo "  --sdk-version <ver>    指定 Diretta SDK 版本（如 150/149/148）"
     echo "  --output-dir <path>    发布包输出根目录（默认 /home/songlian）"
@@ -161,7 +161,7 @@ ARG_COUNT=$#
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)
-            [[ $# -ge 2 ]] || fatal "--arch 需要参数 (v2, v3, v4, zen4, auto, all)"
+            [[ $# -ge 2 ]] || fatal "--arch 需要参数 (v1, v2, v3, v4, zen4, auto, all)"
             TARGET_CPU_ARCH="$2"
             shift 2
             ;;
@@ -297,6 +297,10 @@ package_single_arch() {
     local arch_desc=""
 
     case "$arch_var" in
+        v1)
+            rust_target_cpu="x86-64"
+            arch_desc="x86-64 基线版（无 SSE4.2/POPCNT/CMPXCHG16B 要求，支持 J1900/Atom x5 系/v1 级老 CPU）"
+            ;;
         v2)
             rust_target_cpu="x86-64-v2"
             arch_desc="x86-64-v2 通用兼容版（广泛支持 J4125/N5105/N100/虚拟机等无 AVX2 设备）"
@@ -463,9 +467,18 @@ fi
 # 5. 安装 systemd 服务（非 root + 沙箱，与 install-linux-headless.sh 同源）
 log "配置 systemd 系统服务..."
 RUN_USER=splayer
+if ! getent group "$RUN_USER" >/dev/null 2>&1; then
+    groupadd --system "$RUN_USER"
+    log "已创建系统用户组 ${RUN_USER}"
+fi
 if ! id -u "$RUN_USER" >/dev/null 2>&1; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER"
+    useradd --system --no-create-home --gid "$RUN_USER" --shell /usr/sbin/nologin "$RUN_USER"
     log "已创建系统用户 ${RUN_USER}"
+fi
+# 本地 ALSA 输出需要 audio 组访问 /dev/snd/*（Diretta 网络输出走 CAP_NET_RAW 不受影响）
+if getent group audio >/dev/null 2>&1 && ! id -nG "$RUN_USER" | grep -qw audio; then
+    usermod -aG audio "$RUN_USER"
+    log "已将 ${RUN_USER} 加入 audio 组"
 fi
 # 数据/配置目录属主交给服务用户（CAP_DAC_OVERRIDE 兜底权限位场景）
 chown -R "$RUN_USER:$RUN_USER" "$DATA_DIR" "$CONFIG_DIR"
@@ -484,6 +497,11 @@ systemctl enable splayer-headless.service
 systemctl restart splayer-headless.service
 
 sleep 2
+if ! systemctl is-active --quiet splayer-headless.service; then
+    error "服务启动失败，最近日志："
+    journalctl -u splayer-headless.service --no-pager -n 20 >&2 || true
+    exit 1
+fi
 
 # 6. 获取 IP 与端口
 PORT=14558
