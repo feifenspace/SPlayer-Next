@@ -357,7 +357,9 @@ async fn call_qqmusic(
         "user_detail" => {
             let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
             match client.user_detail().await {
-                Ok(resp) => ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default()),
+                Ok(resp) => {
+                    ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default())
+                }
                 Err(e) => ApiCallResponse::err(format!("QM user_detail error: {e}")),
             }
         }
@@ -389,7 +391,9 @@ async fn call_qqmusic(
             let qr_type = params.get("type").and_then(Value::as_str).unwrap_or("qq");
             let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
             match client.login_qr_key(qr_type).await {
-                Ok(resp) => ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default()),
+                Ok(resp) => {
+                    ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default())
+                }
                 Err(e) => ApiCallResponse::err(format!("QM login_qr_key error: {e}")),
             }
         }
@@ -425,7 +429,6 @@ async fn call_qqmusic(
             let client = QqmusicClient::new(load_platform_cookies(db, "qqmusic"));
             to_qqkg_resp(client.lyric(&params).await)
         }
-
 
         _ => {
             // 通用 fcg 请求封装
@@ -476,7 +479,9 @@ async fn call_kugou(
         "login_qr_key" => {
             let client = KugouClient::new(load_platform_cookies(db, "kugou"));
             match client.login_qr_key().await {
-                Ok(resp) => ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default()),
+                Ok(resp) => {
+                    ApiCallResponse::ok_data(serde_json::to_value(resp).unwrap_or_default())
+                }
                 Err(e) => ApiCallResponse::err(format!("Kugou login_qr_key error: {e}")),
             }
         }
@@ -523,12 +528,15 @@ async fn call_kugou(
                         if let Some(profile) = &resp.profile {
                             let mut cookies_map = load_platform_cookies(db, "kugou");
                             if !profile.nickname.is_empty() {
-                                cookies_map.insert("nickname".to_string(), profile.nickname.clone());
+                                cookies_map
+                                    .insert("nickname".to_string(), profile.nickname.clone());
                             }
                             if !profile.avatar_url.is_empty() {
-                                cookies_map.insert("avatar".to_string(), profile.avatar_url.clone());
+                                cookies_map
+                                    .insert("avatar".to_string(), profile.avatar_url.clone());
                             }
-                            cookies_map.insert("vip_type".to_string(), profile.vip_level.to_string());
+                            cookies_map
+                                .insert("vip_type".to_string(), profile.vip_level.to_string());
                             let conn = db.lock();
                             let _ = crate::db::save_account_cookies(&conn, "kugou", &cookies_map);
                         }
@@ -585,27 +593,23 @@ async fn call_qobuz(
     let client = streaming_api::QobuzClient::new(user_auth_token, user_id);
 
     match name {
-        "auth_login" | "login" => {
-            match client.auth_login(&params).await {
-                Ok(resp) => {
-                    if let (Some(tok), Some(uid)) = (
-                        resp.get("user_auth_token").and_then(Value::as_str),
-                        resp.get("user_id").and_then(Value::as_str),
-                    ) {
-                        let mut new_cookies = HashMap::new();
-                        new_cookies.insert("user_auth_token".to_string(), tok.to_string());
-                        new_cookies.insert("user_id".to_string(), uid.to_string());
-                        let conn = db.lock();
-                        let _ = crate::db::save_account_cookies(&conn, "qobuz", &new_cookies);
-                    }
-                    ApiCallResponse::ok_data(resp)
+        "auth_login" | "login" => match client.auth_login(&params).await {
+            Ok(resp) => {
+                if let (Some(tok), Some(uid)) = (
+                    resp.get("user_auth_token").and_then(Value::as_str),
+                    resp.get("user_id").and_then(Value::as_str),
+                ) {
+                    let mut new_cookies = HashMap::new();
+                    new_cookies.insert("user_auth_token".to_string(), tok.to_string());
+                    new_cookies.insert("user_id".to_string(), uid.to_string());
+                    let conn = db.lock();
+                    let _ = crate::db::save_account_cookies(&conn, "qobuz", &new_cookies);
                 }
-                Err(e) => ApiCallResponse::err(format!("Qobuz login error: {e}")),
+                ApiCallResponse::ok_data(resp)
             }
-        }
-        "auth_status" | "status" | "user_detail" => {
-            to_streaming_resp(client.auth_status().await)
-        }
+            Err(e) => ApiCallResponse::err(format!("Qobuz login error: {e}")),
+        },
+        "auth_status" | "status" | "user_detail" => to_streaming_resp(client.auth_status().await),
         "auth_logout" | "logout" => {
             {
                 let conn = db.lock();
@@ -613,33 +617,21 @@ async fn call_qobuz(
             }
             to_streaming_resp(client.auth_logout().await)
         }
-        "catalog_search" | "search" => {
-            to_streaming_resp(client.catalog_search(&params).await)
-        }
+        "catalog_search" | "search" => to_streaming_resp(client.catalog_search(&params).await),
         "track_getFileUrl" | "song_url" => {
             to_streaming_resp(client.track_get_file_url(&params).await)
         }
-        "album_get" | "album" => {
-            to_streaming_resp(client.album_get(&params).await)
-        }
-        "artist_get" | "artist" => {
-            to_streaming_resp(client.artist_get(&params).await)
-        }
+        "album_get" | "album" => to_streaming_resp(client.album_get(&params).await),
+        "artist_get" | "artist" => to_streaming_resp(client.artist_get(&params).await),
         "artist_getReleasesList" => {
             to_streaming_resp(client.artist_get_releases_list(&params).await)
         }
-        "playlist_get" | "playlist" => {
-            to_streaming_resp(client.playlist_get(&params).await)
-        }
+        "playlist_get" | "playlist" => to_streaming_resp(client.playlist_get(&params).await),
         "user_getFavorites" | "favorites" => {
             to_streaming_resp(client.user_get_favorites(&params).await)
         }
-        "favorite_create" => {
-            to_streaming_resp(client.favorite_create(&params).await)
-        }
-        "favorite_delete" => {
-            to_streaming_resp(client.favorite_delete(&params).await)
-        }
+        "favorite_create" => to_streaming_resp(client.favorite_create(&params).await),
+        "favorite_delete" => to_streaming_resp(client.favorite_delete(&params).await),
         other => ApiCallResponse::err(format!("Unsupported Qobuz API: {}", other)),
     }
 }
@@ -671,12 +663,37 @@ async fn call_tidal(
     );
 
     match name {
-        "auth_authorize" | "authorize" => {
-            to_streaming_resp(client.auth_authorize(&params).await)
+        "auth_authorize" | "authorize" => to_streaming_resp(client.auth_authorize(&params).await),
+        "auth_exchange" | "exchange" => match client.auth_exchange(&params).await {
+            Ok(resp) => {
+                let mut new_cookies = HashMap::new();
+                if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
+                    new_cookies.insert("access_token".to_string(), tok.to_string());
+                }
+                if let Some(rtok) = resp.get("refreshToken").and_then(Value::as_str) {
+                    new_cookies.insert("refresh_token".to_string(), rtok.to_string());
+                }
+                if let Some(uid) = resp.get("userId").and_then(Value::as_str) {
+                    new_cookies.insert("user_id".to_string(), uid.to_string());
+                }
+                if let Some(cc) = resp.get("countryCode").and_then(Value::as_str) {
+                    new_cookies.insert("country_code".to_string(), cc.to_string());
+                }
+                if let Some(cid) = resp.get("clientId").and_then(Value::as_str) {
+                    new_cookies.insert("client_id".to_string(), cid.to_string());
+                }
+                let conn = db.lock();
+                let _ = crate::db::save_account_cookies(&conn, "tidal", &new_cookies);
+                ApiCallResponse::ok_data(resp)
+            }
+            Err(e) => ApiCallResponse::err(format!("TIDAL exchange error: {e}")),
+        },
+        "auth_device_authorization" | "device_authorization" => {
+            to_streaming_resp(client.auth_device_authorization(&params).await)
         }
-        "auth_exchange" | "exchange" => {
-            match client.auth_exchange(&params).await {
-                Ok(resp) => {
+        "auth_token_poll" | "token_poll" => match client.auth_token_poll(&params).await {
+            Ok(resp) => {
+                if resp.get("status").and_then(Value::as_str) == Some("success") {
                     let mut new_cookies = HashMap::new();
                     if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
                         new_cookies.insert("access_token".to_string(), tok.to_string());
@@ -695,62 +712,27 @@ async fn call_tidal(
                     }
                     let conn = db.lock();
                     let _ = crate::db::save_account_cookies(&conn, "tidal", &new_cookies);
-                    ApiCallResponse::ok_data(resp)
                 }
-                Err(e) => ApiCallResponse::err(format!("TIDAL exchange error: {e}")),
+                ApiCallResponse::ok_data(resp)
             }
-        }
-        "auth_device_authorization" | "device_authorization" => {
-            to_streaming_resp(client.auth_device_authorization(&params).await)
-        }
-        "auth_token_poll" | "token_poll" => {
-            match client.auth_token_poll(&params).await {
-                Ok(resp) => {
-                    if resp.get("status").and_then(Value::as_str) == Some("success") {
-                        let mut new_cookies = HashMap::new();
-                        if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
-                            new_cookies.insert("access_token".to_string(), tok.to_string());
-                        }
-                        if let Some(rtok) = resp.get("refreshToken").and_then(Value::as_str) {
-                            new_cookies.insert("refresh_token".to_string(), rtok.to_string());
-                        }
-                        if let Some(uid) = resp.get("userId").and_then(Value::as_str) {
-                            new_cookies.insert("user_id".to_string(), uid.to_string());
-                        }
-                        if let Some(cc) = resp.get("countryCode").and_then(Value::as_str) {
-                            new_cookies.insert("country_code".to_string(), cc.to_string());
-                        }
-                        if let Some(cid) = resp.get("clientId").and_then(Value::as_str) {
-                            new_cookies.insert("client_id".to_string(), cid.to_string());
-                        }
-                        let conn = db.lock();
-                        let _ = crate::db::save_account_cookies(&conn, "tidal", &new_cookies);
+            Err(e) => ApiCallResponse::err(format!("TIDAL poll error: {e}")),
+        },
+        "auth_token_refresh" | "refresh_token" => match client.auth_token_refresh(&params).await {
+            Ok(resp) => {
+                if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
+                    let mut updated = cookies.clone();
+                    updated.insert("access_token".to_string(), tok.to_string());
+                    if let Some(rtok) = resp.get("refreshToken").and_then(Value::as_str) {
+                        updated.insert("refresh_token".to_string(), rtok.to_string());
                     }
-                    ApiCallResponse::ok_data(resp)
+                    let conn = db.lock();
+                    let _ = crate::db::save_account_cookies(&conn, "tidal", &updated);
                 }
-                Err(e) => ApiCallResponse::err(format!("TIDAL poll error: {e}")),
+                ApiCallResponse::ok_data(resp)
             }
-        }
-        "auth_token_refresh" | "refresh_token" => {
-            match client.auth_token_refresh(&params).await {
-                Ok(resp) => {
-                    if let Some(tok) = resp.get("accessToken").and_then(Value::as_str) {
-                        let mut updated = cookies.clone();
-                        updated.insert("access_token".to_string(), tok.to_string());
-                        if let Some(rtok) = resp.get("refreshToken").and_then(Value::as_str) {
-                            updated.insert("refresh_token".to_string(), rtok.to_string());
-                        }
-                        let conn = db.lock();
-                        let _ = crate::db::save_account_cookies(&conn, "tidal", &updated);
-                    }
-                    ApiCallResponse::ok_data(resp)
-                }
-                Err(e) => ApiCallResponse::err(format!("TIDAL refresh error: {e}")),
-            }
-        }
-        "auth_status" | "status" | "user_detail" => {
-            to_streaming_resp(client.auth_status().await)
-        }
+            Err(e) => ApiCallResponse::err(format!("TIDAL refresh error: {e}")),
+        },
+        "auth_status" | "status" | "user_detail" => to_streaming_resp(client.auth_status().await),
         "auth_logout" | "logout" => {
             {
                 let conn = db.lock();
@@ -758,33 +740,17 @@ async fn call_tidal(
             }
             to_streaming_resp(client.auth_logout().await)
         }
-        "search" => {
-            to_streaming_resp(client.search(&params).await)
-        }
+        "search" => to_streaming_resp(client.search(&params).await),
         "track_getStreamUrl" | "song_url" => {
             to_streaming_resp(client.track_get_stream_url(&params).await)
         }
-        "album_get" | "album" => {
-            to_streaming_resp(client.album_get(&params).await)
-        }
-        "album_getTracks" => {
-            to_streaming_resp(client.album_get_tracks(&params).await)
-        }
-        "artist_get" | "artist" => {
-            to_streaming_resp(client.artist_get(&params).await)
-        }
-        "artist_getAlbums" => {
-            to_streaming_resp(client.artist_get_albums(&params).await)
-        }
-        "artist_getTopTracks" => {
-            to_streaming_resp(client.artist_get_top_tracks(&params).await)
-        }
-        "playlist_get" | "playlist" => {
-            to_streaming_resp(client.playlist_get(&params).await)
-        }
-        "playlist_getTracks" => {
-            to_streaming_resp(client.playlist_get_tracks(&params).await)
-        }
+        "album_get" | "album" => to_streaming_resp(client.album_get(&params).await),
+        "album_getTracks" => to_streaming_resp(client.album_get_tracks(&params).await),
+        "artist_get" | "artist" => to_streaming_resp(client.artist_get(&params).await),
+        "artist_getAlbums" => to_streaming_resp(client.artist_get_albums(&params).await),
+        "artist_getTopTracks" => to_streaming_resp(client.artist_get_top_tracks(&params).await),
+        "playlist_get" | "playlist" => to_streaming_resp(client.playlist_get(&params).await),
+        "playlist_getTracks" => to_streaming_resp(client.playlist_get_tracks(&params).await),
         "user_getFavorites" | "favorites" => {
             to_streaming_resp(client.user_get_favorites(&params).await)
         }
@@ -916,10 +882,6 @@ pub async fn image_proxy_handler(
             let status_code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
             (status_code, resp_headers, body).into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            format!("Image proxy error: {}", e),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("Image proxy error: {}", e)).into_response(),
     }
 }

@@ -93,7 +93,7 @@ pub struct AppState {
     /// 下一曲候选（B 层自动连播单槽；None = 未注册）
     pub pending_next: Arc<Mutex<Option<PendingNext>>>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
-    snapshot: Arc<RwLock<Option<WsState>>>,
+    snapshot: Arc<RwLock<Option<PlayerSnapshot>>>,
 }
 
 impl AppState {
@@ -105,7 +105,9 @@ impl AppState {
         // 上次的选择覆盖）；否则用服务端记忆的上次选择（headless 自恢复，
         // 不依赖浏览器在场）
         let saved_output_device = if config.diretta_target.is_none() {
-            crate::db::get_server_state(&db_conn, OUTPUT_DEVICE_STATE_KEY).ok().flatten()
+            crate::db::get_server_state(&db_conn, OUTPUT_DEVICE_STATE_KEY)
+                .ok()
+                .flatten()
         } else {
             None
         };
@@ -128,7 +130,7 @@ impl AppState {
 
         let (ws_tx, _rx) = broadcast::channel(128);
         let (scan_tx, _rx_scan) = broadcast::channel(128);
-        let snapshot: Arc<RwLock<Option<WsState>>> = Arc::new(RwLock::new(None));
+        let snapshot: Arc<RwLock<Option<PlayerSnapshot>>> = Arc::new(RwLock::new(None));
         let is_scanning = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let scan_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let output_recovery_requested = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -148,73 +150,89 @@ impl AppState {
             let staged_meta = Arc::clone(&staged_meta);
             let pending_next = Arc::clone(&pending_next);
             Arc::new(move |event: PlayerEvent| {
-                // 先 clone 一份当前快照，避免持有读锁跨越后续写锁操作
-                let current: Option<WsState> = snapshot.read().clone();
+                // 先 clone 一份当前快照，避免持有读锁跨越后续写锁操作。
+                // 缓存承载完整 PlayerSnapshot：HTTP/WS 轮询不再碰 player 锁（A4）
+                let current: Option<PlayerSnapshot> = snapshot.read().clone();
+                let mut authoritative = current.clone().unwrap_or(PlayerSnapshot {
+                    position: 0.0,
+                    duration: 0.0,
+                    volume: 1.0,
+                    speed: 1.0,
+                    state: PlayerState::Idle,
+                    is_finished: false,
+                    current_source: None,
+                });
                 match event {
                     PlayerEvent::StateChanged { state } => {
+                        authoritative.state = state;
                         let ws_state = WsState {
-                            position: current.as_ref().map(|s| s.position).unwrap_or(0.0),
-                            duration: current.as_ref().map(|s| s.duration).unwrap_or(0.0),
-                            volume: current.as_ref().map(|s| s.volume).unwrap_or(1.0),
+                            position: authoritative.position,
+                            duration: authoritative.duration,
+                            volume: authoritative.volume,
                             state,
                         };
-                        *snapshot.write() = Some(ws_state.clone());
+                        *snapshot.write() = Some(authoritative.clone());
                         if let Ok(data) = serde_json::to_value(&ws_state) {
-                            let _ = ws_tx.send(serde_json::json!({ "type": "state", "data": data }));
+                            let _ =
+                                ws_tx.send(serde_json::json!({ "type": "state", "data": data }));
                         }
                     }
                     PlayerEvent::Position { position, duration } => {
+                        authoritative.position = position;
+                        authoritative.duration = duration;
                         let ws_state = WsState {
                             position,
                             duration,
-                            volume: current.as_ref().map(|s| s.volume).unwrap_or(1.0),
-                            state: current
-                                .as_ref()
-                                .map(|s| s.state)
-                                .unwrap_or(PlayerState::Idle),
+                            volume: authoritative.volume,
+                            state: authoritative.state,
                         };
-                        *snapshot.write() = Some(ws_state.clone());
+                        *snapshot.write() = Some(authoritative.clone());
                         if let Ok(data) = serde_json::to_value(&ws_state) {
-                            let _ = ws_tx.send(serde_json::json!({ "type": "state", "data": data }));
+                            let _ =
+                                ws_tx.send(serde_json::json!({ "type": "state", "data": data }));
                         }
                     }
                     PlayerEvent::Ended => {
-                        let ws_state = WsState {
-                            position: current.as_ref().map(|s| s.duration).unwrap_or(0.0),
-                            duration: current.as_ref().map(|s| s.duration).unwrap_or(0.0),
-                            volume: current.as_ref().map(|s| s.volume).unwrap_or(1.0),
-                            state: PlayerState::Stopped,
-                        };
-                        *snapshot.write() = Some(ws_state);
+                        authoritative.is_finished = true;
+                        authoritative.state = PlayerState::Stopped;
+                        authoritative.position = authoritative.duration;
+                        *snapshot.write() = Some(authoritative);
                         // 置自动连播标志：有注册候选时看门狗会在曲终自动接续
                         auto_advance_requested.store(true, std::sync::atomic::Ordering::Release);
                         let _ = ws_tx.send(serde_json::json!({ "type": "ended", "data": {} }));
                     }
                     PlayerEvent::SourceError => {
-                        let ws_state = WsState {
-                            position: 0.0,
-                            duration: 0.0,
-                            volume: current.as_ref().map(|s| s.volume).unwrap_or(1.0),
-                            state: PlayerState::Idle,
-                        };
-                        *snapshot.write() = Some(ws_state);
-                        let _ = ws_tx.send(serde_json::json!({ "type": "sourceError", "data": {} }));
+                        authoritative.position = 0.0;
+                        authoritative.duration = 0.0;
+                        authoritative.state = PlayerState::Idle;
+                        *snapshot.write() = Some(authoritative);
+                        let _ =
+                            ws_tx.send(serde_json::json!({ "type": "sourceError", "data": {} }));
                     }
-                    PlayerEvent::DirectTrackBoundary { duration, generation } => {
-                        let ws_state = WsState {
-                            position: 0.0,
-                            duration,
-                            volume: current.as_ref().map(|s| s.volume).unwrap_or(1.0),
-                            state: PlayerState::Playing,
-                        };
-                        *snapshot.write() = Some(ws_state);
+                    PlayerEvent::DirectTrackBoundary {
+                        duration,
+                        generation,
+                    } => {
                         // 无缝边界：已 stage 的候选元数据转正为 now-playing 快照，
                         // 保证重开页面/无浏览器场景都能显示正确曲目
+                        let mut promoted_source = None;
                         if let Some((g, meta)) = staged_meta.lock().take() {
                             if g == generation {
+                                promoted_source = meta
+                                    .get("source")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
                                 *now_playing.lock() = Some(meta);
                             }
                         }
+                        authoritative.position = 0.0;
+                        authoritative.duration = duration;
+                        authoritative.state = PlayerState::Playing;
+                        if promoted_source.is_some() {
+                            authoritative.current_source = promoted_source;
+                            authoritative.is_finished = false;
+                        }
+                        *snapshot.write() = Some(authoritative);
                         // 边界即候选消费点：刚切入的曲子就是 pending_next 里注册的
                         // 那首，不清掉的话曲终自动连播会在它播完后重放一遍
                         // （引擎 current_source 不随边界更新，曲终时无法自证重复）。
@@ -277,23 +295,45 @@ impl AppState {
     }
 
     /// 从播放器读取当前状态快照（HTTP 接口使用，持锁时间极短）
+    /// HTTP/WS 快照读取（A4）：优先读事件回调维护的缓存，热路径全程不碰
+    /// player 锁；仅冷启动（尚无任何事件）短锁补齐一次
     pub fn snapshot(&self) -> PlayerSnapshot {
+        if let Some(cached) = self.snapshot.read().clone() {
+            return cached;
+        }
         let player = self.player.lock();
-        let state = WsState {
+        let snap = PlayerSnapshot {
             position: player.position(),
             duration: player.duration(),
             volume: player.volume(),
-            state: player.state(),
-        };
-        *self.snapshot.write() = Some(state.clone());
-        PlayerSnapshot {
-            position: state.position,
-            duration: state.duration,
-            volume: state.volume,
             speed: player.speed(),
-            state: state.state,
+            state: player.state(),
             is_finished: player.is_finished(),
             current_source: player.current_source().map(String::from),
+        };
+        *self.snapshot.write() = Some(snap.clone());
+        snap
+    }
+
+    /// 位置注记（seek 提交后调用：暂停态没有 position 事件，缓存需显式刷新）
+    pub fn note_position(&self, position: f64) {
+        if let Some(snap) = self.snapshot.write().as_mut() {
+            snap.position = position;
+        }
+    }
+
+    /// 音量注记（volume 变更无对应事件，缓存需显式刷新）
+    pub fn note_volume(&self, volume: f32) {
+        if let Some(snap) = self.snapshot.write().as_mut() {
+            snap.volume = volume;
+        }
+    }
+
+    /// 当前曲目变更注记（load 提交/停止后调用；载入即未完成）
+    pub fn note_source_change(&self, source: Option<&str>) {
+        if let Some(snap) = self.snapshot.write().as_mut() {
+            snap.current_source = source.map(String::from);
+            snap.is_finished = false;
         }
     }
 }

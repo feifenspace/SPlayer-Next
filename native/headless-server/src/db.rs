@@ -175,13 +175,19 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE tracks ADD COLUMN cue_audio_path TEXT", []);
     let _ = conn.execute("ALTER TABLE tracks ADD COLUMN cue_start_ms INTEGER", []);
     let _ = conn.execute("ALTER TABLE tracks ADD COLUMN cue_end_ms INTEGER", []);
-    let _ = conn.execute("CREATE INDEX IF NOT EXISTS idx_tracks_cue_audio ON tracks(cue_audio_path)", []);
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tracks_cue_audio ON tracks(cue_audio_path)",
+        [],
+    );
 
     Ok(conn)
 }
 
 /// 读取某平台的 session cookies（转换为键值对 Map）
-pub fn get_account_cookies(conn: &Connection, platform: &str) -> std::collections::HashMap<String, String> {
+pub fn get_account_cookies(
+    conn: &Connection,
+    platform: &str,
+) -> std::collections::HashMap<String, String> {
     let query = "SELECT cookies FROM account_sessions WHERE platform = ?";
     let cookies_json: Option<String> = conn
         .query_row(query, [platform], |row| row.get(0))
@@ -219,7 +225,10 @@ pub fn save_account_cookies(
 
 /// 清除某平台的 session cookies
 pub fn clear_account_cookies(conn: &Connection, platform: &str) -> Result<()> {
-    conn.execute("DELETE FROM account_sessions WHERE platform = ?", [platform])?;
+    conn.execute(
+        "DELETE FROM account_sessions WHERE platform = ?",
+        [platform],
+    )?;
     Ok(())
 }
 
@@ -395,7 +404,10 @@ pub fn normalize_cover_url(raw: Option<String>) -> Option<String> {
     if raw_trimmed.is_empty() {
         return None;
     }
-    if raw_trimmed.starts_with("http://") || raw_trimmed.starts_with("https://") || raw_trimmed.starts_with("/api/v1/covers/") {
+    if raw_trimmed.starts_with("http://")
+        || raw_trimmed.starts_with("https://")
+        || raw_trimmed.starts_with("/api/v1/covers/")
+    {
         return Some(raw_trimmed.to_string());
     }
     if let Some(stripped) = raw_trimmed.strip_prefix("cache://covers/") {
@@ -412,7 +424,11 @@ pub fn normalize_cover_url(raw: Option<String>) -> Option<String> {
 }
 
 /// 同步解析 CUE 文件并向 tracks 写入虚拟分轨记录
-pub fn sync_cue_tracks(conn: &mut Connection, cue_files: &[String], cover_cache_dir: Option<&Path>) -> Result<usize> {
+pub fn sync_cue_tracks(
+    conn: &mut Connection,
+    cue_files: &[String],
+    cover_cache_dir: Option<&Path>,
+) -> Result<usize> {
     if cue_files.is_empty() {
         return Ok(0);
     }
@@ -506,10 +522,22 @@ pub fn sync_cue_tracks(conn: &mut Connection, cue_files: &[String], cover_cache_
                     .optional()
                     .unwrap_or(None);
 
-                let (parent_dur_ms, cover, codec, sample_rate, bit_rate, channels, bits_per_sample, file_size) = match parent_meta {
+                let (
+                    parent_dur_ms,
+                    cover,
+                    codec,
+                    sample_rate,
+                    bit_rate,
+                    channels,
+                    bits_per_sample,
+                    file_size,
+                ) = match parent_meta {
                     Some(m) => m,
                     None => {
-                        if let Some(scanned) = audio_engine_core::scanner::probe_fast(&physical_str, Some(&cache_dir_str)) {
+                        if let Some(scanned) = audio_engine_core::scanner::probe_fast(
+                            &physical_str,
+                            Some(&cache_dir_str),
+                        ) {
                             (
                                 (scanned.duration * 1000.0) as u64,
                                 scanned.cover,
@@ -521,14 +549,27 @@ pub fn sync_cue_tracks(conn: &mut Connection, cue_files: &[String], cover_cache_
                                 scanned.file_size,
                             )
                         } else {
-                            (0, None, Some("wav".to_string()), Some(44100), Some(1411200), Some(2), Some(16), 0)
+                            (
+                                0,
+                                None,
+                                Some("wav".to_string()),
+                                Some(44100),
+                                Some(1411200),
+                                Some(2),
+                                Some(16),
+                                0,
+                            )
                         }
                     }
                 };
 
-                let effective_cover = cover
-                    .or_else(|| folder_cover_from_cue.clone())
-                    .or_else(|| audio_engine_core::metadata::extract_folder_cover_thumbnail(&physical_str, &cache_dir_str));
+                let effective_cover =
+                    cover.or_else(|| folder_cover_from_cue.clone()).or_else(|| {
+                        audio_engine_core::metadata::extract_folder_cover_thumbnail(
+                            &physical_str,
+                            &cache_dir_str,
+                        )
+                    });
                 let cover_url = normalize_cover_url(effective_cover);
 
                 let cue_start_ms = (cue_track.start_time * 1000.0) as u64;
@@ -541,7 +582,8 @@ pub fn sync_cue_tracks(conn: &mut Connection, cue_files: &[String], cover_cache_
                 };
                 let cue_end_ms = cue_start_ms + duration_ms;
 
-                let track_virtual_path = format!("cue://{}#track={:02}", cue_file, cue_track.track_num);
+                let track_virtual_path =
+                    format!("cue://{}#track={:02}", cue_file, cue_track.track_num);
                 let id = format!("local:{:x}", md5_hash(&track_virtual_path));
 
                 let title = cue_track
@@ -667,10 +709,8 @@ pub fn sync_sacd_tracks(
             );
 
             // 2. 解析 SACD ISO 展开分轨并自动提取同目录封面
-            let tracks = audio_engine_core::scanner::probe_sacd_tracks(
-                iso_file,
-                Some(&cache_dir_str),
-            );
+            let tracks =
+                audio_engine_core::scanner::probe_sacd_tracks(iso_file, Some(&cache_dir_str));
 
             if tracks.is_empty() {
                 continue;
