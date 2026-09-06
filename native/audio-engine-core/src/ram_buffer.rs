@@ -30,10 +30,14 @@
 ///                             ▼
 ///                    Primary ← Secondary
 /// ```
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
+
+/// DMA/缓存行对齐要求（蓝图 §3.1）：缓冲区起始地址 64 字节对齐
+const RAM_BUFFER_ALIGN: usize = 64;
 
 /// 默认的 Gapless 预加载触发阈值（秒）。
 ///
@@ -57,9 +61,10 @@ pub const RAM_TRACK_MAX_BYTES: usize = 512 * 1024 * 1024;
 /// 实现零拷贝直通（Direct-Link）。
 pub struct RamTrackBuffer {
     /// 物理连续内存块，存储整首曲目的原始 PCM / DSD 数据。
-    /// 使用 `Vec<u8>` 保证内存连续性（而非分散的 ring buffer），
-    /// 以便 Diretta 回调直接取连续切片。
-    data: Vec<u8>,
+    /// 64 字节对齐的零初始化分配（alloc_zeroed 已触发缺页，append 前无需
+    /// 再做全页触碰；蓝图 §3.1 的 DMA/缓存行要求），Drop 成对 dealloc。
+    data: NonNull<u8>,
+    capacity: usize,
 
     /// 当前写入位置（字节偏移）：由下载/解码线程更新。
     write_pos: AtomicUsize,
@@ -86,18 +91,32 @@ impl RamTrackBuffer {
     /// 2. **防止扩容时拷贝**：提前 reserve 足量空间，写入阶段不会触发 `memcpy`；
     /// 3. **锁定物理内存**：预留空间后调用 [`RamTrackBuffer::lock_memory`]
     ///    防止换页到 swap，彻底消灭 swap I/O 抖动。
-    pub fn with_capacity(initial_capacity: usize) -> Self {
-        let capacity = initial_capacity.min(RAM_TRACK_MAX_BYTES);
-        let mut data = Vec::with_capacity(capacity);
-        // 预分配物理内存（置零是安全初始化的最小代价）
-        data.resize(capacity, 0u8);
+    pub fn with_capacity(initial_capacity: usize, max_bytes: usize) -> Self {
+        let capacity = initial_capacity.min(max_bytes).min(RAM_TRACK_MAX_BYTES);
+        let data = if capacity == 0 {
+            NonNull::dangling()
+        } else {
+            // Safety: capacity > 0 且 align 为 2 的幂；alloc_zeroed 零初始化
+            let data = unsafe {
+                let layout = std::alloc::Layout::from_size_align(capacity, RAM_BUFFER_ALIGN)
+                    .expect("RamTrackBuffer 布局无效");
+                NonNull::new(std::alloc::alloc_zeroed(layout))
+            };
+            data.expect("RamTrackBuffer 物理内存分配失败")
+        };
         Self {
             data,
+            capacity,
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
             fully_loaded: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         }
+    }
+
+    /// 缓冲区容量（字节）。
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// 向缓冲区追加解码数据（由下载/解码线程调用）。
@@ -106,18 +125,21 @@ impl RamTrackBuffer {
     /// 则截断写入并发出警告（调用方应切换到流式模式）。
     pub fn append(&self, src: &[u8]) -> usize {
         let write_pos = self.write_pos.load(Ordering::Relaxed);
-        let available = self.data.capacity().saturating_sub(write_pos);
+        let available = self.capacity.saturating_sub(write_pos);
         let write_len = src.len().min(available);
         if write_len == 0 {
             if !src.is_empty() {
-                warn!("RamTrackBuffer 已满（容量 {} MiB），无法写入更多数据", self.data.capacity() / 1024 / 1024);
+                warn!(
+                    "RamTrackBuffer 已满（容量 {} MiB），无法写入更多数据",
+                    self.capacity / 1024 / 1024
+                );
             }
             return 0;
         }
         // Safety: write_pos 由 AtomicUsize 保护，append 仅由单个下载线程调用，
         // 读侧通过 write_pos 原子值知晓可安全读取的边界，不存在数据竞争。
         unsafe {
-            let dst_ptr = self.data.as_ptr().add(write_pos) as *mut u8;
+            let dst_ptr = self.data.as_ptr().add(write_pos);
             std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, write_len);
         }
         self.write_pos.fetch_add(write_len, Ordering::Release);
@@ -141,19 +163,23 @@ impl RamTrackBuffer {
     /// 缓冲区 drop（unmap）时内核自动解除锁定，无需显式 unlock。
     pub fn lock_memory(&self) -> bool {
         let ptr = self.data.as_ptr().cast::<std::ffi::c_void>();
-        let len = self.data.len();
+        let len = self.capacity;
         #[cfg(unix)]
         let ok = unsafe { libc::mlock(ptr, len) } == 0;
         #[cfg(target_os = "windows")]
-        let ok = unsafe {
-            windows::Win32::System::Memory::VirtualLock(ptr, len).is_ok()
-        };
+        let ok = unsafe { windows::Win32::System::Memory::VirtualLock(ptr, len).is_ok() };
         #[cfg(not(any(unix, target_os = "windows")))]
         let ok = false;
         if ok {
-            info!(len_mib = len / 1024 / 1024, "RamTrackBuffer：物理内存锁定成功，播放热路径免疫 swap 抖动");
+            info!(
+                len_mib = len / 1024 / 1024,
+                "RamTrackBuffer：物理内存锁定成功，播放热路径免疫 swap 抖动"
+            );
         } else {
-            warn!(len_mib = len / 1024 / 1024, "RamTrackBuffer：内存锁定失败（权限不足？），降级为可换页内存");
+            warn!(
+                len_mib = len / 1024 / 1024,
+                "RamTrackBuffer：内存锁定失败（权限不足？），降级为可换页内存"
+            );
         }
         ok
     }
@@ -161,7 +187,7 @@ impl RamTrackBuffer {
     /// 解除内存锁定（显式管理用；缓冲区 drop 时内核亦会自动解除）。
     pub fn unlock_memory(&self) {
         let ptr = self.data.as_ptr().cast::<std::ffi::c_void>();
-        let len = self.data.len();
+        let len = self.capacity;
         #[cfg(unix)]
         unsafe {
             libc::munlock(ptr, len);
@@ -210,9 +236,7 @@ impl RamTrackBuffer {
         let len = available.min(max_len);
         // Safety: read_pos < write_pos，write_pos 端由 append() 以 Ordering::Release 更新，
         // 此处以 Ordering::Acquire 读取，保证写入的字节对当前线程可见。
-        let slice = unsafe {
-            std::slice::from_raw_parts(self.data.as_ptr().add(read_pos), len)
-        };
+        let slice = unsafe { std::slice::from_raw_parts(self.data.as_ptr().add(read_pos), len) };
         Some(slice)
     }
 
@@ -271,6 +295,56 @@ impl RamTrackBuffer {
 unsafe impl Send for RamTrackBuffer {}
 unsafe impl Sync for RamTrackBuffer {}
 
+impl Drop for RamTrackBuffer {
+    fn drop(&mut self) {
+        if self.capacity == 0 {
+            return;
+        }
+        // Safety: 与 with_capacity 的 alloc_zeroed 成对；drop 时唯一持有
+        unsafe {
+            std::alloc::dealloc(
+                self.data.as_ptr(),
+                std::alloc::Layout::from_size_align_unchecked(self.capacity, RAM_BUFFER_ALIGN),
+            );
+        }
+    }
+}
+
+impl std::io::Read for RamTrackBuffer {
+    /// 从当前读指针拷贝可用数据（整曲物化完成后才打开解码器，无需等待逻辑）。
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read_pos = self.read_pos.load(Ordering::Acquire);
+        let write_pos = self.write_pos.load(Ordering::Acquire);
+        if read_pos >= write_pos {
+            return Ok(0);
+        }
+        let len = (write_pos - read_pos).min(buf.len());
+        // Safety: read_pos < len <= write_pos - read_pos，边界由原子值保证
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.as_ptr().add(read_pos), buf.as_mut_ptr(), len);
+        }
+        self.read_pos.fetch_add(len, Ordering::Release);
+        Ok(len)
+    }
+}
+
+impl std::io::Seek for RamTrackBuffer {
+    /// 以写边界（= 物化完成的曲目大小）为文件长度语义；越界 clamp 到末尾
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        let write_pos = self.write_pos.load(Ordering::Acquire) as i64;
+        let new_pos = match pos {
+            std::io::SeekFrom::Start(n) => n as i64,
+            std::io::SeekFrom::End(n) => write_pos.saturating_add(n),
+            std::io::SeekFrom::Current(n) => {
+                (self.read_pos.load(Ordering::Acquire) as i64).saturating_add(n)
+            }
+        };
+        let new_pos = new_pos.clamp(0, write_pos.max(0)) as usize;
+        self.read_pos.store(new_pos, Ordering::Release);
+        Ok(new_pos as u64)
+    }
+}
+
 /// Gapless 双缓冲 RAM Play 管理器。
 ///
 /// 维护 Primary / Secondary 两个 [`RamTrackBuffer`]，
@@ -305,9 +379,9 @@ pub struct RamPlayManager {
 
 impl RamPlayManager {
     /// 创建新的 RAM Play 管理器。
-    pub fn new(initial_capacity: usize) -> Self {
+    pub fn new(initial_capacity: usize, max_bytes: usize) -> Self {
         Self {
-            primary: Arc::new(RamTrackBuffer::with_capacity(initial_capacity)),
+            primary: Arc::new(RamTrackBuffer::with_capacity(initial_capacity, max_bytes)),
             secondary: None,
             preloading: AtomicBool::new(false),
         }
@@ -369,8 +443,8 @@ impl RamPlayManager {
     }
 
     /// 完全重置管理器（停止/切歌时调用）。
-    pub fn reset(&mut self, initial_capacity: usize) {
-        self.primary = Arc::new(RamTrackBuffer::with_capacity(initial_capacity));
+    pub fn reset(&mut self, initial_capacity: usize, max_bytes: usize) {
+        self.primary = Arc::new(RamTrackBuffer::with_capacity(initial_capacity, max_bytes));
         self.secondary = None;
         self.preloading.store(false, Ordering::Relaxed);
     }
@@ -379,10 +453,11 @@ impl RamPlayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek};
 
     #[test]
     fn test_ram_buffer_append_and_read() {
-        let buf = RamTrackBuffer::with_capacity(1024);
+        let buf = RamTrackBuffer::with_capacity(1024, usize::MAX);
         let data = b"hello diretta";
         buf.append(data);
 
@@ -399,7 +474,7 @@ mod tests {
 
     #[test]
     fn test_ram_play_manager_gapless_swap() {
-        let mut manager = RamPlayManager::new(1024);
+        let mut manager = RamPlayManager::new(1024, usize::MAX);
 
         // 模拟当前曲目 100% 加载且播放到末尾
         let primary = manager.primary();
@@ -409,7 +484,7 @@ mod tests {
         assert!(primary.is_at_eof());
 
         // 注册预加载的 Secondary
-        let secondary = Arc::new(RamTrackBuffer::with_capacity(1024));
+        let secondary = Arc::new(RamTrackBuffer::with_capacity(1024, usize::MAX));
         secondary.append(b"track2_audio");
         secondary.mark_fully_loaded();
         manager.register_secondary(secondary);
@@ -425,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_gapless_trigger_threshold() {
-        let manager = RamPlayManager::new(1024 * 1024);
+        let manager = RamPlayManager::new(1024 * 1024, usize::MAX);
         let primary = manager.primary();
 
         // 写入 5 秒的数据（假设 44100 * 2 * 2 = 176400 bytes/sec）
@@ -439,10 +514,43 @@ mod tests {
     }
 
     #[test]
+    fn test_buffer_allocation_is_64b_aligned() {
+        // 蓝图 §3.1：DMA/缓存行对齐
+        for cap in [64, 4096, 1024 * 1024] {
+            let buf = RamTrackBuffer::with_capacity(cap, usize::MAX);
+            assert_eq!(buf.data.as_ptr() as usize % RAM_BUFFER_ALIGN, 0);
+            assert_eq!(buf.capacity(), cap);
+        }
+    }
+
+    #[test]
+    fn test_read_seek_roundtrip_over_materialized_track() {
+        let mut buf = RamTrackBuffer::with_capacity(1024, usize::MAX);
+        buf.append(b"hello ram playback");
+        buf.mark_fully_loaded();
+
+        let mut out = [0u8; 5];
+        buf.read_exact(&mut out).unwrap();
+        assert_eq!(&out, b"hello");
+
+        buf.seek(std::io::SeekFrom::Start(6)).unwrap();
+        let mut out2 = [0u8; 4];
+        buf.read_exact(&mut out2).unwrap();
+        assert_eq!(&out2, b"ram ");
+
+        // End 语义以写边界为文件长度；末尾读取即 EOF
+        assert_eq!(buf.seek(std::io::SeekFrom::End(0)).unwrap(), 18);
+        assert_eq!(buf.read(&mut out2).unwrap(), 0);
+
+        // 越界 seek clamp 到末尾
+        assert_eq!(buf.seek(std::io::SeekFrom::Start(999)).unwrap(), 18);
+    }
+
+    #[test]
     fn test_memory_lock_roundtrip() {
         // mlock/munlock 往返：无 CAP_IPC_LOCK 的环境允许失败（EPERM），
         // 只验证调用不 panic 且 unlock 安全
-        let buf = RamTrackBuffer::with_capacity(4096);
+        let buf = RamTrackBuffer::with_capacity(4096, usize::MAX);
         let _ = buf.lock_memory();
         buf.unlock_memory();
     }
@@ -453,10 +561,14 @@ mod tests {
         // 这是 PDM 零电平基准（01 交替平衡），Diretta / HQPlayer 等专业 DSD 播放器的标准静音值。
         // 若错误地使用 0x00，会导致 DSD DAC 产生满幅直流偏置爆音和极高频白噪。
         const EXPECTED_DSD_SILENCE: u8 = 0x69;
-        assert_eq!(EXPECTED_DSD_SILENCE, 0x69_u8,
-            "DSD 静音字节必须为 0x69（PDM 零电平基准），而非 0x00（会导致 DSD DAC 爆音）");
+        assert_eq!(
+            EXPECTED_DSD_SILENCE, 0x69_u8,
+            "DSD 静音字节必须为 0x69（PDM 零电平基准），而非 0x00（会导致 DSD DAC 爆音）"
+        );
         // 同时验证不是 0x00（PCM 静音）
-        assert_ne!(EXPECTED_DSD_SILENCE, 0x00_u8,
-            "0x00 是 PCM 静音值，用于 DSD 会造成爆音");
+        assert_ne!(
+            EXPECTED_DSD_SILENCE, 0x00_u8,
+            "0x00 是 PCM 静音值，用于 DSD 会造成爆音"
+        );
     }
 }
