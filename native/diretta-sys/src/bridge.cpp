@@ -174,7 +174,6 @@ void* open_direct_with_format(
   std::uint16_t channels,
   DIRETTA::FormatID format_id,
   DIRETTA::FormatID alternate_format_id,
-  double bytes_per_sample,
   void* source_context,
   SPlayerDirettaNextBlock next_block,
   SPlayerDirettaReleaseBlock release_block,
@@ -209,21 +208,12 @@ void* open_direct_with_format(
     // 【对齐 tinyLMS】MTU 按 IP 缓存（见 measured_mtu_for）
     std::uint32_t mtu = measured_mtu_for(target, *connection->find);
 
-    // 【对齐 tinyLMS】按 MTU 动态计算传输周期：UDP 包尽量填满 MTU，减少分片
-    // 抖动；DSD 高码率下避免包过大导致 SDK 内部挂起。约束 100us ~ 10ms
-    const std::uint32_t udp_overhead = 48; // IPv6(40) + UDP(8)
-    const std::uint32_t efficient_mtu = (mtu > udp_overhead) ? (mtu - udp_overhead) : 1452;
-    const double bytes_per_second =
-      static_cast<double>(sample_rate) * static_cast<double>(channels) * bytes_per_sample;
-    std::uint32_t cycle_time_us = static_cast<std::uint32_t>(
-      (static_cast<double>(efficient_mtu) / bytes_per_second) * 1000000.0);
-    cycle_time_us = std::clamp(cycle_time_us, 100u, 10000u);
-
     connection->sync = std::make_unique<DirectSync>(
       source_context,
       next_block,
       release_block);
-    // THRED_MODE(289) 为 tinyLMS 验证过的实时线程配置组合；CPU 参数 -1,-1 交由 SDK 自选核心
+    // THRED_MODE(5) = CRITICAL | NOSLEEP4CORE，与官方 SinHost 示例一致；
+    // OCCUPIED(16)+cpuMain/cpuOther 自绑核与动态传输周期为阶段五真机 A/B 实验项
     const auto thread_mode = static_cast<DIRETTA::Sync::THRED_MODE>(5);
     const auto ifno = static_cast<std::uint16_t>(target.get_ifno());
     if (!connection->sync->open(
@@ -269,6 +259,8 @@ void* open_direct_with_format(
       return nullptr;
     }
 
+    // 当前参数为真机 T1-T3 验证过的现行为；atom/官方 SinHost 用 (200µs, 0, 100ms)，
+    // 参数语义复核与 A/B 见优化方案 §1-B4-B6.5（阶段五，真机在场才做）
     connection->sync->configTransferAuto(
       ACQUA::Clock::MilliSeconds(100),
       ACQUA::Clock(),
@@ -376,7 +368,6 @@ void* splayer_diretta_open_direct(
     channels,
     format_id,
     DIRETTA::FormatID::NONE,
-    4.0,
     source_context,
     next_block,
     release_block,
@@ -418,7 +409,6 @@ void* splayer_diretta_open_dsd_direct(
     channels,
     source_format_id,
     alternate_format_id,
-    1.0,
     source_context,
     next_block,
     release_block,
