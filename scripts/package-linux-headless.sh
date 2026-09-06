@@ -402,7 +402,7 @@ diretta_target: null
 EOF
 
     # systemd 服务模板（与 install-linux-headless.sh 同源：非 root + 沙箱）
-    cp "$(dirname "$0")/splayer-headless.service.in" "$pkg_dir/splayer-headless.service.in"
+    cp "${PROJECT_ROOT}/scripts/splayer-headless.service.in" "$pkg_dir/splayer-headless.service.in"
 
     # 一键免编译部署脚本
     cat > "$pkg_dir/install.sh" <<'EOF'
