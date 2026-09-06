@@ -1891,6 +1891,12 @@ impl DirectPcmRing {
             )
             .is_err()
         {
+            // SDK 契约:getNewStream 返回 false 会终止发送线程(之后永不拉流,
+            // 表现为消费冻结)。供数空窗时交付数字静音块保持块时钟,
+            // producer 填好槽后自动恢复真数据
+            if let Some(block) = self.pre_mute_block() {
+                return Some(block);
+            }
             return None;
         }
 
@@ -3803,9 +3809,10 @@ mod tests {
             .iter()
             .all(|&b| b == 0));
 
-        // 窗口关闭后恢复严格欠载语义，保证 Ended 判定不受影响
-        ring.pre_mute_until_ms.store(0, Ordering::Relaxed);
-        assert!(ring.next_block().is_none());
+        // 窗口关闭后恢复严格欠载语义，保证 Ended 判定不受影响ring.pre_mute_until_ms.store(0, Ordering::Relaxed);
+        // SDK 契约:欠载空窗仍交付静音块(返回 false 会终止 SDK 发送线程)
+        let block = ring.next_block().expect("欠载空窗应交付静音块");
+        assert!(block.len > 0);
     }
 
     #[test]

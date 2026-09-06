@@ -808,6 +808,12 @@ impl DirectDsdRing {
             )
             .is_err()
         {
+            // SDK 契约:getNewStream 返回 false 会终止发送线程(之后永不拉流,
+            // 表现为消费冻结)。供数空窗时交付 0x69 静音块保持块时钟,
+            // producer 填好槽后自动恢复真数据
+            if let Some(block) = self.pre_mute_block() {
+                return Some(block);
+            }
             return None;
         }
         let data = slot.payload_ptr.load(Ordering::Relaxed).cast_const();
@@ -2102,8 +2108,13 @@ mod tests {
             .iter()
             .all(|&b| b == DSD_SILENCE_BYTE));
 
-        // 窗口关闭后恢复严格欠载语义，保证 Ended 判定不受影响
+        // 窗口关闭后欠载仍交付 0x69 静音：SDK 契约禁止 getNewStream 返回
+        // false（会终止发送线程，此后永不消费——真机复现的消费冻结）
         ring.pre_mute_until_ms.store(0, Ordering::Relaxed);
-        assert!(ring.next_block().is_none());
+        let block = ring.next_block().expect("欠载空窗应交付静音块而非 None");
+        assert_eq!(block.len, 1024);
+        assert!(unsafe { std::slice::from_raw_parts(block.data, block.len) }
+            .iter()
+            .all(|&b| b == DSD_SILENCE_BYTE));
     }
 }
