@@ -523,6 +523,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-buffer"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "block-padding"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -702,7 +711,7 @@ version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
- "crypto-common",
+ "crypto-common 0.1.7",
  "inout",
 ]
 
@@ -813,6 +822,12 @@ name = "const-oid"
 version = "0.9.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+
+[[package]]
+name = "const-oid"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
 name = "convert_case"
@@ -985,6 +1000,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crypto-common"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "ctor"
 version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1121,7 +1145,7 @@ version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
- "const-oid",
+ "const-oid 0.9.6",
  "pem-rfc7468",
  "zeroize",
 ]
@@ -1138,9 +1162,20 @@ version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
- "block-buffer",
- "const-oid",
- "crypto-common",
+ "block-buffer 0.10.4",
+ "const-oid 0.9.6",
+ "crypto-common 0.1.7",
+]
+
+[[package]]
+name = "digest"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
+dependencies = [
+ "block-buffer 0.12.1",
+ "const-oid 0.10.2",
+ "crypto-common 0.2.2",
 ]
 
 [[package]]
@@ -1714,6 +1749,7 @@ dependencies = [
  "qqkg-api",
  "reqwest 0.12.28",
  "rusqlite",
+ "rust-embed",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1829,6 +1865,15 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "hybrid-array"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "707114b52a152fa7bdb290cd7cd5912d9467273b6d74e21b8d81aca1f8533f6b"
+dependencies = [
+ "typenum",
 ]
 
 [[package]]
@@ -2402,7 +2447,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
 dependencies = [
  "cfg-if",
- "digest",
+ "digest 0.10.7",
 ]
 
 [[package]]
@@ -3864,8 +3909,8 @@ version = "0.9.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8573f03f5883dcaebdfcf4725caa1ecb9c15b2ef50c43a07b816e06799bb12d"
 dependencies = [
- "const-oid",
- "digest",
+ "const-oid 0.9.6",
+ "digest 0.10.7",
  "num-bigint-dig",
  "num-integer",
  "num-traits",
@@ -3890,6 +3935,41 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+]
+
+[[package]]
+name = "rust-embed"
+version = "8.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e7760e252aaba7b09f4be00e36476cf585bdb68a53552ac954cdf504ab4bc9"
+dependencies = [
+ "rust-embed-impl",
+ "rust-embed-utils",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-impl"
+version = "8.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bcfc4d6f53af43755f7a723e4b6b8794fcce052a178dd8c6c1dadc5f5343097"
+dependencies = [
+ "mime_guess",
+ "proc-macro2",
+ "quote",
+ "rust-embed-utils",
+ "syn 2.0.117",
+ "walkdir",
+]
+
+[[package]]
+name = "rust-embed-utils"
+version = "8.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0"
+dependencies = [
+ "sha2",
+ "walkdir",
 ]
 
 [[package]]
@@ -4204,7 +4284,18 @@ checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest",
+ "digest 0.10.7",
+]
+
+[[package]]
+name = "sha2"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.0",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -4249,7 +4340,7 @@ version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
- "digest",
+ "digest 0.10.7",
  "rand_core 0.6.4",
 ]
 

@@ -18,6 +18,9 @@ libc = "0.2"
 # CLI 参数解析
 clap = { version = "4", features = ["derive"] }
 
+# Web 资源内嵌（D.13.1：默认内嵌，首屏零磁盘 IO；--web-root 显式指定时优先磁盘）
+rust-embed = "8"
+
 # HTTP 框架
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
