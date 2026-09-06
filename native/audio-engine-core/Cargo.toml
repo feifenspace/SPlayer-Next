@@ -54,6 +54,8 @@ time = { workspace = true }
 cpal = { version = "0.18.2", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+# ALSA MMAP 直出后端（L1 位纯真本地输出，蓝图 §3.2）
+alsa = "0.11"
 pipewire = { version = "0.10.0", features = ["v0_3_53"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

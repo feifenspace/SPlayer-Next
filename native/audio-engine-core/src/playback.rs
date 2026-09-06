@@ -9,10 +9,41 @@ use crate::audio_output::AudioOutput;
 use crate::error::{AudioErrorKind, AudioResultExt};
 use crate::source::DecoderSource;
 
-/// 平台统一的播放控制句柄：持有一条独立的 `cpal::Stream`。
+/// 播放流（B1.1 单变体枚举扩展点）：新输出后端加变体，句柄层零改动
+pub enum PlaybackStream {
+    Cpal(cpal::Stream),
+    #[cfg(target_os = "linux")]
+    Alsa(crate::alsa_mmap_sink::AlsaMmapStream),
+}
+
+impl PlaybackStream {
+    pub fn play(&self) -> anyhow::Result<()> {
+        match self {
+            PlaybackStream::Cpal(stream) => stream.play().map_err(Into::into),
+            #[cfg(target_os = "linux")]
+            PlaybackStream::Alsa(stream) => {
+                stream.play();
+                Ok(())
+            }
+        }
+    }
+
+    pub fn pause(&self) -> anyhow::Result<()> {
+        match self {
+            PlaybackStream::Cpal(stream) => stream.pause().map_err(Into::into),
+            #[cfg(target_os = "linux")]
+            PlaybackStream::Alsa(stream) => {
+                stream.pause();
+                Ok(())
+            }
+        }
+    }
+}
+
+/// 平台统一的播放控制句柄：持有一条独立的输出流。
 /// 每次加载/seek 由 `attach` 创建，播放期间音量与停止通过原子标志与实时回调通信。
 pub struct PlaybackHandle {
-    stream: cpal::Stream,
+    stream: PlaybackStream,
     volume: Arc<AtomicU32>,
     stopped: Arc<AtomicBool>,
 }

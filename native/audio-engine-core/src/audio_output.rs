@@ -23,9 +23,22 @@ pub type OutputFailureCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 ///
 /// 不持有 `cpal::Stream`——输出流由每次加载音源时的 `PlaybackHandle::attach` 按此配置创建，
 /// 因此切歌时无需跨线程移交流，也天然避免新旧流重叠占用设备。
+/// 输出后端（B1.1 扩展点）：新后端加变体，player 层零改动
+enum OutputBackend {
+    Cpal {
+        device: cpal::Device,
+        config: SupportedStreamConfig,
+    },
+    #[cfg(target_os = "linux")]
+    AlsaMmap {
+        device: String,
+        sample_rate: u32,
+        channels: u16,
+    },
+}
+
 pub struct AudioOutput {
-    device: cpal::Device,
-    config: SupportedStreamConfig,
+    backend: OutputBackend,
     /// 该输出流的单调代次，用于诊断和过滤销毁后迟到的流错误
     generation: u64,
     on_failure: OutputFailureCallback,
@@ -50,6 +63,37 @@ impl AudioOutput {
         generation: u64,
         on_failure: OutputFailureCallback,
     ) -> Result<Self> {
+        // 设备协议：alsammap:<alsa 设备名>（空 = "default"）走 ALSA MMAP 直出，
+        // 其余（None / cpal 设备 ID）走 cpal（B1.1）
+        if let Some(selector) = device_id.filter(|d| d.starts_with("alsammap:")) {
+            #[cfg(target_os = "linux")]
+            {
+                let device = selector.strip_prefix("alsammap:").unwrap_or_default();
+                let device = if device.is_empty() { "default" } else { device };
+                let (_, format, rate, channels, _) =
+                    crate::alsa_mmap_sink::open_pcm(device, requested_sample_rate)?;
+                info!(
+                    device = %device,
+                    ?format,
+                    rate,
+                    "打开 ALSA MMAP 位纯真输出配置"
+                );
+                return Ok(Self {
+                    backend: OutputBackend::AlsaMmap {
+                        device: device.to_owned(),
+                        sample_rate: rate,
+                        channels,
+                    },
+                    generation,
+                    on_failure,
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = (selector, requested_sample_rate);
+                anyhow::bail!("ALSA MMAP 输出仅支持 Linux");
+            }
+        }
         let (device, config) = open_device(device_id, requested_sample_rate)
             .with_audio_kind(AudioErrorKind::Device)?;
         info!(
@@ -59,8 +103,7 @@ impl AudioOutput {
             "打开音频输出配置"
         );
         Ok(Self {
-            device,
-            config,
+            backend: OutputBackend::Cpal { device, config },
             generation,
             on_failure,
         })
@@ -68,29 +111,56 @@ impl AudioOutput {
 
     /// 实际输出流采样率（播放重采样目标）
     pub fn sample_rate(&self) -> u32 {
-        self.config.sample_rate()
+        match &self.backend {
+            OutputBackend::Cpal { config, .. } => config.sample_rate(),
+            #[cfg(target_os = "linux")]
+            OutputBackend::AlsaMmap { sample_rate, .. } => *sample_rate,
+        }
     }
 
     /// 实际输出流声道数
     pub fn channels(&self) -> u16 {
-        self.config.channels()
+        match &self.backend {
+            OutputBackend::Cpal { config, .. } => config.channels(),
+            #[cfg(target_os = "linux")]
+            OutputBackend::AlsaMmap { channels, .. } => *channels,
+        }
     }
 
     /// 按本配置创建一次播放的输出流，实时回调从 `source` 拉取样本。
-    /// 调用方持有返回的 `Stream`，直到本次播放结束。
+    /// 调用方持有返回的 `PlaybackStream`，直到本次播放结束。
     pub(crate) fn build_stream(
         &self,
         source: DecoderSource,
         volume: Arc<AtomicU32>,
         stopped: Arc<AtomicBool>,
-    ) -> Result<cpal::Stream> {
-        let device = self.device.clone();
-        let config = self.config.clone();
-        let on_failure = Arc::clone(&self.on_failure);
-        run_in_clean_mta(move || {
-            build_typed_stream_for_format(&device, &config, source, volume, stopped, on_failure)
-        })
-        .with_audio_kind(AudioErrorKind::Device)
+    ) -> Result<crate::playback::PlaybackStream> {
+        match &self.backend {
+            OutputBackend::Cpal { device, config } => {
+                let device = device.clone();
+                let config = config.clone();
+                let on_failure = Arc::clone(&self.on_failure);
+                let stream = run_in_clean_mta(move || {
+                    build_typed_stream_for_format(
+                        &device, &config, source, volume, stopped, on_failure,
+                    )
+                })
+                .with_audio_kind(AudioErrorKind::Device)?;
+                Ok(crate::playback::PlaybackStream::Cpal(stream))
+            }
+            #[cfg(target_os = "linux")]
+            OutputBackend::AlsaMmap { device, .. } => {
+                let (stream, _, _) = crate::alsa_mmap_sink::AlsaMmapStream::open(
+                    device,
+                    Some(self.sample_rate()),
+                    source,
+                    volume,
+                    stopped,
+                    Arc::clone(&self.on_failure),
+                )?;
+                Ok(crate::playback::PlaybackStream::Alsa(stream))
+            }
+        }
     }
 }
 

@@ -337,6 +337,7 @@ dependencies = [
 name = "audio-engine-core"
 version = "0.1.0"
 dependencies = [
+ "alsa",
  "anyhow",
  "base64",
  "cc",

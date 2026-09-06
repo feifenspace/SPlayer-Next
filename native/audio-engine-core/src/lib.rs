@@ -6,6 +6,8 @@
 
 #![allow(dead_code)]
 
+#[cfg(target_os = "linux")]
+pub mod alsa_mmap_sink;
 pub mod audio_output;
 pub mod cue;
 pub mod decoder;
