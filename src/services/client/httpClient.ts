@@ -40,6 +40,9 @@ export class HttpPlayerClient implements IPlayerClient {
   private ws: WebSocket | null = null;
   private eventListeners = new Set<(event: PlayerEvent) => void>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /// A2.6 协议协商：服务端 protocol.version 超出客户端支持范围时置位，
+  /// 永久停止 WS 重连（结构化错误只报一次）
+  private protocolBlocked = false;
   private isDestroyed = false;
 
   /** headless 服务端支持候选预注册 + 曲终自动连播 */
@@ -125,8 +128,35 @@ export class HttpPlayerClient implements IPlayerClient {
   }
 
   private initWebSocket(): void {
-    if (this.isDestroyed || typeof WebSocket === "undefined") return;
+    if (this.isDestroyed || this.protocolBlocked || typeof WebSocket === "undefined") return;
 
+    void this.checkProtocolVersion().then((compatible) => {
+      if (!compatible || this.isDestroyed || this.protocolBlocked) return;
+      this.openSocket();
+    });
+  }
+
+  /// A2.6 协议版本协商：/api/status 的 protocol.version 超出支持范围即
+  /// 停止 WS 重连（服务端降级/升级到不兼容协议时，客户端诚实报错而非
+  /// 静默解析错乱）。状态不可达（服务未就绪）时放行，交由原重连逻辑处理
+  private async checkProtocolVersion(): Promise<boolean> {
+    try {
+      const res = await this.request<{ protocol?: { version?: number } }>("/api/status");
+      const version = res.data?.protocol?.version;
+      if (version != null && (version < 2 || version > 2)) {
+        this.protocolBlocked = true;
+        console.error(
+          `[httpClient] 服务端协议版本 ${version} 超出客户端支持范围 [2, 2]，停止 WebSocket 重连`,
+        );
+        return false;
+      }
+      return true;
+    } catch {
+      return true;
+    }
+  }
+
+  private openSocket(): void {
     try {
       const wsUrlWithToken = this.token
         ? `${this.wsUrl}?token=${encodeURIComponent(this.token)}`
@@ -170,7 +200,7 @@ export class HttpPlayerClient implements IPlayerClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer || this.isDestroyed) return;
+    if (this.reconnectTimer || this.isDestroyed || this.protocolBlocked) return;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.initWebSocket();
