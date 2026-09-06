@@ -1383,11 +1383,22 @@ impl DirectDsdSource {
                                     }
                                 }
                             } else {
+                                // fill 返回 None = reader 报告 EOF：若远早于曲目时长，
+                                // 即文件读取提前终止（CIFS/介质读失败常伪装成 EOF）
+                                tracing::warn!(
+                                    target: "diretta_dsd",
+                                    "Native DSD 源提前 EOF，production 结束"
+                                );
                                 slot.state.store(SLOT_FREE, Ordering::Release);
                                 producer_ring.finished.store(true, Ordering::Release);
                             }
                         }
-                        Err(_) => {
+                        Err(ref error) => {
+                            tracing::warn!(
+                                target: "diretta_dsd",
+                                error = format!("{error:#}"),
+                                "Native DSD 填槽失败，production 置 failed"
+                            );
                             slot.state.store(SLOT_FREE, Ordering::Release);
                             producer_ring.failed.store(true, Ordering::Release);
                         }

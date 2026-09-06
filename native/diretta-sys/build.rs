@@ -71,8 +71,11 @@ fn main() {
         .include(&sdk_include)
         .flag_if_supported("-fPIC")
         .flag_if_supported("-O3")
-        .flag_if_supported("-Wno-ignored-qualifiers")
-        .flag_if_supported(&format!("-march={}", march));
+        .flag_if_supported("-Wno-ignored-qualifiers");
+    // 注意：绝不给 bridge.cpp 传 -march=<变体>——march 只用于选择 SDK 静态库
+    // 变体；桥接代码含内联 libstdc++ 模板（std::string 等），march=v2 会让
+    // v1 级 CPU（如 Atom x5-E8000）执行到非法指令而 SIGILL（真机已复现）。
+    // bridge.cpp 保持基线 x86-64 指令集。
 
     build.compile("splayer_diretta_bridge");
 
