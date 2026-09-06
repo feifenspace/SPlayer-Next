@@ -72,6 +72,63 @@ pub struct ArtistSummary {
 }
 
 /// 初始化数据库并建表
+/// 当前二进制支持的库 schema 版本。破坏性升级时 +1 并在 init_db 补迁移逻辑；
+/// 库版本高于此值（用户回滚了程序）时拒绝启动，防止降级读坏（G.2 迁移 preflight）
+pub const SCHEMA_VERSION: i32 = 1;
+
+/// 迁移 preflight：库 schema 版本新于二进制支持版本时拒绝启动；
+/// 需要升级的旧库先 VACUUM INTO 备份到 <db目录>/backups/migration-<版本>-<时间戳>/
+fn schema_preflight(conn: &Connection, db_path: &Path) -> Result<()> {
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    match version.cmp(&SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(anyhow::anyhow!(
+            "数据库 schema 版本 ({version}) 高于本程序支持版本 ({SCHEMA_VERSION})，拒绝以旧程序读新数据。请升级程序或恢复备份：{:?}",
+            db_path
+        )),
+        std::cmp::Ordering::Less => {
+            let has_tables: bool = conn.query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table'",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_tables {
+                return Ok(()); // 全新空库，无需备份
+            }
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let backup_dir = db_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("backups")
+                .join(format!("migration-v{version}-{ts}"));
+            std::fs::create_dir_all(&backup_dir)
+                .with_context(|| format!("创建迁移备份目录失败: {:?}", backup_dir))?;
+            let backup_file = backup_dir.join("library.db");
+            conn.execute("VACUUM INTO ?1", [backup_file.to_string_lossy().as_ref()])?;
+            let manifest = serde_json::json!({
+                "schema_version_before": version,
+                "schema_version_target": SCHEMA_VERSION,
+                "timestamp_unix": ts,
+                "source": db_path,
+                "backup": backup_file,
+            });
+            std::fs::write(
+                backup_dir.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            tracing::info!(
+                version_before = version,
+                backup = %backup_file.display(),
+                "旧版库已备份，开始 schema 迁移"
+            );
+            Ok(())
+        }
+    }
+}
+
 pub fn init_db(db_path: &Path) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -80,6 +137,8 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
 
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open SQLite database at {:?}", db_path))?;
+
+    schema_preflight(&conn, db_path)?;
 
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -179,6 +238,9 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_tracks_cue_audio ON tracks(cue_audio_path)",
         [],
     );
+
+    // 迁移完成后盖版本戳（下次启动 preflight 即为 Equal 短路）
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
 
     Ok(conn)
 }

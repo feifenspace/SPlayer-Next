@@ -638,35 +638,16 @@ EOF
 }
 
 install_service() {
-    cat > "$SERVICE_PATH" <<EOF
-[Unit]
-Description=SPlayer Linux Headless Music Server
-After=network-online.target sound.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${RUN_USER}
-Group=${RUN_GROUP}
-WorkingDirectory=${INSTALL_DIR}
-Environment=RUST_LOG=headless_server=info,audio_engine_core=info
-Environment=SPLAYER_DATA_DIR=${DATA_DIR}
-Environment=SPLAYER_CONFIG_PATH=${CONFIG_PATH}
-ExecStart=${BIN_PATH}
-Restart=on-failure
-RestartSec=3
-LimitRTPRIO=infinity
-LimitMEMLOCK=infinity
-AmbientCapabilities=CAP_SYS_NICE CAP_NET_RAW CAP_NET_BIND_SERVICE
-# CAP_DAC_OVERRIDE 必须保留：数据目录属主非 root 时，root 仍需越过权限位写库
-CapabilityBoundingSet=CAP_SYS_NICE CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
-PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=${DATA_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # 服务模板与 package-linux-headless.sh 同源（scripts/splayer-headless.service.in）
+    local template_dir
+    template_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    sed -e "s|@RUN_USER@|${RUN_USER}|g" \
+        -e "s|@RUN_GROUP@|${RUN_GROUP}|g" \
+        -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" \
+        -e "s|@DATA_DIR@|${DATA_DIR}|g" \
+        -e "s|@CONFIG_PATH@|${CONFIG_PATH}|g" \
+        -e "s|@BIN_PATH@|${BIN_PATH}|g" \
+        "${template_dir}/splayer-headless.service.in" > "$SERVICE_PATH"
 
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME"

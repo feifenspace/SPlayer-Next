@@ -401,32 +401,8 @@ web_root: "/opt/splayer-headless/web"
 diretta_target: null
 EOF
 
-    # systemd 服务模板（数据目录由程序默认解析：<程序目录>/data，无需环境变量）
-    cat > "$pkg_dir/splayer-headless.service" <<'EOF'
-[Unit]
-Description=SPlayer Linux Headless Music Server
-After=network-online.target sound.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-Group=root
-WorkingDirectory=/opt/splayer-headless
-Environment=RUST_LOG=headless_server=info,audio_engine_core=info
-Environment=SPLAYER_CONFIG_PATH=/opt/splayer-headless/config/config.yaml
-ExecStart=/opt/splayer-headless/splayer-headless
-Restart=on-failure
-RestartSec=3
-LimitRTPRIO=infinity
-LimitMEMLOCK=infinity
-AmbientCapabilities=CAP_SYS_NICE CAP_NET_RAW CAP_NET_BIND_SERVICE
-# CAP_DAC_OVERRIDE 必须保留：数据目录属主非 root 时，root 仍需越过权限位写库
-CapabilityBoundingSet=CAP_SYS_NICE CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    # systemd 服务模板（与 install-linux-headless.sh 同源：非 root + 沙箱）
+    cp "$(dirname "$0")/splayer-headless.service.in" "$pkg_dir/splayer-headless.service.in"
 
     # 一键免编译部署脚本
     cat > "$pkg_dir/install.sh" <<'EOF'
@@ -484,9 +460,25 @@ else
     log "保留现有配置文件：${CONFIG_PATH}"
 fi
 
-# 5. 安装 systemd 服务
+# 5. 安装 systemd 服务（非 root + 沙箱，与 install-linux-headless.sh 同源）
 log "配置 systemd 系统服务..."
-install -m 0644 "${SCRIPT_DIR}/splayer-headless.service" "$SERVICE_FILE"
+RUN_USER=splayer
+if ! id -u "$RUN_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$RUN_USER"
+    log "已创建系统用户 ${RUN_USER}"
+fi
+# 数据/配置目录属主交给服务用户（CAP_DAC_OVERRIDE 兜底权限位场景）
+chown -R "$RUN_USER:$RUN_USER" "$DATA_DIR" "$CONFIG_DIR"
+render_unit() {
+    sed -e "s|@RUN_USER@|${RUN_USER}|g" \
+        -e "s|@RUN_GROUP@|${RUN_USER}|g" \
+        -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" \
+        -e "s|@DATA_DIR@|${DATA_DIR}|g" \
+        -e "s|@CONFIG_PATH@|${CONFIG_PATH}|g" \
+        -e "s|@BIN_PATH@|${INSTALL_DIR}/splayer-headless|g" \
+        "${SCRIPT_DIR}/splayer-headless.service.in"
+}
+render_unit > "$SERVICE_FILE"
 systemctl daemon-reload
 systemctl enable splayer-headless.service
 systemctl restart splayer-headless.service

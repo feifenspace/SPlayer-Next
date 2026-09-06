@@ -86,6 +86,10 @@ pub(crate) async fn status_handler(State(state): State<AppState>) -> Result<Json
         "speed": snapshot.speed,
         "is_finished": snapshot.is_finished,
         "current_source": snapshot.current_source,
+        // 构建元数据（G.2 runtime.json 契约的运行期部分）
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("SPLAYER_BUILD_COMMIT"),
+        "source_dirty": env!("SPLAYER_BUILD_DIRTY") == "true",
     })))
 }
 

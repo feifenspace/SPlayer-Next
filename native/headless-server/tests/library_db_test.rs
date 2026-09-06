@@ -357,3 +357,23 @@ FILE "CDImage.wav" WAVE
         assert_eq!(t1.cue_end_ms, Some(200000));
     }
 }
+
+/// G.2 迁移 preflight：库 schema 版本高于二进制支持版本时拒绝初始化
+#[test]
+fn schema_preflight_rejects_newer_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("library.db");
+    {
+        let _conn = db::init_db(&db_path).unwrap();
+    }
+    // 模拟"未来版本"程序写高版本戳
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+    }
+    let error = db::init_db(&db_path).unwrap_err().to_string();
+    assert!(
+        error.contains("99") && error.contains("拒绝"),
+        "应拒绝高版本库并给出版本信息: {error}"
+    );
+}
