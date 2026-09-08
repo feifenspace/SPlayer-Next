@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -610,7 +610,27 @@ fn adapt_dsd_bit_order(
     }
 }
 
-const DIRECT_DSD_RING_DEPTH: usize = 8;
+/// ring 预缓冲目标时长（毫秒）：整环深度按此换算。CIFS 等网络文件系统单次
+/// 读延迟毛刺实测可达 ~70ms，固定 8 槽（DSD64 DSF 仅 ~93ms）在毛刺集中时被
+/// 打穿，SDK 拉到静音块与真实数据交替——即 Diretta DSD 播放的哒哒杂音
+const DIRECT_DSD_TARGET_BUFFERED_MS: f64 = 400.0;
+const DIRECT_DSD_RING_DEPTH_MIN: usize = 8;
+/// 深度上限约束内存：DSD512 DSF 单槽 8KB，256 槽 = 2MB
+const DIRECT_DSD_RING_DEPTH_MAX: usize = 256;
+
+/// 槽位容量是各声道合计字节数：换算回单声道比特数后除以 DSD 比特率得到单槽
+/// 时长，整环深度取「目标时长 / 单槽时长」向上取整并夹在上下限内。换源
+/// handoff 要求 same_dsd_transport（同比特率），深度在连接生命周期内保持有效
+fn ring_depth_for(format: DirectDsdFormat, slot_capacity: usize) -> usize {
+    let channels = usize::from(format.channels.max(1));
+    let bits_per_channel = (slot_capacity / channels).saturating_mul(8);
+    if format.bit_rate == 0 || bits_per_channel == 0 {
+        return DIRECT_DSD_RING_DEPTH_MIN;
+    }
+    let slot_ms = bits_per_channel as f64 * 1000.0 / f64::from(format.bit_rate);
+    ((DIRECT_DSD_TARGET_BUFFERED_MS / slot_ms).ceil() as usize)
+        .clamp(DIRECT_DSD_RING_DEPTH_MIN, DIRECT_DSD_RING_DEPTH_MAX)
+}
 /// pre-mute 静音窗口时长：覆盖换源/seek 复位的供数空窗（对齐 tinyLMS DSD 20 cycles）
 const PRE_MUTE_WINDOW_MS: u64 = 80;
 
@@ -703,6 +723,15 @@ struct DirectDsdRing {
     signal_cv: Condvar,
     /// 控制通道存在待处理命令的提示位：命令发送方置位并唤醒，producer 消费命令前清零
     command_pending: AtomicBool,
+    /// staged 候选已接受且尚未装填进 ring：曲终判定必须避开此窗口
+    /// （stage 迟到时 producer 在 EOF 处等待，装填后 finished 复位）
+    stage_pending: AtomicBool,
+    /// stage 准备代数：CancelStaged/ReplaceLocal 推进，使在途后台 prepare
+    /// 的结果过期（prepare 在独立线程执行，完成时代数可能已变）
+    stage_epoch: AtomicU64,
+    /// 后台 prepare 已产出 Ready 结果待 producer 收取（finished 分支等待的
+    /// 唤醒提示位；producer 收空通道后复位）
+    staged_ready: AtomicBool,
     /// pre-mute 静音窗口截止（monotonic 毫秒，0 = 未触发）：换源/seek 复位前触发，
     /// 窗口内 SDK 拉取遇供数空窗时交付静音块，消除 Target 欠载杂音
     pre_mute_until_ms: AtomicU64,
@@ -710,6 +739,21 @@ struct DirectDsdRing {
     pre_mute_buf: Mutex<Vec<u8>>,
     /// 最近一次交付块的长度（pre-mute 静音块的几何依据）
     last_delivered_len: AtomicUsize,
+    /// 换源/拆线前排空请求：置位后回调侧把每个交付块替换为 0x69 静音并累计
+    /// 静音垫（DSD 位流不可乘增益，无淡出通道；排空 = 静音顶掉设备端缓冲）。
+    /// replace/seek 复位时清除
+    drain_requested: AtomicBool,
+    /// 排空期间已交付的静音块数
+    silence_blocks: AtomicU32,
+    /// 排空期间已交付静音的累计时长（微秒）：块尺寸波动大，时长时间为主谓词
+    silence_micros: AtomicU64,
+    /// 排空目标时长（µs）：建连后由上层注入（Sink 实测延迟/自报缓冲 + 余量）；
+    /// 0 = 未注入，谓词退回旧常量 DIRECT_FADE_DRAIN_MIN_MICROS（默认行为可回退）
+    drain_target_micros: AtomicU64,
+    /// 静音字节：以 SDK getMuteByte() 返回为准；0 = 未注入（退回 0x69 硬编码）
+    mute_byte: AtomicU8,
+    /// DSD 比特率（Hz）：静音垫时长换算用
+    bit_rate: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -719,8 +763,8 @@ pub struct DirectDsdBlock {
 }
 
 impl DirectDsdRing {
-    fn new(capacity: usize) -> Self {
-        let slots = (0..DIRECT_DSD_RING_DEPTH)
+    fn new(capacity: usize, format: DirectDsdFormat) -> Self {
+        let slots = (0..ring_depth_for(format, capacity))
             .map(|_| DirectDsdSlot::new(capacity))
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -738,9 +782,19 @@ impl DirectDsdRing {
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
             command_pending: AtomicBool::new(false),
+            stage_pending: AtomicBool::new(false),
+            stage_epoch: AtomicU64::new(0),
+            staged_ready: AtomicBool::new(false),
             pre_mute_until_ms: AtomicU64::new(0),
             pre_mute_buf: Mutex::new(Vec::new()),
             last_delivered_len: AtomicUsize::new(0),
+            drain_requested: AtomicBool::new(false),
+            silence_blocks: AtomicU32::new(0),
+            silence_micros: AtomicU64::new(0),
+            // 0 = 未注入：drain 谓词/mute 字节退回旧常量行为（与改动前等价，可回退）
+            drain_target_micros: AtomicU64::new(0),
+            mute_byte: AtomicU8::new(0),
+            bit_rate: format.bit_rate,
         }
     }
 
@@ -790,14 +844,17 @@ impl DirectDsdRing {
             return None;
         }
         // pre-mute 窗口（换源/seek 复位触发）：SDK 拉取遇供数空窗时交付 0x69
-        // 静音块而非"无块"，消除 Target 欠载杂音；不推进 consumed/boundary 会计
-        if self.pre_mute_active() {
+        // 静音块而非"无块"，消除 Target 欠载杂音；不推进 consumed/boundary 会计。
+        // 真实数据优先：候选 slot 已就绪时不让静音块抢占——换源排空垫已在
+        // replace 前顶掉 Target 缓冲，新曲就绪即应立即开始，无需额外静音窗口
+        let index = self.consumer_index.load(Ordering::Relaxed);
+        let slot = &self.slots[index];
+        let slot_ready = slot.state.load(Ordering::Acquire) == SLOT_READY;
+        if self.pre_mute_active() && !slot_ready {
             if let Some(block) = self.pre_mute_block() {
                 return Some(block);
             }
         }
-        let index = self.consumer_index.load(Ordering::Relaxed);
-        let slot = &self.slots[index];
         if slot
             .state
             .compare_exchange(
@@ -843,17 +900,34 @@ impl DirectDsdRing {
     }
 
     /// 触发 pre-mute 静音窗口（换源/seek 复位前调用）：窗口内 SDK 拉取遇
-    /// 供数空窗时交付 0x69 静音块而非"无块"，消除 Target 侧欠载杂音
+    /// 供数空窗时交付 0x69 静音块而非"无块"，消除 Target 侧欠载杂音。
+    /// 缓冲预分配在本函数（producer/控制线程上下文）完成，
+    /// SDK 回调线程内只读不分配（R1：回调路径禁止堆分配）
     fn trigger_pre_mute(&self) {
+        let len = self.last_delivered_len.load(Ordering::Acquire);
+        if len > 0 {
+            let mut buf = self.pre_mute_buf.lock().unwrap_or_else(|p| p.into_inner());
+            if buf.len() < len {
+                buf.resize(len, self.silence_byte());
+            }
+        }
         self.pre_mute_until_ms
             .store(mono_millis() + PRE_MUTE_WINDOW_MS, Ordering::Release);
+    }
+
+    /// 静音字节：SDK 注入值优先，未注入（0）时退回 0x69 硬编码（PDM 直流均衡）
+    fn silence_byte(&self) -> u8 {
+        match self.mute_byte.load(Ordering::Acquire) {
+            0 => DSD_SILENCE_BYTE,
+            byte => byte,
+        }
     }
 
     fn pre_mute_active(&self) -> bool {
         self.pre_mute_until_ms.load(Ordering::Acquire) > mono_millis()
     }
 
-    /// 供数空窗静音块：0x69（PDM 直流均衡），几何沿用最近一次交付块
+    /// 供数空窗静音块：静音字节（PDM 直流均衡），几何沿用最近一次交付块
     fn pre_mute_block(&self) -> Option<DirectDsdBlock> {
         let len = self.last_delivered_len.load(Ordering::Acquire);
         if len == 0 {
@@ -861,13 +935,78 @@ impl DirectDsdRing {
         }
         let mut buf = self.pre_mute_buf.lock().unwrap_or_else(|p| p.into_inner());
         if buf.len() < len {
-            // DSD 静音必须为 0x69，防止满幅直流偏置爆音
-            buf.resize(len, DSD_SILENCE_BYTE);
+            // DSD 静音必须为直流均衡字节（0x69 或 SDK mute_byte），防止满幅直流偏置爆音；
+            // 正常路径已在 trigger_pre_mute 预分配，此分支仅作防御
+            buf.resize(len, self.silence_byte());
         }
         Some(DirectDsdBlock {
             data: buf.as_ptr(),
             len,
         })
+    }
+
+    /// 请求换源/拆线前排空：此后每个交付块在回调侧替换为 0x69 静音
+    /// （DSD 位流不可乘增益，无淡出通道——排空以静音垫置换设备端缓冲）。
+    /// 由控制线程调用，回调线程经原子位观察
+    fn begin_drain(&self) {
+        self.drain_requested.store(true, Ordering::Release);
+    }
+
+    /// 清除排空请求（Phase3 软暂停配套）：恢复播放前必须调用——
+    /// 静音垫请求不清除则恢复后所有交付块持续为 0x69（永久静音，正确性关键）
+    fn clear_drain(&self) {
+        self.drain_requested.store(false, Ordering::Release);
+        self.silence_blocks.store(0, Ordering::Relaxed);
+        self.silence_micros.store(0, Ordering::Relaxed);
+    }
+
+    /// 软暂停就绪谓词：排空请求已置位且至少交付一个 0x69 静音块
+    ///（停发时 Target 端新到块为零电平）
+    fn soft_pause_ready(&self) -> bool {
+        self.drain_requested.load(Ordering::Acquire)
+            && self.silence_blocks.load(Ordering::Acquire) >= 1
+    }
+
+    /// SDK 回调内对即将交付的块原位应用排空静音（与 PCM apply_fade 对称：
+    /// 块 IN_FLIGHT 期仅回调可写，写入安全）。真实旧数据块同样被替换——
+    /// 排空期间旧曲立即静音，静音垫按交付节奏持续顶掉 Target 端缓冲
+    fn apply_drain(&self, data: *mut u8, len: usize) {
+        if !self.drain_requested.load(Ordering::Acquire) {
+            return;
+        }
+        // R1：SDK 实时回调线程内严禁 lock/notify/堆分配 —— 只做原子 store，
+        // 等待方改为短周期轮询（见 DirectDsdMonitor::wait_fade_drained）
+        unsafe { ptr::write_bytes(data, self.silence_byte(), len) };
+        self.silence_blocks.fetch_add(1, Ordering::Release);
+        if self.bit_rate > 0 {
+            // bytes × 8 bit/byte × 1e6 µs/s ÷ bit/s = µs
+            self.silence_micros.fetch_add(
+                len as u64 * 8_000_000 / u64::from(self.bit_rate),
+                Ordering::Release,
+            );
+        }
+    }
+
+    /// 排空目标时长（µs）：上层未注入（0）时退回旧常量，保证默认行为可回退
+    fn drain_target_micros(&self) -> u64 {
+        match self.drain_target_micros.load(Ordering::Acquire) {
+            0 => crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_MICROS,
+            micros => micros,
+        }
+    }
+
+    /// 排空完成谓词：未请求排空视为已完成；已请求则要求静音垫同时达到
+    /// 时长时间下限（主谓词）与块数下限（兜底）——原 OR 逻辑导致 200ms
+    /// 时长下限永不生效（块数先到），静音垫不足 Sink 缓冲即切歌产生爆音
+    fn drain_complete(&self, min_blocks: u32) -> bool {
+        if !self.drain_requested.load(Ordering::Acquire) {
+            return true;
+        }
+        // AND：块数为下限兜底，时长时间为主谓词
+        if self.silence_blocks.load(Ordering::Acquire) < min_blocks {
+            return false;
+        }
+        self.bit_rate == 0 || self.silence_micros.load(Ordering::Acquire) >= self.drain_target_micros()
     }
 
     fn release_in_flight(&self) {
@@ -890,6 +1029,10 @@ impl DirectDsdRing {
         self.consumed_bits_per_channel.store(0, Ordering::Relaxed);
         self.finished.store(false, Ordering::Relaxed);
         self.failed.store(false, Ordering::Relaxed);
+        // 换源后新曲从正常供数开始：清除排空请求与静音垫计数
+        self.drain_requested.store(false, Ordering::Relaxed);
+        self.silence_blocks.store(0, Ordering::Relaxed);
+        self.silence_micros.store(0, Ordering::Relaxed);
         for slot in &self.slots {
             slot.state.store(SLOT_FREE, Ordering::Relaxed);
             slot.payload_ptr.store(ptr::null_mut(), Ordering::Relaxed);
@@ -943,6 +1086,13 @@ struct StagedDsdSource {
     format: DirectDsdFormat,
     duration_micros: u64,
     generation: u64,
+}
+
+/// 后台 stage prepare 线程的结果。epoch 为 ring 的 stage 代数：
+/// CancelStaged/ReplaceLocal 会推进代数，过期结果直接丢弃
+enum StagePrepareOutcome {
+    Ready(u64, StagedDsdSource),
+    Failed(u64),
 }
 
 fn prepare_staged_dsd_source(
@@ -1034,6 +1184,12 @@ fn replace_dsd_ring(
     first_slot.boundary.store(true, Ordering::Relaxed);
     fill_slot(&mut reader, first_slot, wire_bit_order)?
         .context("Native DSD handoff 后没有可播放 payload")?;
+    // R3：新曲首块几何生效——pre-mute 窗口内的静音块随之切换，
+    // 保证 静音块 → 新曲首块 的交付块长度连续，避免 SDK 侧 Size 突变
+    let first_len = first_slot.payload_len.load(Ordering::Acquire);
+    if first_len > 0 {
+        ring.last_delivered_len.store(first_len, Ordering::Release);
+    }
     Ok((reader, new_format))
 }
 
@@ -1077,6 +1233,47 @@ impl DirectDsdMonitor {
                 .slots
                 .iter()
                 .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_FREE)
+    }
+
+    /// staged 候选已接受但尚未装填：此窗口内 finished 不可作为曲终依据
+    /// （stage 迟到时 producer 在 EOF 处等待，装填后 finished 复位）
+    pub fn staging(&self) -> bool {
+        self.ring.stage_pending.load(Ordering::Acquire)
+    }
+
+    /// 排空等待（短周期轮询）：换源/拆线前请求排空后调用，静音垫同时达到
+    /// 时长时间与块数下限（或排空被复位）即返回。句柄持有 ring 的 Arc 引用，
+    /// 供调用方在 player 锁外等待。
+    /// R1 取舍：不再依赖回调线程 notify（SDK 实时线程禁止 lock），
+    /// 改为控制线程 10ms 轮询——判定最多延迟一个轮询周期，发生在瞬时
+    /// 排空等待内，不在常态播放路径；回调线程零锁零负担
+    pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.ring.drain_complete(min_blocks) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 注入排空目标时长（µs）：建连后由上层根据 Sink 实测参数调用；
+    /// 0 = 恢复旧常量行为
+    pub fn set_drain_target_micros(&self, micros: u64) {
+        self.ring.drain_target_micros.store(micros, Ordering::Release);
+    }
+
+    /// 排空目标时长（µs）：供调用方联动计算超时
+    pub fn drain_target_micros(&self) -> u64 {
+        self.ring.drain_target_micros()
+    }
+
+    /// 注入静音字节（SDK getMuteByte() 返回值）；0 = 退回 0x69 硬编码
+    pub fn set_mute_byte(&self, byte: u8) {
+        self.ring.mute_byte.store(byte, Ordering::Release);
     }
 
     /// 事件驱动首块消费等待：任一位被设备消费、失败或源提前结束即唤醒；
@@ -1161,6 +1358,42 @@ impl DirectDsdSource {
         Ok(source)
     }
 
+    /// 换源/拆线前的源级排空请求：此后交付块在回调侧替换为 0x69 静音，
+    /// 直到 replace/seek 复位或连接关闭。DSD 无淡出通道，排空即静音垫
+    pub fn begin_drain(&self) {
+        self.ring.begin_drain();
+    }
+
+    /// 软暂停等待（Phase3）：首个交付块已被替换为 0x69 零电平（或超时，
+    /// 超时后调用方仍会停发，退化为改动前行为）。控制线程 5ms 轮询
+    pub fn wait_soft_pause(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.ring.soft_pause_ready() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 清除排空请求（恢复播放配套）：不清除则恢复后永久静音（正确性关键）
+    pub fn clear_drain(&self) {
+        self.ring.clear_drain();
+    }
+
+    /// 注入排空目标时长（µs）：建连后由上层根据 Sink 实测参数调用
+    pub fn set_drain_target_micros(&self, micros: u64) {
+        self.ring.drain_target_micros.store(micros, Ordering::Release);
+    }
+
+    /// 注入静音字节（SDK getMuteByte() 返回值）；0 = 退回 0x69 硬编码
+    pub fn set_mute_byte(&self, byte: u8) {
+        self.ring.mute_byte.store(byte, Ordering::Release);
+    }
+
     pub fn open_local_at(path: &Path, position_secs: f64) -> Result<(Self, f64)> {
         let mut reader = DirectDsdReader::open_local(path)?;
         let duration_micros = (reader.duration_secs() * 1_000_000.0)
@@ -1172,7 +1405,14 @@ impl DirectDsdSource {
             0.0
         };
         let format = reader.format();
-        let ring = Arc::new(DirectDsdRing::new(reader.max_output_len()));
+        let ring = Arc::new(DirectDsdRing::new(reader.max_output_len(), format));
+        tracing::info!(
+            target: "diretta_dsd",
+            depth = ring.slots.len(),
+            slot_bytes = reader.max_output_len(),
+            bit_rate = format.bit_rate,
+            "Native DSD ring 初始化（目标预缓冲 {DIRECT_DSD_TARGET_BUFFERED_MS:.0}ms）"
+        );
         ring.duration_micros
             .store(duration_micros, Ordering::Release);
         fill_slot(&mut reader, &ring.slots[0], format.bit_order)?
@@ -1190,6 +1430,10 @@ impl DirectDsdSource {
                 let mut active_format = format;
                 let mut wire_bit_order = format.bit_order;
                 let mut staged: Option<StagedDsdSource> = None;
+                // 后台 stage prepare 的结果通道：prepare 在独立线程执行（打开文件/
+                // CUE seek 可达数百 ms，绝不能阻塞 producer 数据通路）
+                let (stage_result_tx, stage_result_rx) =
+                    mpsc::channel::<StagePrepareOutcome>();
                 let mut next_slot = 1 % producer_ring.slots.len();
                 while !producer_ring.stopped.load(Ordering::Acquire) {
                     // 消费命令前清提示位：此后发送方的新命令会重新置位并唤醒
@@ -1252,6 +1496,11 @@ impl DirectDsdSource {
                                     reader = new_reader;
                                     active_format = new_format;
                                     staged = None;
+                                    // 推进代数：旧候选的在途 prepare 结果作废
+                                    producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
+                                    producer_ring
+                                        .stage_pending
+                                        .store(false, Ordering::Release);
                                     let _ = response.send(Ok(new_format));
                                     next_slot = 1 % producer_ring.slots.len();
                                 }
@@ -1268,30 +1517,74 @@ impl DirectDsdSource {
                             generation,
                             response,
                         }) => {
-                            match prepare_staged_dsd_source(
-                                &path,
-                                start_secs,
-                                active_format,
-                                duration_micros,
-                                generation,
-                            ) {
-                                Ok(candidate) => {
-                                    staged = Some(candidate);
-                                    let _ = response.send(Ok(()));
-                                }
-                                Err(error) => {
-                                    let _ = response.send(Err(error));
-                                }
+                            // stage_pending 置位后直到装填进 ring 或取消/失败才清除。
+                            // prepare 在独立线程执行，完成后经 stage_result 通道回交
+                            // producer（epoch 校验防过期）
+                            producer_ring.stage_pending.store(true, Ordering::Release);
+                            let epoch = producer_ring.stage_epoch.load(Ordering::Acquire);
+                            let fmt = active_format;
+                            let result_tx = stage_result_tx.clone();
+                            let flag = std::sync::Arc::clone(&producer_ring);
+                            let spawned = std::thread::Builder::new()
+                                .name("direct-dsd-stage-prepare".into())
+                                .spawn(move || {
+                                    let result = prepare_staged_dsd_source(
+                                        &path,
+                                        start_secs,
+                                        fmt,
+                                        duration_micros,
+                                        generation,
+                                    );
+                                    match result {
+                                        Ok(candidate) => {
+                                            let _ = result_tx.send(StagePrepareOutcome::Ready(
+                                                epoch, candidate,
+                                            ));
+                                            flag.staged_ready.store(true, Ordering::Release);
+                                            flag.notify_state();
+                                            let _ = response.send(Ok(()));
+                                        }
+                                        Err(error) => {
+                                            flag.stage_pending.store(false, Ordering::Release);
+                                            let _ = result_tx
+                                                .send(StagePrepareOutcome::Failed(epoch));
+                                            let _ = response.send(Err(error));
+                                        }
+                                    }
+                                });
+                            if spawned.is_err() {
+                                // 线程启动失败：response 随闭包丢弃，调用方 recv()
+                                // 直接得到错误；此处仅复位提示位
+                                producer_ring.stage_pending.store(false, Ordering::Release);
                             }
                             continue;
                         }
                         Ok(DirectDsdCommand::CancelStaged) => {
                             staged = None;
+                            producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
+                            producer_ring.stage_pending.store(false, Ordering::Release);
                             continue;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => return,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
+                    // 收取后台 prepare 的结果：epoch 匹配才装填（过期结果丢弃）；
+                    // 失败仅清除 stage_pending
+                    while let Ok(outcome) = stage_result_rx.try_recv() {
+                        match outcome {
+                            StagePrepareOutcome::Ready(epoch, candidate) => {
+                                if epoch == producer_ring.stage_epoch.load(Ordering::Acquire) {
+                                    staged = Some(candidate);
+                                }
+                            }
+                            StagePrepareOutcome::Failed(epoch) => {
+                                if epoch == producer_ring.stage_epoch.load(Ordering::Acquire) {
+                                    producer_ring.stage_pending.store(false, Ordering::Release);
+                                }
+                            }
+                        }
+                    }
+                    producer_ring.staged_ready.store(false, Ordering::Release);
                     if producer_ring.failed.load(Ordering::Acquire) {
                         // 事件等待：等 failed 被清（reset_for_transition）或有新命令
                         producer_ring.wait_for(
@@ -1309,6 +1602,7 @@ impl DirectDsdSource {
                             producer_ring.wait_for(
                                 |ring| {
                                     !ring.finished.load(Ordering::Acquire)
+                                        || ring.staged_ready.load(Ordering::Acquire)
                                         || ring.command_pending.load(Ordering::Acquire)
                                 },
                                 PRODUCER_WAIT_CEILING,
@@ -1342,11 +1636,13 @@ impl DirectDsdSource {
                                 reader = new_reader;
                                 active_format = new_format;
                                 producer_ring.finished.store(false, Ordering::Release);
+                                producer_ring.stage_pending.store(false, Ordering::Release);
                                 next_slot = (next_slot + 1) % producer_ring.slots.len();
                             }
                             Err(_) => {
                                 slot.state.store(SLOT_FREE, Ordering::Release);
                                 producer_ring.failed.store(true, Ordering::Release);
+                                producer_ring.stage_pending.store(false, Ordering::Release);
                             }
                         }
                         continue;
@@ -1381,11 +1677,17 @@ impl DirectDsdSource {
                                         reader = new_reader;
                                         active_format = new_format;
                                         producer_ring.finished.store(false, Ordering::Release);
+                                        producer_ring
+                                            .stage_pending
+                                            .store(false, Ordering::Release);
                                         next_slot = (next_slot + 1) % producer_ring.slots.len();
                                     }
                                     Err(_) => {
                                         slot.state.store(SLOT_FREE, Ordering::Release);
                                         producer_ring.failed.store(true, Ordering::Release);
+                                        producer_ring
+                                            .stage_pending
+                                            .store(false, Ordering::Release);
                                     }
                                 }
                             } else {
@@ -1571,6 +1873,8 @@ pub unsafe extern "C" fn direct_dsd_next_block(
     let Some(block) = ring.next_block() else {
         return false;
     };
+    // 换源/拆线前排空：交付前把块原位替换为 0x69 静音（块 IN_FLIGHT 期仅本回调可写）
+    ring.apply_drain(block.data.cast_mut(), block.len);
     unsafe {
         *data = block.data;
         *len = block.len;
@@ -2083,9 +2387,40 @@ mod tests {
         assert_eq!(monitor.boundary_generation(), 9);
     }
 
+    fn test_dsd64_format() -> DirectDsdFormat {
+        DirectDsdFormat {
+            bit_rate: 2_822_400,
+            channels: 2,
+            bit_order: DirectDsdBitOrder::LsbFirst,
+            container: DirectDsdContainer::Dsf,
+        }
+    }
+
+    /// 整环预缓冲时长必须覆盖目标毫秒数（CIFS 读毛刺吸收能力）
+    #[test]
+    fn ring_depth_covers_target_buffered_duration() {
+        let format = test_dsd64_format();
+        // DSF 4096B/声道：单槽 11.61ms
+        let depth = ring_depth_for(format, 8192);
+        let buffered_ms = depth as f64 * 4096.0 * 8.0 * 1000.0 / 2_822_400.0;
+        assert!(buffered_ms >= DIRECT_DSD_TARGET_BUFFERED_MS);
+
+        // DFF 槽位更大（16KB/声道）：槽数变少但整环时长仍达标
+        let dff_depth = ring_depth_for(format, 32768);
+        let dff_buffered_ms = dff_depth as f64 * 16384.0 * 8.0 * 1000.0 / 2_822_400.0;
+        assert!(dff_buffered_ms >= DIRECT_DSD_TARGET_BUFFERED_MS);
+
+        // DSD512 单槽仅 ~1.45ms：深度夹在上限 256（内存 2MB 封顶）
+        let dsd512 = DirectDsdFormat {
+            bit_rate: 22_579_200,
+            ..format
+        };
+        assert_eq!(ring_depth_for(dsd512, 8192), DIRECT_DSD_RING_DEPTH_MAX);
+    }
+
     #[test]
     fn strict_dsd_ring_underrun_returns_no_block_instead_of_inserting_data() {
-        let ring = DirectDsdRing::new(64);
+        let ring = DirectDsdRing::new(64, test_dsd64_format());
         assert!(ring.next_block().is_none());
     }
 
@@ -2093,7 +2428,7 @@ mod tests {
     /// 消除 Target 欠载杂音；窗口关闭后恢复严格欠载语义
     #[test]
     fn dsd_pre_mute_window_delivers_0x69_silence_over_the_gap() {
-        let ring = DirectDsdRing::new(64);
+        let ring = DirectDsdRing::new(64, test_dsd64_format());
         // 未触发窗口：严格欠载语义（None）保持不变
         assert!(ring.next_block().is_none());
 

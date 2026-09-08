@@ -278,3 +278,43 @@ export const getQueueItem = (index: number): PlaybackQueueItem | null => {
 export const findTrackIndex = (trackId: string): number => {
   return queueEntries.value.findIndex((item) => item.track.id === trackId);
 };
+
+/**
+ * 根据服务端权威 source 逆向匹配队列曲目索引。
+ *
+ * 服务端持久播放在源可能是 CUE 物理切片串（`<master>|start|dur|trackNum`），
+ * 而前端队列存的却是 cue:// 虚拟 ID（或普通本地路径）。全等匹配会失败导致
+ * 当选曲目脱节、标题退化为切片串。本函数先把 common 格式全等对拍，
+ * 再把切片串的"母版音频路径 + 分轨序号"与本地 CUE 音轨（cueAudioPath/track）
+ * 对拍命中，即可把游标归位到正确的 cue:// 曲目。
+ *
+ * @param serverSource - 服务端上报的当前/候选 source（可为物理切片串）
+ * @returns 队列索引，未找到返回 -1
+ */
+export const findTrackIndexByServerSource = (serverSource: string): number => {
+  if (!serverSource) return -1;
+
+  // 1) 全等：ID / path / 母版路径任一命中
+  const direct = queueEntries.value.findIndex(
+    (item) =>
+      item.track.id === serverSource ||
+      item.track.path === serverSource ||
+      (item.track.cueAudioPath ?? "") === serverSource,
+  );
+  if (direct !== -1) return direct;
+
+  // 2) CUE 物理切片格式：`<master>|start|dur|trackNum`
+  const seg = serverSource.split("|");
+  if (seg.length === 4) {
+    const master = seg[0];
+    const trackNum = seg[3];
+    const cueMatch = queueEntries.value.findIndex(
+      (item) =>
+        (item.track.cueAudioPath ?? "") === master &&
+        String(item.track.track ?? "") === trackNum,
+    );
+    if (cueMatch !== -1) return cueMatch;
+  }
+
+  return -1;
+};

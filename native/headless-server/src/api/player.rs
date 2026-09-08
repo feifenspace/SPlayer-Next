@@ -23,7 +23,7 @@ use crate::state::{AppState, PlayerSnapshot};
 use anyhow::Context as _;
 use audio_engine_core::direct_runtime::{
     is_native_dsd_source, DirectLoadOutcome, DIRECT_FADE_DRAIN_MIN_BLOCKS,
-    DIRECT_FADE_DRAIN_TIMEOUT, DIRECT_FULL_RECONNECT_STABILIZATION,
+    DIRECT_FULL_RECONNECT_STABILIZATION,
 };
 use audio_engine_core::ram_buffer::RamTrackBuffer;
 use audio_engine_core::LoadSuperseded;
@@ -164,6 +164,12 @@ pub(crate) async fn pause_handler(State(state): State<AppState>) -> Json<PlayerR
 /// 停止
 pub(crate) async fn stop_handler(State(state): State<AppState>) -> Json<PlayerResponse> {
     let _ = spawn_isolated_blocking("player-stop-worker", move || {
+        // 停止即作废在途/已就绪的无缝预载（下一曲 staging 不属于新会话）
+        super::direct_preloader::invalidate();
+        // 中止在途的 probe 物化下载（若有）：停止后继续下载属于纯浪费
+        if let Some(download) = state.load_download_cancel.lock().take() {
+            download.cancel();
+        }
         let mut player = state.player.lock();
         player.stop();
         state.note_source_change(None);
@@ -351,6 +357,11 @@ fn resolve_cue_source(
 /// 单次 load 在进入异步 worker 前从 player 锁内预留的全部状态
 struct LoadReservation {
     handle: audio_engine_core::HttpCancelHandle,
+    /// probe 物化下载专用取消句柄：已注册进 state.load_download_cancel，
+    /// 下一个 load/stop 会 cancel 它以中止本请求仍在途的全量下载。
+    /// 与主 handle 分离——播放中源的 HttpAudioSource 持有主 handle，
+    /// 若复用会把"取消下载"误伤成"打断播放中的连接"
+    download_cancel: audio_engine_core::HttpCancelHandle,
     direct_initial_take: Option<audio_engine_core::player::OldThreads>,
     direct_active: bool,
     current_direct_format: Option<audio_engine_core::direct_runtime::DirectFormat>,
@@ -372,16 +383,31 @@ struct LoadReservation {
 fn reserve_player_for_load(
     state: &AppState,
     handle: audio_engine_core::HttpCancelHandle,
+    source: &str,
 ) -> Result<LoadReservation, ApiError> {
     let mut player = state.player.lock();
     let mut device_name = player.selected_device().map(String::from);
-    // B1.1 位纯真门槛：alsammap 选择下音量≠100%/DSP 开启时自动降级 cpal
-    // 默认设备（文档 B9.4）；音量恢复 100% 后下一次 load 自动回到 MMAP
+    // B1.1 位纯真门槛：alsammap 选择下音量≠100%/DSP 开启或源为 DSD 时自动降级
+    // cpal（文档 B9.4）；音量恢复 100% 且源为 PCM 后下一次 load 自动回到 MMAP。
     if let Some(ref selector) = device_name {
         if selector.starts_with("alsammap:") {
-            if let Err(reason) = player.validate_alsammap_entry() {
-                tracing::warn!(selector = %selector, reason = %reason, "alsammap 降级 cpal 默认设备");
-                device_name = None;
+            let downgrade_reason = if is_native_dsd_source(source) {
+                Some("DSD 源需 DSD→PCM 转换，alsammap 位纯直出不支持".to_string())
+            } else {
+                player
+                    .validate_alsammap_entry()
+                    .err()
+                    .map(|e| e.to_string())
+            };
+            if let Some(reason) = downgrade_reason {
+                // 降级目标优先选同一物理声卡的 plughw 兄弟设备（ALSA 为每个 hw 设备
+                // 自动定义 plughw 并做格式/采样率转换），声音仍从用户所选声卡输出
+                let sibling = selector.strip_prefix("alsammap:").and_then(|alsa| {
+                    let rest = alsa.strip_prefix("hw:").unwrap_or(alsa);
+                    (!rest.is_empty()).then(|| format!("alsa:plughw:{rest}"))
+                });
+                tracing::warn!(selector = %selector, sibling = ?sibling, reason = %reason, "alsammap 降级 cpal");
+                device_name = sibling;
             }
         }
     }
@@ -393,6 +419,13 @@ fn reserve_player_for_load(
         if let Err(e) = player.validate_direct_entry() {
             return Err(ApiError::bad_request(e.to_string()));
         }
+        // 手动切歌意图已明确：立即作废无缝预载缓存（含在途 prepare，epoch 推进）。
+        // 否则 probe/淡出窗口（数百 ms）内当前曲 EOF 会装填缓存曲目"抢播"，
+        // 用户先听到错曲片段再进入目标曲——这是切歌"杂音/错乱感"的来源之一。
+        // 预载在 load 提交后会按新当前曲重新调度，此处作废无副作用
+        if let Some(handle) = player.direct_stage_handle() {
+            handle.cancel();
+        }
     }
     let direct_active = direct_selector.is_some() && player.direct_active();
     let current_direct_format = player.direct_format();
@@ -402,10 +435,21 @@ fn reserve_player_for_load(
         let (old_threads, token) = player.take_for_async_load(handle.clone());
         (Some(old_threads), token)
     };
+    // 轮换注册下载取消句柄：cancel 上一请求仍在途的物化下载（probe 阶段
+    // 长循环不受 load token 校验中断，无此机制则连续切歌会并发多个僵尸下载）
+    let download_cancel = audio_engine_core::HttpCancelHandle::new();
+    let previous_download = state
+        .load_download_cancel
+        .lock()
+        .replace(download_cancel.clone());
+    if let Some(previous) = previous_download {
+        previous.cancel();
+    }
     let output_generation = player.reserve_output_generation();
     let failure_callback = player.make_failure_callback(output_generation);
     Ok(LoadReservation {
         handle,
+        download_cancel,
         direct_initial_take,
         direct_active,
         current_direct_format,
@@ -447,7 +491,7 @@ pub(crate) async fn load_handler(
 
     let handle = audio_engine_core::HttpCancelHandle::new();
     let source_for_decoder = resolve_cue_source(&state, &source, payload.meta.as_ref())?;
-    let reservation = reserve_player_for_load(&state, handle)?;
+    let reservation = reserve_player_for_load(&state, handle, &source_for_decoder)?;
     let meta_duration_secs = payload
         .meta
         .as_ref()
@@ -510,6 +554,7 @@ fn probe_direct_source(
     meta_duration_secs: Option<f64>,
     cover_dir: Option<&str>,
     handle: &audio_engine_core::HttpCancelHandle,
+    download_cancel: &audio_engine_core::HttpCancelHandle,
     load_token: &std::sync::atomic::AtomicU64,
     token: u64,
 ) -> Result<
@@ -537,7 +582,14 @@ fn probe_direct_source(
     let physical_source = if stream_mode {
         None
     } else if is_http {
-        Some(materialize_direct_input(source_for_direct)?)
+        // 物化下载用独立取消句柄：被新 load/stop 掐断时本请求整体失败，
+        // token 校验随后把它归类为让位（而非故障）
+        let abort_download = || download_cancel.is_cancelled();
+        Some(materialize_direct_input(
+            source_for_direct,
+            download_cancel,
+            abort_download,
+        )?)
     } else if ram.is_none() {
         Some(DirectInput::Path(source_for_direct.to_owned()))
     } else {
@@ -579,6 +631,7 @@ fn try_handoff_to_new_source(
     state: &AppState,
     token: u64,
     source_for_direct: &str,
+    open_path: Option<&str>,
     auto_play: bool,
     current_format: audio_engine_core::direct_runtime::DirectFormat,
     metadata: &mut audio_engine_core::AudioMetadata,
@@ -588,6 +641,7 @@ fn try_handoff_to_new_source(
         &state.player,
         token,
         source_for_direct,
+        open_path,
         metadata.duration_secs,
         auto_play,
         current_format,
@@ -651,9 +705,12 @@ fn full_reconnect_load(
             // 排空等待最长 600ms：短锁取句柄，在锁外等待不占全局 player 锁
             let drain = state.player.lock().direct_drain_handle();
             if let Some(monitor) = &drain {
-                if !monitor
-                    .wait_fade_drained(DIRECT_FADE_DRAIN_MIN_BLOCKS, DIRECT_FADE_DRAIN_TIMEOUT)
-                {
+                // 超时与动态排空目标联动（drain_target + EXTRA）
+                if !monitor.wait_fade_drained(
+                    DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                    std::time::Duration::from_micros(monitor.drain_target_micros())
+                        + audio_engine_core::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
+                ) {
                     tracing::warn!(
                         target: "diretta_handoff",
                         phase = "reconnect_fade_drain_timeout",
@@ -743,6 +800,7 @@ async fn run_direct_load(
 ) -> Result<Json<PlayerResponse>, ApiError> {
     let LoadReservation {
         handle,
+        download_cancel,
         direct_initial_take,
         direct_active,
         current_direct_format: direct_format_snapshot,
@@ -782,9 +840,23 @@ async fn run_direct_load(
             meta_duration_secs,
             cover_dir.as_deref(),
             &handle,
+            &download_cancel,
             &load_token_for_direct,
             token,
         )?;
+
+        // handoff 打开用物化路径：preload 物化产物（memfd/磁盘缓存）本地
+        // seekable，避免 handoff 阶段绕过缓存重开网络流（整曲双下载，且
+        // preload 的抗网络抖动语义失效）。仅 HTTP 换源传入——本地 CUE/SACD
+        // 的 source 是含虚拟轨信息的串，cue/sacd 解析必须留在引擎内基于
+        // source 进行；stream 模式无物化（None），按 URL 流式打开（原行为）
+        let handoff_open_path = if is_http {
+            physical_source
+                .as_ref()
+                .map(|input| input.path().to_owned())
+        } else {
+            None
+        };
 
         if direct_active {
             let current_format =
@@ -793,6 +865,7 @@ async fn run_direct_load(
                 &state_for_task,
                 token,
                 &source_for_direct,
+                handoff_open_path.as_deref(),
                 auto_play,
                 current_format,
                 &mut metadata,
@@ -849,6 +922,8 @@ async fn commit_direct_outcome(
         Ok(DirectLoadOutcome::Handoff(meta)) => {
             update_now_playing(state, source, &meta);
             state.note_source_change(Some(source));
+            // 新曲已生效：调度下一曲无缝预载（队列未注册时为无害 no-op）
+            super::direct_preloader::schedule_next_preload(state);
             Ok(direct_load_response(source, auto_play, *meta))
         }
         Ok(DirectLoadOutcome::FullReconnect {
@@ -866,6 +941,8 @@ async fn commit_direct_outcome(
                 Some(meta) => {
                     update_now_playing(state, source, &meta);
                     state.note_source_change(Some(source));
+                    // 新曲已生效：调度下一曲无缝预载（队列未注册时为无害 no-op）
+                    super::direct_preloader::schedule_next_preload(state);
                     Ok(direct_load_response(source, auto_play, meta))
                 }
                 None => Ok(Json(PlayerResponse::ok(json!({

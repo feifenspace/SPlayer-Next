@@ -28,6 +28,7 @@ import {
   scheduleNextTrackPreload,
 } from "@/services/nextTrackPreloader";
 import { installPlayStats } from "./stats";
+import { installServerQueueSync, setRestoringQueue, markServerQueueSynchronized } from "./serverQueue";
 import { useFavorite } from "@/composables/useFavorite";
 import { extractColorFromUrl } from "@/utils/color";
 import { handleError, isSkippableError } from "@/utils/errors";
@@ -306,7 +307,10 @@ const loadTrack = async (track: Track | null, context?: PlaybackContext): Promis
   media.setPlaybackContext(context);
   lyricLoader.beginLoad();
   resetForLoad(track.duration ?? 0);
-  void window.api.player.stop();
+  // 注意：此处不得抢跑 fire-and-forget 的 stop——服务端 load 自带完整的旧源接管
+  // 语义（Diretta handoff/全量重连、cpal take_for_async_load），抢先 stop 会把
+  // Diretta 的 handoff 路径架空成"拆线重连"，并造成新旧会话在 Target 上重叠（切歌杂音）。
+  // 音源解析失败的兜底 stop 在下方 unresolved 分支（:327 附近）保留。
   // 是否可跳曲
   let shouldSkip = false;
   try {
@@ -1132,6 +1136,8 @@ export const initPlayer = async (): Promise<void> => {
   // 下一首预载的监听器
   installNextTrackPreloadWatchers();
   scheduleNextTrackPreload();
+  // 服务端队列快照同步（headless 自治无缝预载；桌面端 no-op）
+  installServerQueueSync();
 };
 
 
@@ -1166,6 +1172,7 @@ export const restoreLastTrack = async (): Promise<void> => {
   // 避免队列 playIndex 停留在旧曲（浏览器关闭期间接力过的场景）
   if (isServerActive && serverSource) {
     try {
+      // --- Step A: Restore current track metadata via getNowPlaying ---
       const np = await playerClient.getNowPlaying();
       const meta = np.success ? (np.data as any)?.metadata : null;
       if (meta) {
@@ -1185,11 +1192,100 @@ export const restoreLastTrack = async (): Promise<void> => {
         status.trackLoading = false;
         status.currentSource = serverSource;
         lyricLoader.beginLoad();
-        return; // 服务端已在播，无需本地加载
       }
+
+      // --- Step B: Pull authoritative queue snapshot & align playIndex ---
+      if (playerClient.supportsServerAutoAdvance) {
+        try {
+          const snap = await playerClient.getQueueSnapshot();
+          if (snap.success && snap.data && snap.data.registered && snap.data.items.length > 0) {
+            const snapshotItems = snap.data.items;
+            const localEmpty = queue.queueEntries.value.length === 0;
+
+            if (localEmpty) {
+              // Rebuild local queue from server snapshot.
+              // 新版快照条目携带完整 Track（平台身份 id/source、流媒体 serverId、
+              // CUE 分段、音质等），原样恢复即可重新解析直链/歌词/喜欢；
+              // 旧版快照回退字段拼接——只有展示字段，无平台身份
+              const rebuiltTracks: Track[] = snapshotItems.map((item) =>
+                item.track
+                  ? { ...item.track, duration: item.track.duration || item.duration_ms || 0 }
+                  : {
+                      id: item.source,
+                      source: "local" as const,
+                      path: item.source,
+                      title: item.title || item.source,
+                      artists: item.artist
+                        ? item.artist.split("/").map((name: string) => ({ name: name.trim() }))
+                        : [],
+                      album: item.album ? { name: item.album } : undefined,
+                      cover: item.cover || undefined,
+                      duration: item.duration_ms ?? 0,
+                    },
+              );
+              queue.setQueue(rebuiltTracks);
+              console.log("[player] Rebuilt local queue from server snapshot:", rebuiltTracks.length, "tracks");
+            }
+
+            // Align playIndex: prefer finding current source in local queue.
+            // findTrackIndexByServerSource 支持 CUE 物理切片串 → cue:// 曲目的逆向匹配，
+            // 否则服务端自动接力到 CUE 分轨后游标会脱节
+            const matchIndex = queue.findTrackIndexByServerSource(serverSource);
+            if (matchIndex !== -1) {
+              status.playIndex = matchIndex;
+              const matched = queue.getTrack(matchIndex);
+              if (matched) {
+                // 用队列里结构完整的曲目（正确 id/标题/封面）覆盖 Step A 用引擎
+                // tag 拼出的哑曲目（本地曲目 path/id 与服务端 source 全等命中）
+                media.setTrack(matched);
+                status.currentSource = matched.id || serverSource;
+              }
+            } else {
+              // Fallback to server-reported index
+              status.playIndex = snap.data.index;
+              // 在线曲目的 current_source 是播放时解析的临时直链，与队列曲目的
+              // id/path 全等必然失败（逆向匹配只兜得住本地/CUE）。快照与本地
+              // 队列同源同序，条目数对位且标题一致（防队列漂移错位）时，用队列
+              // 曲目覆盖 Step A 哑曲目（id=直链URL/source=local），恢复封面、
+              // 歌词与平台身份
+              const candidate = queue.getTrack(snap.data.index);
+              const item = snapshotItems[snap.data.index];
+              if (
+                candidate &&
+                item &&
+                snapshotItems.length === queue.queueEntries.value.length &&
+                (!item.title || item.title === candidate.title)
+              ) {
+                media.setTrack(candidate);
+                lyricLoader.beginLoad();
+                void lyricLoader.loadForTrack(null);
+                void coverLoader.loadCoverForTrack(candidate);
+                extractColorFromUrl(candidate.cover ?? candidate.coverOriginal ?? null);
+              }
+            }
+
+            // Align repeat mode
+            status.repeatMode = snap.data.repeat === "one" ? "one" : "list";
+            console.log("[player] Aligned playIndex to", status.playIndex, "repeat:", status.repeatMode);
+
+            // Mark server queue as synchronized to prevent reverse-flush
+            markServerQueueSynchronized();
+          }
+        } catch (snapError) {
+          console.error("[player] getQueueSnapshot failed, skipping alignment:", snapError);
+        }
+      }
+
+      if (meta) return;
     } catch (error) {
       console.error("[player] getNowPlaying failed", error);
+    } finally {
+      // Always release the restore lock so future user actions can push to server
+      setRestoringQueue(false);
     }
+  } else {
+    // Server not active – release the restore lock immediately
+    setRestoringQueue(false);
   }
 
   const lastTrack = status.currentTrack;

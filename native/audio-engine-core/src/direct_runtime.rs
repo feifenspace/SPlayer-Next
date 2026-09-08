@@ -31,8 +31,27 @@ pub struct LoadSuperseded;
 /// Direct handoff/拆连接前排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
 pub const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
 
-/// Direct 排空的事件等待上限（超时兜底，正常远快于此值）
+/// Direct 排空的静音垫时长时间下限（微秒）：块尺寸随 codec/采样率波动
+/// （MP3 ~26ms / FLAC@192k ~21ms/块，固定 4 块的垫时长不可控），
+/// 达到该时长即视为设备端缓冲已置换完成，块数谓词保留为兜底
+pub const DIRECT_FADE_DRAIN_MIN_MICROS: u64 = 200_000;
+
+/// Direct 排空的事件等待上限（超时兜底，正常远快于此值）。
+/// ring 未注入动态排空目标时使用；已注入时调用方按 drain_target + EXTRA 计算
 pub const DIRECT_FADE_DRAIN_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// 动态排空超时的额外余量：timeout = drain_target_micros + EXTRA。
+/// 覆盖轮询周期（10ms）与调度抖动，防止排空谓词达成前被超时截断
+pub const DIRECT_FADE_DRAIN_EXTRA: Duration = Duration::from_millis(400);
+
+/// Phase3 软暂停开关：暂停前先淡出（PCM）/ 0x69 置零（DSD）到零电平再停发，
+/// 消除暂停/恢复的块边界阶跃。默认启用；SPLAYER_DIRECT_SOFT_PAUSE=0/false/off 关闭
+pub fn direct_soft_pause_enabled() -> bool {
+    match std::env::var("SPLAYER_DIRECT_SOFT_PAUSE") {
+        Ok(value) => !matches!(value.as_str(), "0" | "false" | "off" | "OFF"),
+        Err(_) => true,
+    }
+}
 
 /// Diretta full reconnect 后的 Target/DAC 格式稳定窗口。
 /// 仅替换现存 DirectPlayback（全量重连）时使用；同格式 staged/handoff 不经过此路径
@@ -109,15 +128,27 @@ impl DirectMonitor {
         }
     }
 
-    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
-    /// DSD 无淡出通道恒 true；Fake 无音频流恒 true。
+    /// 事件驱动排空等待：淡出/静音垫完成且已交付足量静音（时长时间下限为
+    /// 主谓词），或超时。DSD 排空 = 回调侧静音垫置换设备端缓冲；
+    /// Fake 无音频流恒 true。
     /// 句柄持有 ring 的 Arc 引用，供调用方在 player 锁外排空
     pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
         match self {
             Self::Pcm(value) => value.wait_fade_drained(min_blocks, timeout),
-            Self::Dsd(_) => true,
+            Self::Dsd(value) => value.wait_fade_drained(min_blocks, timeout),
             #[cfg(test)]
             Self::Fake(_) => true,
+        }
+    }
+
+    /// 排空目标时长（µs）：ring 建连后注入的动态值；未注入时为旧常量
+    /// 200_000。调用方以此联动计算 wait_fade_drained 超时。Fake 恒为旧常量
+    pub fn drain_target_micros(&self) -> u64 {
+        match self {
+            Self::Pcm(value) => value.drain_target_micros(),
+            Self::Dsd(value) => value.drain_target_micros(),
+            #[cfg(test)]
+            Self::Fake(_) => DIRECT_FADE_DRAIN_MIN_MICROS,
         }
     }
 
@@ -127,6 +158,18 @@ impl DirectMonitor {
             Self::Dsd(value) => value.finished(),
             #[cfg(test)]
             Self::Fake(value) => value.finished.load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+
+    /// staged 候选已接受但尚未装填进 ring：曲终判定（Ended）必须避开此窗口，
+    /// 否则 stage 迟到时会触发假 Ended（监视线程死亡 + 看门狗抢跑重放）。
+    /// Fake 监视器（仅测试）恒 false
+    pub fn staging(&self) -> bool {
+        match self {
+            Self::Pcm(value) => value.staging(),
+            Self::Dsd(value) => value.staging(),
+            #[cfg(test)]
+            Self::Fake(_) => false,
         }
     }
 
@@ -253,14 +296,15 @@ enum DirectTransport {
 }
 
 impl DirectTransport {
-    /// 换源/关流前的源级淡出：下一交付块 20ms 线性渐零，随后块为数字静音。
-    /// DSD 无独立淡出通道（位流在块边界硬切换），保持 no-op。
+    /// 换源/关流前的源级静音垫请求：PCM 走淡出（下一交付块 10ms 升余弦渐零，
+    /// 随后块为静音）；DSD 位流不可乘增益（无淡出通道），改为请求排空——
+    /// 此后每个交付块在回调侧替换为 0x69 静音，持续顶掉设备端缓冲
     fn begin_fade_out(&self) {
         match self {
             #[cfg(feature = "diretta")]
             Self::Pcm(value) => value.begin_fade_out(),
             #[cfg(feature = "diretta")]
-            Self::Dsd(_) => {}
+            Self::Dsd(value) => value.begin_drain(),
             #[cfg(all(test, not(feature = "diretta")))]
             Self::Fake(_) => {}
             // 空枚举兜底：既无 diretta 也非 test 的构建不存在可构造的传输
@@ -269,7 +313,9 @@ impl DirectTransport {
         }
     }
 
-    /// 淡出是否已生效（后续块均为数字静音）。DSD/Fake 恒返回 true。
+    /// 淡出/排空是否已生效（后续块均为静音）。DSD 排空完成度由
+    /// wait_fade_drained 判定，此处与 PCM 一致返回排空请求是否已置位之后
+    /// 的静音态——DSD 无独立淡出态，保持恒 true（等待方以 wait_fade_drained 为准）
     fn is_faded_out(&self) -> bool {
         match self {
             #[cfg(feature = "diretta")]
@@ -283,16 +329,62 @@ impl DirectTransport {
         }
     }
 
-    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
-    /// DSD/Fake 无淡出需求，恒返回 true。
+    /// 事件驱动排空等待：淡出/静音垫完成且达到时长时间（主）或块数（兜底）
+    /// 下限，或超时。PCM/DSD 均真实等待——DSD 此前恒 true 导致换源零排空
     fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
         match self {
             #[cfg(feature = "diretta")]
             Self::Pcm(value) => value.wait_fade_drained(min_blocks, timeout),
             #[cfg(feature = "diretta")]
-            Self::Dsd(_) => true,
+            Self::Dsd(value) => value.monitor().wait_fade_drained(min_blocks, timeout),
             #[cfg(all(test, not(feature = "diretta")))]
             Self::Fake(_) => true,
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// 排空目标时长（µs）：ring 建连后注入的动态值；未注入时为旧常量。
+    /// Fake/空枚举兜底返回旧常量
+    fn drain_target_micros(&self) -> u64 {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.monitor().drain_target_micros(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => value.monitor().drain_target_micros(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => DIRECT_FADE_DRAIN_MIN_MICROS,
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// 软暂停（Phase3）：淡出（PCM）/ 0x69 置零（DSD）到零电平并至少交付
+    /// 一个静音块（或超时返回 false——调用方仍会停发，退化为硬停）。
+    /// 供 InnerPlayer::pause 在 sync->stop 前调用，消除暂停末块阶跃
+    fn begin_soft_pause_and_wait(&self, timeout: Duration) -> bool {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.begin_soft_pause_and_wait(timeout),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => value.begin_soft_pause_and_wait(timeout),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => true,
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// 恢复播放软起：清除软暂停留下的静音/排空态（PCM 另做淡入）。
+    /// 不清除则恢复后永久静音（正确性关键）。Fake 无状态
+    fn resume_soft(&self) {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.resume_soft(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => value.resume_soft(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => {}
             #[cfg(not(any(feature = "diretta", test)))]
             _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
@@ -538,10 +630,16 @@ impl DirectPlayback {
         Ok(playback)
     }
 
+    /// handoff 换源。`open_path` 为打开用物理路径（在线源的物化产物 memfd/磁盘
+    /// 缓存），与逻辑 `source` 分离：cue/sacd 解析与 DSD 家族嗅探仍基于 source
+    /// （物化路径无原始扩展名；HTTP DSD 源物化后仍是原始 DSF/DFF，家族判定
+    /// 按 URL 才正确），连接与 current_source 记录的也是 source；
+    /// `None` = 直接按 source 打开（本地源原行为）
     #[cfg(feature = "diretta")]
     pub fn handoff_drained_source(
         &mut self,
         source: &str,
+        open_path: Option<&str>,
         duration: f64,
         cancel: crate::ffmpeg_audio::HttpCancelHandle,
     ) -> Result<DirectFormat> {
@@ -569,6 +667,7 @@ impl DirectPlayback {
             } else {
                 (source.to_owned(), 0.0, duration)
             };
+        let open_str = open_path.unwrap_or(&path_str);
         let path = Path::new(&path_str);
         let extension = path
             .extension()
@@ -587,14 +686,14 @@ impl DirectPlayback {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
                 value.set_duration(cue_dur);
-                let format = value.replace_drained_local_source(&path_str, cue_start, cancel)?;
+                let format = value.replace_drained_local_source(open_str, cue_start, cancel)?;
                 DirectFormat::Pcm(format)
             }
             DirectTransport::Dsd(value) => {
                 if !is_dsd {
                     bail!("[Direct] Native DSD → PCM 需要重新协商 Diretta connection");
                 }
-                let format = value.replace_drained_local_source(&path_str, cue_start)?;
+                let format = value.replace_drained_local_source(open_str, cue_start)?;
                 DirectFormat::Dsd(format)
             }
         };
@@ -681,6 +780,22 @@ impl DirectPlayback {
         self.transport.wait_fade_drained(min_blocks, timeout)
     }
 
+    /// 排空目标时长（µs）：ring 建连后注入的动态值；未注入时为旧常量
+    /// 200_000。调用方以此联动计算 wait_fade_drained 超时
+    pub fn drain_target_micros(&self) -> u64 {
+        self.transport.drain_target_micros()
+    }
+
+    /// 软暂停等待（Phase3）：淡出/0x69 置零到零电平再停发（详见 transport）
+    pub fn begin_soft_pause_and_wait(&self, timeout: Duration) -> bool {
+        self.transport.begin_soft_pause_and_wait(timeout)
+    }
+
+    /// 恢复播放软起：清除静音/排空态（PCM 另做淡入）
+    pub fn resume_soft(&self) {
+        self.transport.resume_soft()
+    }
+
     /// open 后启动验证：等待首块被设备真正消费。
     /// 首块消费前失败/提前结束/被新 load 取代即报错；超时返回 Ok(false)，
     /// 由调用方决定回退方式。事件驱动等待，单次 100ms 上限保证 load 取消的响应性
@@ -689,9 +804,17 @@ impl DirectPlayback {
         load_token: &std::sync::atomic::AtomicU64,
         token: u64,
     ) -> Result<bool> {
-        /// 启动验证总超时：Target 时钟锁定通常亚秒级，2s 已覆盖慢启动
+        // 启动验证总超时：Target 时钟锁定通常亚秒级，2s 已覆盖慢启动；
+        // 高码率（>96k PCM / 任意 DSD）首块交付前置更长（DSD 400ms 预缓冲 +
+        // 慢盘首帧读），放宽到 5s——误判会拆掉本已成功的连接，表现即"切歌失败"
         const DIRECT_START_TIMEOUT: Duration = Duration::from_secs(2);
-        let deadline = std::time::Instant::now() + DIRECT_START_TIMEOUT;
+        const DIRECT_START_TIMEOUT_HIGH_RATE: Duration = Duration::from_secs(5);
+        let start_timeout = if self.monitor().is_high_rate() {
+            DIRECT_START_TIMEOUT_HIGH_RATE
+        } else {
+            DIRECT_START_TIMEOUT
+        };
+        let deadline = std::time::Instant::now() + start_timeout;
         loop {
             if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
                 return Err(LoadSuperseded.into());
@@ -747,10 +870,11 @@ impl DirectPlayback {
     pub fn handoff_drained_source(
         &mut self,
         source: &str,
+        open_path: Option<&str>,
         duration: f64,
         cancel: crate::ffmpeg_audio::HttpCancelHandle,
     ) -> Result<DirectFormat> {
-        let _ = cancel;
+        let _ = (open_path, cancel);
         self.duration = duration;
         self.start_offset = crate::cue::parse_cue_virtual_path(source)
             .map(|cue| cue.start_time)

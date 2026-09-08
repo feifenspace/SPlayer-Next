@@ -121,6 +121,11 @@ unsafe extern "C" {
         target_id: *const c_char,
         out_caps: *mut SPlayerDirettaTargetCaps,
     ) -> bool;
+    // Phase0 诊断导出：Sink 实测参数（0 = 不可用/未注入）
+    pub fn splayer_diretta_sink_latency_us(handle: *mut c_void) -> u64;
+    pub fn splayer_diretta_sink_buffer_us(handle: *mut c_void) -> u64;
+    pub fn splayer_diretta_cycle_size(handle: *mut c_void) -> usize;
+    pub fn splayer_diretta_mute_byte(handle: *mut c_void) -> u8;
 }
 
 #[cfg(not(diretta_sdk_enabled))]
@@ -179,4 +184,24 @@ pub unsafe fn splayer_diretta_query_target_caps(
     _out_caps: *mut SPlayerDirettaTargetCaps,
 ) -> bool {
     false
+}
+
+#[cfg(not(diretta_sdk_enabled))]
+pub unsafe fn splayer_diretta_sink_latency_us(_handle: *mut c_void) -> u64 {
+    0
+}
+
+#[cfg(not(diretta_sdk_enabled))]
+pub unsafe fn splayer_diretta_sink_buffer_us(_handle: *mut c_void) -> u64 {
+    0
+}
+
+#[cfg(not(diretta_sdk_enabled))]
+pub unsafe fn splayer_diretta_cycle_size(_handle: *mut c_void) -> usize {
+    0
+}
+
+#[cfg(not(diretta_sdk_enabled))]
+pub unsafe fn splayer_diretta_mute_byte(_handle: *mut c_void) -> u8 {
+    0
 }

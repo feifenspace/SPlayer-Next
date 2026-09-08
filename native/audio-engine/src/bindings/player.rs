@@ -12,7 +12,7 @@ use crate::direct_runtime::LoadSuperseded;
 #[cfg(feature = "diretta")]
 use crate::direct_runtime::{
     is_native_dsd_source, DirectFormat, DirectLoadOutcome, DirectPlayback,
-    DIRECT_FADE_DRAIN_MIN_BLOCKS, DIRECT_FADE_DRAIN_TIMEOUT, DIRECT_FULL_RECONNECT_STABILIZATION,
+    DIRECT_FADE_DRAIN_MIN_BLOCKS, DIRECT_FULL_RECONNECT_STABILIZATION,
 };
 use crate::player::{self, InnerPlayer, PlayerEvent, PlayerState, SeekTake};
 use crate::{audio_output, decoder, device_watcher, diretta};
@@ -600,6 +600,8 @@ impl AudioPlayer {
                         &inner_for_direct,
                         token,
                         &source_for_direct,
+                        // NAPI 侧 Direct Lifecycle Gate 仅支持本地源：无独立打开路径
+                        None,
                         metadata.duration_secs,
                         auto_play,
                         current_format,
@@ -657,9 +659,11 @@ impl AudioPlayer {
                         // 排空等待最长 600ms：短锁取句柄，在锁外等待不占全局 player 锁
                         let drain = inner_for_direct.lock().direct_drain_handle();
                         if let Some(monitor) = &drain {
+                            // 超时与动态排空目标联动（drain_target + EXTRA）
                             if !monitor.wait_fade_drained(
                                 DIRECT_FADE_DRAIN_MIN_BLOCKS,
-                                DIRECT_FADE_DRAIN_TIMEOUT,
+                                std::time::Duration::from_micros(monitor.drain_target_micros())
+                                    + crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
                             ) {
                                 warn!(
                                     target: "diretta_handoff",

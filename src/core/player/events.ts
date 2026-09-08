@@ -9,6 +9,7 @@ import * as cacheScheduler from "@/services/cacheScheduler";
 import * as playStats from "./stats";
 import { playerClient } from "@/services/client";
 import { adoptServerAdvancedTrack, maybeRegisterNextCandidate } from "./serverAutoAdvance";
+import { isServerQueueActive } from "./serverQueue";
 import {
   hasReachedSeekTarget,
   insertManyToQueue,
@@ -94,9 +95,15 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       }
       playback.setDuration(event.data.duration);
       playback.setPlaying(event.data.state === "playing");
-      // headless 自动连播：服务端接力切曲后，按 current_source 采纳队列曲目
-      if (event.data.currentSource && playerClient.supportsServerAutoAdvance) {
-        adoptServerAdvancedTrack(event.data.currentSource);
+      // headless 自动连播：服务端接力/boundary 切曲后按曲目 id（回退 source）采纳队列曲目
+      if (
+        (event.data.currentSource || event.data.currentTrackId) &&
+        playerClient.supportsServerAutoAdvance
+      ) {
+        adoptServerAdvancedTrack({
+          source: event.data.currentSource,
+          trackId: event.data.currentTrackId,
+        });
       }
       break;
     case "seek":
@@ -119,8 +126,10 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       abLoop.checkLoop(adjusted);
       // 推进延时缓存调度
       cacheScheduler.tick(adjusted);
-      // Diretta Source Direct 无缝 stage 检查（内部自节流）
-      maybeStageDirectNext();
+      // Diretta Source Direct 无缝 stage 检查（内部自节流）。
+      // 服务端队列快照已注册时由服务端 preloader 自治 staging（generation
+      // 单一所有权），前端 staging 停用避免同槽竞争
+      if (!isServerQueueActive()) maybeStageDirectNext();
       // headless 自动连播：注册下一曲候选（内部自节流）
       maybeRegisterNextCandidate();
       const track = useMediaStore().track;
@@ -144,7 +153,11 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
     }
     case "directTrackBoundary": {
       // 引擎已在音频回调内零间隙切入下一曲，前端推进 queue/media 并 commit
-      await advanceGaplessBoundary(event.data.duration, event.data.generation);
+      await advanceGaplessBoundary(
+        event.data.duration,
+        event.data.generation,
+        event.data.trackId,
+      );
       break;
     }
     case "sourceError":

@@ -1634,6 +1634,14 @@ struct DirectPcmFadeState {
     silent: AtomicBool,
     /// 已交付的静音块数（tinyLMS 式预静音计数：足够多的静音块顶掉目标端缓冲中的旧音频）
     silence_blocks: AtomicU32,
+    /// 已交付静音的累计时长（微秒）：块尺寸随 codec 波动（MP3 ~26ms / FLAC@192k ~21ms），
+    /// 固定块数计量的实际静音垫时长不可控，排空判定以时长时间为第一谓词
+    silence_micros: AtomicU64,
+    /// 采样率（begin_fade_out 时记录）：静音时长换算用，0 = 未知
+    sample_rate: AtomicU32,
+    /// 排空目标时长（µs）：建连后由上层注入（Sink 实测延迟/自报缓冲 + 余量）；
+    /// 0 = 未注入，谓词退回旧常量 DIRECT_FADE_DRAIN_MIN_MICROS（默认行为可回退）
+    drain_target_micros: AtomicU64,
     /// 打包样本位宽（16/32），0 = 未知（尚未解码出首块）
     sample_bits: AtomicU8,
     /// 有效位宽（s24-in-s32 传输槽时为 24，其余等于 sample_bits）
@@ -1650,6 +1658,9 @@ impl DirectPcmFadeState {
             ramping: AtomicBool::new(false),
             silent: AtomicBool::new(false),
             silence_blocks: AtomicU32::new(0),
+            silence_micros: AtomicU64::new(0),
+            sample_rate: AtomicU32::new(0),
+            drain_target_micros: AtomicU64::new(0),
             sample_bits: AtomicU8::new(0),
             valid_bits: AtomicU8::new(0),
             window_samples: AtomicUsize::new(0),
@@ -1663,6 +1674,7 @@ impl DirectPcmFadeState {
         }
         self.sample_bits.store(sample_bits, Ordering::Release);
         self.valid_bits.store(valid_bits, Ordering::Release);
+        self.sample_rate.store(sample_rate, Ordering::Release);
         // 蓝图 §3.5：升余弦淡出窗 10ms（原线性 20ms）
         let window = (sample_rate as usize).saturating_mul(10) / 1000;
         self.window_samples.store(window.max(1), Ordering::Release);
@@ -1670,6 +1682,27 @@ impl DirectPcmFadeState {
         self.gain_start_micro.store(current, Ordering::Release);
         self.gain_end_micro.store(0, Ordering::Release);
         self.ramping.store(true, Ordering::Release);
+    }
+
+    /// 恢复播放淡入（Phase3 软暂停配套）：清除软暂停留下的静音态，
+    /// 从零增益 10ms 升余弦渐入全增益——复用 apply_fade 的 ramping 通路，
+    /// 与 begin_fade_out 对称。静音态不清除则恢复后永久静音（正确性关键）
+    fn begin_fade_in(&self, sample_bits: u8, valid_bits: u8, sample_rate: u32) {
+        self.reset();
+        self.sample_bits.store(sample_bits, Ordering::Release);
+        self.valid_bits.store(valid_bits, Ordering::Release);
+        self.sample_rate.store(sample_rate, Ordering::Release);
+        let window = (sample_rate as usize).saturating_mul(10) / 1000;
+        self.window_samples.store(window.max(1), Ordering::Release);
+        self.gain_start_micro.store(0, Ordering::Release);
+        self.gain_end_micro.store(1_000_000, Ordering::Release);
+        self.ramping.store(true, Ordering::Release);
+    }
+
+    /// 软暂停就绪谓词：已渐零且至少交付一个静音块（停发时末尾为零电平）
+    fn soft_pause_ready(&self) -> bool {
+        self.silent.load(Ordering::Acquire)
+            && self.silence_blocks.load(Ordering::Acquire) >= 1
     }
 
     fn silent(&self) -> bool {
@@ -1682,12 +1715,31 @@ impl DirectPcmFadeState {
         self.ramping.store(false, Ordering::Release);
         self.silent.store(false, Ordering::Release);
         self.silence_blocks.store(0, Ordering::Release);
+        self.silence_micros.store(0, Ordering::Release);
     }
 
-    /// 排空谓词：已渐零且交付的静音块数达到下限
-    fn drained(&self, min_blocks: u32) -> bool {
-        self.silent.load(Ordering::Acquire)
-            && self.silence_blocks.load(Ordering::Acquire) >= min_blocks
+    /// 排空目标时长（µs）：上层未注入（0）时退回旧常量，保证默认行为可回退
+    fn drain_target_micros(&self) -> u64 {
+        match self.drain_target_micros.load(Ordering::Acquire) {
+            0 => crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_MICROS,
+            micros => micros,
+        }
+    }
+
+    /// 排空谓词：已渐零，且静音垫同时达到块数下限与时长时间下限。
+    /// 原 OR 逻辑导致 200ms 时长下限永不生效（4 块 ≈ 84-104ms 先到），
+    /// 静音垫不足 Sink 缓冲即切歌，Target 端旧音频未排空产生 mid-sample 爆音。
+    /// AND：块数为下限兜底，时长时间为主谓词；
+    /// 采样率未知（0）时退化为只看块数，保持可用性（与旧行为一致）
+    fn drained(&self, min_blocks: u32, min_micros: u64) -> bool {
+        if !self.silent.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.silence_blocks.load(Ordering::Acquire) < min_blocks {
+            return false;
+        }
+        let rate = self.sample_rate.load(Ordering::Acquire);
+        rate == 0 || self.silence_micros.load(Ordering::Acquire) >= min_micros
     }
 }
 
@@ -1717,12 +1769,24 @@ struct DirectPcmRing {
     signal_cv: Condvar,
     /// 控制通道存在待处理命令的提示位：命令发送方置位并唤醒，producer 消费命令前清零
     command_pending: AtomicBool,
+    /// staged 候选已接受且尚未装填进 ring：曲终判定必须避开此窗口——
+    /// producer 在 EOF 后等待 stage 期间 finished=true，装填完成后复位；
+    /// 监视侧若在该窗口判曲终会造成假 Ended（监视线程死亡 + 看门狗抢跑重放）
+    stage_pending: AtomicBool,
+    /// stage 准备代数：CancelStaged/ReplaceLocal 推进，使在途后台 prepare
+    /// 的结果过期（prepare 在独立线程执行，完成时代数可能已变）
+    stage_epoch: AtomicU64,
+    /// 后台 prepare 已产出 Ready 结果待 producer 收取（finished 分支等待的
+    /// 唤醒提示位；producer 收空通道后复位）
+    staged_ready: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
 pub struct DirectPcmBlock {
     pub data: *const u8,
     pub len: usize,
+    /// 每声道帧数：静音垫时长换算用（len 覆盖全部声道的交错字节）
+    pub frames: usize,
 }
 
 impl DirectPcmRing {
@@ -1750,6 +1814,9 @@ impl DirectPcmRing {
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
             command_pending: AtomicBool::new(false),
+            stage_pending: AtomicBool::new(false),
+            stage_epoch: AtomicU64::new(0),
+            staged_ready: AtomicBool::new(false),
         })
     }
 
@@ -1795,7 +1862,7 @@ impl DirectPcmRing {
 
     /// SDK 回调内对即将交付的块原位应用淡出包络/静音。
     /// 块处于 IN_FLIGHT 状态时仅由本回调可写（下一次 next_block/release 才回收），写入安全。
-    fn apply_fade(&self, data: *mut u8, len: usize) {
+    fn apply_fade(&self, data: *mut u8, len: usize, frames: usize) {
         if data.is_null() || len == 0 {
             return;
         }
@@ -1803,8 +1870,14 @@ impl DirectPcmRing {
         if fade.silent() {
             unsafe { ptr::write_bytes(data, 0, len) };
             fade.silence_blocks.fetch_add(1, Ordering::Release);
-            // 静音交付计数变化：唤醒排空等待方
-            self.notify_state();
+            // 静音垫时长累计（时长时间排空谓词的数据源）
+            let rate = fade.sample_rate.load(Ordering::Acquire);
+            if rate > 0 && frames > 0 {
+                fade.silence_micros
+                    .fetch_add(frames as u64 * 1_000_000 / rate as u64, Ordering::Release);
+            }
+            // R1：SDK 实时回调线程内严禁 lock/notify —— 只做原子 store，
+            // 等待方改为短周期轮询（见 wait_fade_drained）
             return;
         }
         if !fade.ramping.load(Ordering::Acquire) {
@@ -1872,15 +1945,18 @@ impl DirectPcmRing {
         }
 
         // pre-mute 窗口（换源/seek 复位触发）：SDK 拉取遇供数空窗时交付静音块
-        // 而非"无块"，消除 Target 欠载杂音；静音块不推进 consumed/boundary 会计
-        if self.pre_mute_active() {
+        // 而非"无块"，消除 Target 欠载杂音；静音块不推进 consumed/boundary 会计。
+        // 真实数据优先：候选 slot 已就绪时不让静音块抢占——换源排空垫已在
+        // replace 前顶掉 Target 缓冲，新曲就绪即应立即开始，无需额外静音窗口
+        let index = self.consumer_index.load(Ordering::Relaxed);
+        let slot = &self.slots[index];
+        let slot_ready = slot.state.load(Ordering::Acquire) == SLOT_READY;
+        if self.pre_mute_active() && !slot_ready {
             if let Some(block) = self.pre_mute_block() {
                 return Some(block);
             }
         }
 
-        let index = self.consumer_index.load(Ordering::Relaxed);
-        let slot = &self.slots[index];
         if slot
             .state
             .compare_exchange(
@@ -1923,7 +1999,11 @@ impl DirectPcmRing {
         self.in_flight.store(index, Ordering::Release);
         self.consumer_index
             .store((index + 1) % self.slots.len(), Ordering::Relaxed);
-        Some(DirectPcmBlock { data, len })
+        Some(DirectPcmBlock {
+            data,
+            len,
+            frames: slot.sample_frames.load(Ordering::Relaxed),
+        })
     }
 
     fn release_in_flight(&self) {
@@ -1941,8 +2021,17 @@ impl DirectPcmRing {
     }
 
     /// 触发 pre-mute 静音窗口（换源/seek 复位前调用）：窗口内 SDK 拉取遇
-    /// 供数空窗时交付静音块而非"无块"，消除 Target 侧欠载杂音
+    /// 供数空窗时交付静音块而非"无块"，消除 Target 侧欠载杂音。
+    /// 缓冲预分配在本函数（producer/控制线程上下文）完成，
+    /// SDK 回调线程内只读不分配（R1：回调路径禁止堆分配）
     fn trigger_pre_mute(&self) {
+        let bytes = self.last_block_bytes.load(Ordering::Acquire);
+        if bytes > 0 {
+            let mut buf = self.pre_mute_buf.lock().unwrap_or_else(|p| p.into_inner());
+            if buf.len() < bytes {
+                buf.resize(bytes, 0); // 分配发生在非回调线程
+            }
+        }
         self.pre_mute_until_ms
             .store(mono_millis() + PRE_MUTE_WINDOW_MS, Ordering::Release);
     }
@@ -1957,13 +2046,16 @@ impl DirectPcmRing {
         if bytes == 0 {
             return None;
         }
+        let frames = self.last_block_frames.load(Ordering::Acquire);
         let mut buf = self.pre_mute_buf.lock().unwrap_or_else(|p| p.into_inner());
         if buf.len() < bytes {
+            // 正常路径已在 trigger_pre_mute 预分配，此分支仅作防御
             buf.resize(bytes, 0);
         }
         Some(DirectPcmBlock {
             data: buf.as_ptr(),
             len: bytes,
+            frames,
         })
     }
 
@@ -2047,6 +2139,13 @@ struct StagedPcmSource {
     format: DirectPcmFormat,
     duration_micros: u64,
     generation: u64,
+}
+
+/// 后台 stage prepare 线程的结果。epoch 为 ring 的 stage 代数：
+/// CancelStaged/ReplaceLocal 会推进代数，过期结果直接丢弃（decoder 随 drop 关闭）
+enum StagePrepareOutcome {
+    Ready(u64, StagedPcmSource),
+    Failed(u64),
 }
 
 fn prepare_staged_pcm_source(
@@ -2188,6 +2287,12 @@ fn replace_pcm_ring(
     first_slot
         .sample_frames
         .store(first_frame.samples_per_channel(), Ordering::Relaxed);
+    // R3：新曲首块几何生效——pre-mute 窗口内的静音块随之切换，
+    // 保证 静音块 → 新曲首块 的 stream.Size 连续，避免 SDK 侧块尺寸突变
+    ring.last_block_bytes
+        .store(first_frame.payload_len, Ordering::Release);
+    ring.last_block_frames
+        .store(first_frame.samples_per_channel(), Ordering::Release);
     // handoff 后第一个 slot 标记为 boundary：消费时 next_block 会递增 transition_count
     first_slot.boundary_duration_micros.store(
         ring.duration_micros.load(Ordering::Relaxed),
@@ -2257,6 +2362,12 @@ impl DirectPcmMonitor {
                 .all(|slot| slot.state.load(Ordering::Acquire) == SLOT_FREE)
     }
 
+    /// staged 候选已接受但尚未装填：此窗口内 finished 不可作为曲终依据
+    /// （stage 迟到时 producer 在 EOF 处等待，装填后 finished 复位）
+    pub fn staging(&self) -> bool {
+        self.ring.stage_pending.load(Ordering::Acquire)
+    }
+
     /// 事件驱动首块消费等待：任一帧被设备消费、失败或源提前结束即唤醒；
     /// 无事件时阻塞至超时（返回 false）。用于启动校验，取代轮询 sleep
     pub fn wait_first_consumed(&self, timeout: Duration) -> bool {
@@ -2286,11 +2397,38 @@ impl DirectPcmMonitor {
         self.ring.boundary_generation.load(Ordering::Acquire)
     }
 
-    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
-    /// 句柄持有 ring 的 Arc 引用，供调用方在 player 锁外排空
+    /// 排空等待（短周期轮询）：淡出完成且静音垫同时达到块数与时长时间
+    /// 下限（动态目标），或超时。句柄持有 ring 的 Arc 引用，供调用方在
+    /// player 锁外排空。
+    /// R1 取舍：不再依赖回调线程 notify（SDK 实时线程禁止 lock），
+    /// 改为控制线程 10ms 轮询——判定最多延迟一个轮询周期，发生在瞬时
+    /// 排空等待内，不在常态播放路径；回调线程零锁零负担
     pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        let min_micros = self.ring.fade.drain_target_micros();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.ring.fade.drained(min_blocks, min_micros) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 注入排空目标时长（µs）：建连后由上层根据 Sink 实测参数调用；
+    /// 0 = 恢复旧常量行为
+    pub fn set_drain_target_micros(&self, micros: u64) {
         self.ring
-            .wait_for(|ring| ring.fade.drained(min_blocks), timeout)
+            .fade
+            .drain_target_micros
+            .store(micros, Ordering::Release);
+    }
+
+    /// 排空目标时长（µs）：供调用方联动计算超时
+    pub fn drain_target_micros(&self) -> u64 {
+        self.ring.fade.drain_target_micros()
     }
 }
 
@@ -2419,6 +2557,11 @@ impl DirectPcmSource {
                 boost_current_audio_thread("diretta-direct-decode");
                 let mut active_format = format;
                 let mut staged: Option<StagedPcmSource> = None;
+                // 后台 stage prepare 的结果通道：prepare 在独立线程执行（打开解码器/
+                // 首帧解码/CUE seek 可达数百 ms，绝不能阻塞 producer 数据通路，
+                // 否则 fresh ring 被吃空 → 欠载静音 → 恢复时静音跳回音频=可闻咔哒）
+                let (stage_result_tx, stage_result_rx) =
+                    mpsc::channel::<StagePrepareOutcome>();
                 let mut next_slot = 1; // slot 0 已被首帧占用
                 while !producer_ring.stopped.load(Ordering::Acquire) {
                     // 消费命令前清提示位：此后发送方的新命令会重新置位并唤醒
@@ -2461,6 +2604,11 @@ impl DirectPcmSource {
                                     decoder = new_decoder;
                                     active_format = new_format;
                                     staged = None;
+                                    // 推进代数：旧候选的在途 prepare 结果作废
+                                    producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
+                                    producer_ring
+                                        .stage_pending
+                                        .store(false, Ordering::Release);
                                     let _ = response.send(Ok(new_format));
                                     next_slot = 1;
                                 }
@@ -2477,30 +2625,76 @@ impl DirectPcmSource {
                             generation,
                             response,
                         }) => {
-                            match prepare_staged_pcm_source(
-                                &path,
-                                start_secs,
-                                active_format,
-                                duration_micros,
-                                generation,
-                            ) {
-                                Ok(candidate) => {
-                                    staged = Some(candidate);
-                                    let _ = response.send(Ok(()));
-                                }
-                                Err(error) => {
-                                    let _ = response.send(Err(error));
-                                }
+                            // stage_pending 置位后直到装填进 ring 或取消/失败才清除：
+                            // 曲终判定避开此窗口。prepare 在独立线程执行，完成后经
+                            // stage_result 通道回交 producer（epoch 校验防过期）
+                            producer_ring.stage_pending.store(true, Ordering::Release);
+                            let epoch = producer_ring.stage_epoch.load(Ordering::Acquire);
+                            let fmt = active_format;
+                            let result_tx = stage_result_tx.clone();
+                            let flag = std::sync::Arc::clone(&producer_ring);
+                            let spawned = std::thread::Builder::new()
+                                .name("direct-stage-prepare".into())
+                                .spawn(move || {
+                                    let result = prepare_staged_pcm_source(
+                                        &path,
+                                        start_secs,
+                                        fmt,
+                                        duration_micros,
+                                        generation,
+                                    );
+                                    match result {
+                                        Ok(candidate) => {
+                                            let _ = result_tx.send(StagePrepareOutcome::Ready(
+                                                epoch, candidate,
+                                            ));
+                                            // 唤醒 finished 分支的等待（结果已就绪）
+                                            flag.staged_ready.store(true, Ordering::Release);
+                                            flag.notify_state();
+                                            let _ = response.send(Ok(()));
+                                        }
+                                        Err(error) => {
+                                            flag.stage_pending.store(false, Ordering::Release);
+                                            let _ = result_tx
+                                                .send(StagePrepareOutcome::Failed(epoch));
+                                            let _ = response.send(Err(error));
+                                        }
+                                    }
+                                });
+                            if spawned.is_err() {
+                                // 线程启动失败：response 随闭包丢弃，调用方 recv()
+                                // 直接得到错误；此处仅复位提示位
+                                producer_ring.stage_pending.store(false, Ordering::Release);
                             }
                             continue;
                         }
                         Ok(DirectPcmCommand::CancelStaged) => {
                             staged = None;
+                            // 推进代数：在途后台 prepare 的结果作废
+                            producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
+                            producer_ring.stage_pending.store(false, Ordering::Release);
                             continue;
                         }
                         Err(mpsc::TryRecvError::Disconnected) => return,
                         Err(mpsc::TryRecvError::Empty) => {}
                     }
+                    // 收取后台 prepare 的结果：epoch 匹配才装填（过期结果丢弃，
+                    // decoder 随 drop 关闭）；失败仅清除 stage_pending
+                    while let Ok(outcome) = stage_result_rx.try_recv() {
+                        match outcome {
+                            StagePrepareOutcome::Ready(epoch, candidate) => {
+                                if epoch == producer_ring.stage_epoch.load(Ordering::Acquire) {
+                                    staged = Some(candidate);
+                                }
+                            }
+                            StagePrepareOutcome::Failed(epoch) => {
+                                if epoch == producer_ring.stage_epoch.load(Ordering::Acquire) {
+                                    producer_ring.stage_pending.store(false, Ordering::Release);
+                                }
+                            }
+                        }
+                    }
+                    producer_ring.staged_ready.store(false, Ordering::Release);
                     if producer_ring.failed.load(Ordering::Acquire) {
                         // 事件等待：等 failed 被清（reset_for_transition）或有新命令
                         producer_ring.wait_for(
@@ -2519,12 +2713,14 @@ impl DirectPcmSource {
                             || producer_ring.fade.silent.load(Ordering::Acquire);
                         if !fade_active {
                             let Some(candidate) = staged.take() else {
-                                // 事件等待：等淡出被激活（关流排空开始）、新源就位或命令到达
+                                // 事件等待：等淡出被激活（关流排空开始）、新源就位、
+                                // 后台 prepare 产出或命令到达
                                 producer_ring.wait_for(
                                     |ring| {
                                         ring.fade.ramping.load(Ordering::Acquire)
                                             || ring.fade.silent.load(Ordering::Acquire)
                                             || !ring.finished.load(Ordering::Acquire)
+                                            || ring.staged_ready.load(Ordering::Acquire)
                                             || ring.command_pending.load(Ordering::Acquire)
                                     },
                                     PRODUCER_WAIT_CEILING,
@@ -2559,11 +2755,17 @@ impl DirectPcmSource {
                                     decoder = new_decoder;
                                     active_format = new_format;
                                     producer_ring.finished.store(false, Ordering::Release);
+                                    producer_ring
+                                        .stage_pending
+                                        .store(false, Ordering::Release);
                                     next_slot = (next_slot + 1) % producer_ring.slots.len();
                                 }
                                 Err(_) => {
                                     slot.state.store(SLOT_FREE, Ordering::Release);
                                     producer_ring.failed.store(true, Ordering::Release);
+                                    producer_ring
+                                        .stage_pending
+                                        .store(false, Ordering::Release);
                                 }
                             }
                             continue;
@@ -2691,11 +2893,17 @@ impl DirectPcmSource {
                                         decoder = new_decoder;
                                         active_format = new_format;
                                         producer_ring.finished.store(false, Ordering::Release);
+                                        producer_ring
+                                            .stage_pending
+                                            .store(false, Ordering::Release);
                                         next_slot = (next_slot + 1) % producer_ring.slots.len();
                                     }
                                     Err(_) => {
                                         slot.state.store(SLOT_FREE, Ordering::Release);
                                         producer_ring.failed.store(true, Ordering::Release);
+                                        producer_ring
+                                            .stage_pending
+                                            .store(false, Ordering::Release);
                                     }
                                 }
                             } else {
@@ -2796,6 +3004,32 @@ impl DirectPcmSource {
         self.ring.notify_state();
     }
 
+    /// 软暂停等待（Phase3）：淡出完成且已交付至少一个静音块（末尾为零电平），
+    /// 或超时（超时后调用方仍会停发，退化为改动前行为）。控制线程 5ms 轮询
+    pub fn wait_soft_pause(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.ring.fade.soft_pause_ready() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 恢复播放淡入（软暂停配套）：清除静音态并从零增益渐入。
+    /// 静音态不清除则恢复后永久静音（正确性关键）
+    pub fn begin_fade_in(&self) {
+        self.ring.fade.begin_fade_in(
+            self.format.storage_bits,
+            self.format.valid_bits,
+            self.format.sample_rate,
+        );
+        self.ring.notify_state();
+    }
+
     /// 淡出块是否已交付给 SDK（后续块均为静音）
     pub fn is_faded_out(&self) -> bool {
         self.ring.fade.silent()
@@ -2806,11 +3040,28 @@ impl DirectPcmSource {
         self.ring.fade.silence_blocks.load(Ordering::Acquire)
     }
 
-    /// 事件驱动排空等待：淡出完成且已交付 min_blocks 块静音，或超时。
-    /// 取代旧的「10ms 轮询 + 固定 sleep」，控制线程在等待期间不占用 CPU。
+    /// 排空等待（短周期轮询）：淡出完成且静音垫同时达到块数与时长时间
+    /// 下限（动态目标），或超时。R1：回调线程不再 notify，控制线程轮询
     pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
+        let min_micros = self.ring.fade.drain_target_micros();
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.ring.fade.drained(min_blocks, min_micros) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// 注入排空目标时长（µs）：建连后由上层根据 Sink 实测参数调用
+    pub fn set_drain_target_micros(&self, micros: u64) {
         self.ring
-            .wait_for(|ring| ring.fade.drained(min_blocks), timeout)
+            .fade
+            .drain_target_micros
+            .store(micros, Ordering::Release);
     }
 
     pub fn replace_drained_local(
@@ -2863,7 +3114,7 @@ pub unsafe extern "C" fn direct_pcm_next_block(
         return false;
     };
     // 关流前淡出/静音在交付前原位应用（块 IN_FLIGHT 期仅本回调可写）
-    ring.apply_fade(block.data.cast_mut(), block.len);
+    ring.apply_fade(block.data.cast_mut(), block.len, block.frames);
     unsafe {
         *data = block.data;
         *len = block.len;

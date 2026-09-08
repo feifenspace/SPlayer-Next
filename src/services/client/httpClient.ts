@@ -8,7 +8,8 @@ import type {
   AudioDevice,
   FftData,
   PlayerEvent,
-} from "./types";
+  Track,
+  ServerQueueSnapshot } from "./types";
 
 interface ServerStatusResponse {
   state: string;
@@ -241,6 +242,8 @@ export class HttpPlayerClient implements IPlayerClient {
               data: {
                 duration: Math.round(msg.data.duration * 1000),
                 generation: Number(msg.data.generation ?? 0),
+                source: msg.data.source ? String(msg.data.source) : undefined,
+                trackId: msg.data.track_id ? String(msg.data.track_id) : undefined,
               },
             });
           }
@@ -345,6 +348,7 @@ export class HttpPlayerClient implements IPlayerClient {
     is_finished?: boolean;
     speed?: number;
     current_source?: string;
+    current_track_id?: string;
   }): void {
     const currentState = this.normalizeState(data.state);
     const posMs = Math.round((data.position || 0) * 1000);
@@ -370,6 +374,7 @@ export class HttpPlayerClient implements IPlayerClient {
         isFinished: Boolean(data.is_finished),
         speed: Number(data.speed ?? 1.0),
         currentSource: data.current_source,
+        currentTrackId: data.current_track_id,
       },
     });
   }
@@ -650,6 +655,32 @@ export class HttpPlayerClient implements IPlayerClient {
 
   async clearNextCandidate(): Promise<IpcResponse> {
     return this.request("/api/v1/player/queue/next-candidate", { method: "DELETE" });
+  }
+
+  /** 推送服务端播放队列快照（服务端自治无缝预载的队列权威） */
+  async pushQueueSnapshot(payload: {
+    items: Array<{
+      source: string;
+      duration_ms: number | null;
+      title: string | null;
+      artist: string | null;
+      album: string | null;
+      cover: string | null;
+      track?: Track | null;
+    }>;
+    index: number;
+    repeat: string;
+    shuffle: boolean;
+  }): Promise<IpcResponse> {
+    return this.request("/api/v1/player/queue", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  /** 获取服务端播放队列快照（重开/刷新页面权威对齐） */
+  async getQueueSnapshot(): Promise<IpcResponse<ServerQueueSnapshot>> {
+    return this.request("/api/v1/player/queue");
   }
 
   /** 服务端权威“正在播放”快照（重开页面恢复曲目显示） */

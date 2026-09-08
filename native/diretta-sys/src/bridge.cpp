@@ -80,6 +80,8 @@ struct DirettaConnection {
   std::unique_ptr<DIRETTA::Find> find;
   std::unique_ptr<DirectSync> sync;
   DIRETTA::FormatConfigure format;
+  // setSink 时记录的请求缓冲时长（µs）：Sink 自报值不可用时兜底
+  std::uint64_t requested_sink_buffer_us = 0;
 
   ~DirettaConnection() {
     shutdown();
@@ -172,13 +174,13 @@ void* open_direct_with_format(
   const char* target_id,
   std::uint32_t sample_rate,
   std::uint16_t channels,
-  DIRETTA::FormatID format_id,
-  DIRETTA::FormatID alternate_format_id,
+  const DIRETTA::FormatID* candidate_formats,
+  std::size_t candidate_count,
   void* source_context,
   SPlayerDirettaNextBlock next_block,
   SPlayerDirettaReleaseBlock release_block,
   const char* format_name,
-  bool* used_alternate_format) {
+  std::size_t* used_candidate_index) {
   try {
     auto connection = std::make_unique<DirettaConnection>();
 
@@ -230,6 +232,9 @@ void* open_direct_with_format(
       return nullptr;
     }
 
+    // 请求 100ms Sink 缓冲（Phase0 诊断：上层排空垫时长需覆盖该值）
+    connection->requested_sink_buffer_us = static_cast<std::uint64_t>(
+      ACQUA::Clock::MilliSeconds(100).getMicroSeconds());
     if (!connection->sync->setSink(target, ACQUA::Clock::MilliSeconds(100), true, mtu)) {
       set_error("failed to configure Diretta sink");
       return nullptr;
@@ -240,43 +245,78 @@ void* open_direct_with_format(
       set_error(std::string("Diretta SDK rejected exact Source Direct ") + format_name + " rate/channels");
       return nullptr;
     }
-    if (used_alternate_format != nullptr) {
-      *used_alternate_format = false;
+    if (used_candidate_index != nullptr) {
+      *used_candidate_index = 0;
     }
-    bool supported = format.setFormat(format_id) && connection->sync->checkSinkSupport(format);
-    if (!supported && alternate_format_id != DIRETTA::FormatID::NONE) {
-      supported = format.setFormat(alternate_format_id) && connection->sync->checkSinkSupport(format);
-      if (supported && used_alternate_format != nullptr) {
-        *used_alternate_format = true;
+    // R8 位图协商：按调用方给定的偏好顺序逐个探测（checkSinkSupport 为本地
+    // 校验，无网络往返），取第一个 Target 支持者——替代旧的"主/备两条硬编码"
+    std::size_t chosen = candidate_count;
+    for (std::size_t index = 0; index < candidate_count; ++index) {
+      if (format.setFormat(candidate_formats[index]) &&
+          connection->sync->checkSinkSupport(format)) {
+        chosen = index;
+        break;
       }
     }
-    if (!supported) {
+    if (chosen == candidate_count) {
       set_error(std::string("Diretta target does not support Source Direct ") + format_name + " format");
       return nullptr;
+    }
+    if (used_candidate_index != nullptr) {
+      *used_candidate_index = chosen;
     }
     if (!connection->sync->setSinkConfigure(format)) {
       set_error("failed to apply exact Diretta Source Direct format");
       return nullptr;
     }
 
-    // 当前参数为真机 T1-T3 验证过的现行为；atom/官方 SinHost 用 (200µs, 0, 100ms)，
-    // 参数语义复核与 A/B 见优化方案 §1-B4-B6.5（阶段五，真机在场才做）
+    // 【对齐官方 SinHost】(200µs, 0, 100ms)：Sync.hpp 三参依次为 Minimum Sync
+    // System Time / Target Cycle Time(0=默认) / Maximum Cycle Time(busy 恢复)。
+    // 旧值 (100ms, 0, 30ms) 按该语义 min>max 自相矛盾（疑为参数位序笔误，
+    // 真机 T1-T3 曾验证可播但与 SDK 语义冲突，且与 combo384 握手失败现场关联）；
+    // 如真机 A/B 需要回退，改回 MilliSeconds(100) / MicroSeconds(30000) 并复测
     connection->sync->configTransferAuto(
-      ACQUA::Clock::MilliSeconds(100),
+      ACQUA::Clock::MicroSeconds(200),
       ACQUA::Clock(),
-      ACQUA::Clock::MicroSeconds(30000));
+      ACQUA::Clock::MicroSeconds(100000));
 
-    // true = 强制 Target 状态机重置：全量重连（跨格式/重连）需要干净的协商起点
-    if (!connection->sync->connectPrepare(true)) {
-      set_error("failed to prepare Diretta Source Direct connection");
-      return nullptr;
+    // true = 强制 Target 状态机重置：全量重连（跨格式/重连）需要干净的协商起点。
+    // 连接建立带重试（含残留状态清理）：Target 旧会话释放慢/状态残留时
+    // connectWait 可能瞬时失败（.dbg 现场 connectWait-timeout, is_connect=0），
+    // 退避重试通常可自愈；RT 权限缺失等确定性失败会快速连败后按原错误返回
+    bool connected = false;
+    std::string connect_error;
+    for (int attempt = 1; attempt <= 3 && !connected; ++attempt) {
+      if (attempt > 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300 * (attempt - 1)));
+        try {
+          if (connection->sync->is_connect()) {
+            connection->sync->stop();
+            connection->sync->disconnect_flgset();
+            connection->sync->disconnect(true);
+            connection->sync->disconnectWait();
+          }
+        } catch (...) {
+          // 残留状态清理失败不阻断重试
+        }
+      }
+      if (!connection->sync->connectPrepare(true)) {
+        connect_error = "failed to prepare Diretta Source Direct connection";
+        continue;
+      }
+      if (!connection->sync->connect(0)) {
+        connect_error = "failed to start Diretta Source Direct connection";
+        continue;
+      }
+      if (connection->sync->connectWait()) {
+        connected = true;
+      } else {
+        connect_error = "failed to complete Diretta Source Direct connection";
+      }
     }
-    if (!connection->sync->connect(0)) {
-      set_error("failed to start Diretta Source Direct connection");
-      return nullptr;
-    }
-    if (!connection->sync->connectWait()) {
-      set_error("failed to complete Diretta Source Direct connection");
+    if (!connected) {
+      set_error(connect_error.empty() ? "Diretta Source Direct connection failed"
+                                      : connect_error);
       return nullptr;
     }
 
@@ -362,12 +402,13 @@ void* splayer_diretta_open_direct(
     return nullptr;
   }
 
+  const DIRETTA::FormatID candidates[] = { format_id };
   return open_direct_with_format(
     target_id,
     sample_rate,
     channels,
-    format_id,
-    DIRETTA::FormatID::NONE,
+    candidates,
+    1,
     source_context,
     next_block,
     release_block,
@@ -395,27 +436,43 @@ void* splayer_diretta_open_dsd_direct(
     return nullptr;
   }
 
-  const auto base_format_id = DIRETTA::FormatID::FMT_DSD1 |
-                              DIRETTA::FormatID::FMT_DSD_SIZ_32 |
-                              DIRETTA::FormatID::FMT_DSD_BIG;
-  const auto source_format_id = base_format_id |
-    (source_lsb_first ? DIRETTA::FormatID::FMT_DSD_LSB : DIRETTA::FormatID::FMT_DSD_MSB);
-  const auto alternate_format_id = base_format_id |
-    (source_lsb_first ? DIRETTA::FormatID::FMT_DSD_MSB : DIRETTA::FormatID::FMT_DSD_LSB);
-  bool used_alternate_format = false;
+  // R8：DSD 位图 4 组合探测，顺序偏好 = 源位序优先（避免 Rust 侧
+  // set_wire_bit_order_while_paused 的位重排）、字节序其次（BIG 先，
+  // 沿用原硬编码偏好）。SDK Format.hpp：LSB↔DSF、MSB↔DFF
+  const DIRETTA::FormatID bit_orders[] = {
+    source_lsb_first ? DIRETTA::FormatID::FMT_DSD_LSB : DIRETTA::FormatID::FMT_DSD_MSB,
+    source_lsb_first ? DIRETTA::FormatID::FMT_DSD_MSB : DIRETTA::FormatID::FMT_DSD_LSB,
+  };
+  const DIRETTA::FormatID byte_orders[] = {
+    DIRETTA::FormatID::FMT_DSD_BIG,
+    DIRETTA::FormatID::FMT_DSD_LITTLE,
+  };
+  DIRETTA::FormatID candidates[4];
+  std::size_t candidate_count = 0;
+  for (const auto bit_order : bit_orders) {
+    for (const auto byte_order : byte_orders) {
+      candidates[candidate_count++] = DIRETTA::FormatID::FMT_DSD1 |
+                                      DIRETTA::FormatID::FMT_DSD_SIZ_32 |
+                                      bit_order | byte_order;
+    }
+  }
+  std::size_t used_candidate_index = 0;
   auto* connection = open_direct_with_format(
     target_id,
     bit_rate,
     channels,
-    source_format_id,
-    alternate_format_id,
+    candidates,
+    candidate_count,
     source_context,
     next_block,
     release_block,
     "Native DSD",
-    &used_alternate_format);
+    &used_candidate_index);
   if (connection != nullptr) {
-    *wire_lsb_first = used_alternate_format ? !source_lsb_first : source_lsb_first;
+    // 候选表 [0,1] 为源位序、[2,3] 为翻转位序
+    *wire_lsb_first = used_candidate_index < 2
+      ? source_lsb_first
+      : !source_lsb_first;
   }
   return connection;
 }
@@ -460,6 +517,53 @@ bool splayer_diretta_pause(void* opaque) {
 void splayer_diretta_close(void* opaque) {
   clear_error();
   auto connection = std::unique_ptr<DirettaConnection>(static_cast<DirettaConnection*>(opaque));
+}
+
+// ============================================================================
+// Phase0 诊断导出：Sink 实测参数（排空垫时长动态化 + DSD 静音字节定案）
+// 全部 try/catch 包裹，连接无效或 SDK 调用失败时返回 0（上层按"未注入"处理）
+// ============================================================================
+std::uint64_t splayer_diretta_sink_latency_us(void* opaque) {
+  auto* connection = static_cast<DirettaConnection*>(opaque);
+  if (connection == nullptr || !connection->sync) return 0;
+  try {
+    return static_cast<std::uint64_t>(connection->sync->getLatency().getMicroSeconds());
+  } catch (...) {
+    return 0;
+  }
+}
+
+std::uint64_t splayer_diretta_sink_buffer_us(void* opaque) {
+  auto* connection = static_cast<DirettaConnection*>(opaque);
+  if (connection == nullptr || !connection->sync) return 0;
+  try {
+    // Sink 自报值（100µs 单位）与 setSink 请求值取大者
+    // 注意：Linux LP64 下 uint64_t(unsigned long) 与 ULL 字面量类型不同，显式统一为 uint64_t
+    const std::uint64_t reported = static_cast<std::uint64_t>(connection->sync->getSinkInfo().latencyBuffer) * 100ULL;
+    return std::max(reported, connection->requested_sink_buffer_us);
+  } catch (...) {
+    return connection->requested_sink_buffer_us;
+  }
+}
+
+std::size_t splayer_diretta_cycle_size(void* opaque) {
+  auto* connection = static_cast<DirettaConnection*>(opaque);
+  if (connection == nullptr || !connection->sync) return 0;
+  try {
+    return connection->sync->getCycleSize();
+  } catch (...) {
+    return 0;
+  }
+}
+
+std::uint8_t splayer_diretta_mute_byte(void* opaque) {
+  auto* connection = static_cast<DirettaConnection*>(opaque);
+  if (connection == nullptr || !connection->sync) return 0;
+  try {
+    return connection->sync->getSinkConfigure().getMuteByte();
+  } catch (...) {
+    return 0;
+  }
 }
 
 } // extern "C"

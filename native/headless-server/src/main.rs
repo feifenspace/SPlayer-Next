@@ -119,9 +119,31 @@ async fn main() -> Result<()> {
     args.apply_to(&mut config);
     audio_engine_core::priority::configure_rt_priority(i32::from(config.audio.rt_priority));
 
+    #[cfg(target_os = "linux")]
+    warn_if_diretta_lacks_rt(&config);
+
     let _addr = start_server(config).await?;
 
     // 保持主线程存活
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+/// Diretta 选中时校验实时调度能力：THRED_MODE(5) 的 SDK 工作线程依赖
+/// SCHED_FIFO，无权限时 SDK 日志表现为 "Worker Thread Priority set Error →
+/// connectWait 0"——跨格式切歌的全量重连必然失败（同格式 handoff 不受影响，
+/// 症状呈"偶发切歌失败"）。systemd unit 已配置 LimitRTPRIO/AmbientCapabilities；
+/// 手动运行需先执行 scripts/rt-tuning.sh
+#[cfg(target_os = "linux")]
+fn warn_if_diretta_lacks_rt(config: &Config) {
+    if config.diretta_target.is_none() {
+        return;
+    }
+    let policy = unsafe { libc::sched_getscheduler(0) };
+    if policy != libc::SCHED_FIFO {
+        tracing::warn!(
+            policy,
+            "当前进程未运行在 SCHED_FIFO 实时调度下：Diretta Target 可能拒绝时钟锁定（connectWait 失败）。请通过 systemd 服务运行（unit 已含 LimitRTPRIO/AmbientCapabilities）或先执行 scripts/rt-tuning.sh"
+        );
+    }
 }

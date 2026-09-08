@@ -35,6 +35,12 @@ pub struct WsState {
     pub volume: f32,
     #[serde(serialize_with = "serialize_player_state")]
     pub state: PlayerState,
+    /// 当前播放 source：服务端接力/boundary 切曲后，前端据此采纳队列曲目推进 UI
+    /// （缺失时前端 UI 与服务端音频脱节——遥控器显示已切曲前的曲目）
+    pub current_source: Option<String>,
+    /// 当前曲在队列快照中的 track_id：前端 adopt 按 id 匹配，避免依赖
+    /// 直链串一致（同一曲两次解析的 URL 不同）
+    pub current_track_id: Option<String>,
 }
 
 /// 播放器状态快照（用于 HTTP 响应和 WebSocket 推送）
@@ -68,6 +74,134 @@ pub struct PendingNext {
     pub duration_hint: Option<f64>,
 }
 
+/// 播放队列重复模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueueRepeat {
+    Off,
+    All,
+    One,
+}
+
+impl QueueRepeat {
+    pub fn parse(value: Option<&str>) -> Self {
+        match value.map(str::to_ascii_lowercase).as_deref() {
+            Some("all") => Self::All,
+            Some("one") => Self::One,
+            _ => Self::Off,
+        }
+    }
+}
+
+/// 队列条目：source 与 load API 的取值语义一致（绝对路径/HTTP 直链/cue:// 等）。
+/// track 为前端完整曲目快照（透传字段，服务端不解释）：浏览器存储清空后
+/// 重开页面时前端据此恢复平台身份（id/source/流媒体 serverId/CUE 分段等）
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueueItem {
+    pub source: String,
+    pub duration_ms: Option<u64>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub cover: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub track: Option<serde_json::Value>,
+}
+
+/// 服务端播放队列快照：Direct 无缝预载与曲终接力的队列权威。
+/// 由前端整表推送（PUT /api/v1/player/queue）；服务端在 boundary 提交时
+/// 推进游标（align_by_source 自愈，队列被重排后按 source 重新对齐）。
+/// 未注册队列时无缝预载不工作，回退前端驱动的候选/接力旧链路。
+#[derive(Debug, Clone)]
+pub struct QueueSnapshot {
+    pub items: Vec<QueueItem>,
+    /// 播放顺序（shuffle 在注册时物化为本快照内的确定性排列）
+    pub order: Vec<usize>,
+    /// order 中当前播放位置
+    pub pos: usize,
+    pub repeat: QueueRepeat,
+}
+
+impl QueueSnapshot {
+    /// 按 source 反查队列条目的前端曲目 id（接力/边界后随 WS 带回，前端按 id
+    /// 采纳新曲）。找不到（手动 load 队列外曲目）返回 None
+    pub fn track_id_for_source(&self, source: &str) -> Option<String> {
+        self.items
+            .iter()
+            .find(|item| item.source == source)
+            .and_then(|item| {
+                item.track
+                    .as_ref()
+                    .and_then(|track| track.get("id"))
+                    .and_then(|id| id.as_str())
+                    .map(String::from)
+            })
+    }
+
+    pub fn new(items: Vec<QueueItem>, index: usize, repeat: QueueRepeat, shuffle: bool) -> Self {
+        let n = items.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        if shuffle && n > 1 {
+            // 确定性洗牌：注册时固定顺序，服务端自治推进时顺序自洽即可
+            let mut seed = n as u64 ^ 0x9E37_79B9_7F4A_7C15;
+            for i in (1..n).rev() {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let j = (seed >> 33) as usize % (i + 1);
+                order.swap(i, j);
+            }
+        }
+        let pos = if n == 0 {
+            0
+        } else {
+            order
+                .iter()
+                .position(|&v| v == index.min(n - 1))
+                .unwrap_or(0)
+        };
+        Self {
+            items,
+            order,
+            pos,
+            repeat,
+        }
+    }
+
+    pub fn current(&self) -> Option<&QueueItem> {
+        self.items.get(*self.order.get(self.pos)?)
+    }
+
+    /// 下一个播放条目及其 order 位置。repeat=one 返回 None
+    /// （单曲重播由既有 Ended 接力/前端处理，不做无缝预载）
+    pub fn next(&self) -> Option<(usize, &QueueItem)> {
+        if self.items.is_empty() || self.repeat == QueueRepeat::One {
+            return None;
+        }
+        let next_pos = match self.pos + 1 {
+            next if next < self.order.len() => next,
+            // 队尾：repeat=all 回卷到顺序头
+            _ if self.repeat == QueueRepeat::All => 0,
+            _ => return None,
+        };
+        let item = self.items.get(*self.order.get(next_pos)?)?;
+        Some((next_pos, item))
+    }
+
+    /// 按条目 source 把当前播放位置对齐到队列（队列重排/换歌后自愈）。
+    /// 找不到时保持原位
+    pub fn align_by_source(&mut self, source: Option<&str>) {
+        let Some(source) = source else { return };
+        if let Some(pos) = self
+            .order
+            .iter()
+            .position(|&idx| self.items.get(idx).is_some_and(|it| it.source == source))
+        {
+            self.pos = pos;
+        }
+    }
+}
+
 /// 应用全局状态
 #[derive(Clone)]
 pub struct AppState {
@@ -92,6 +226,16 @@ pub struct AppState {
     pub staged_meta: Arc<Mutex<Option<(u64, serde_json::Value)>>>,
     /// 下一曲候选（B 层自动连播单槽；None = 未注册）
     pub pending_next: Arc<Mutex<Option<PendingNext>>>,
+    /// 服务端播放队列快照（PUT /api/v1/player/queue 注册；None = 前端驱动旧链路）。
+    /// Direct 无缝预载与 boundary 自治推进的队列权威
+    pub queue: Arc<Mutex<Option<QueueSnapshot>>>,
+    /// 待自治消费的 Direct boundary generation（事件回调置位，看门狗消费——
+    /// 回调线程禁止锁 player）：无缝边界后的簿记提交与再预载调度
+    pub direct_boundary_event: Arc<Mutex<Option<u64>>>,
+    /// 在途 load 请求的网络下载取消句柄（probe 物化阶段专用，注册即轮换）。
+    /// 下一次 load/stop 时 cancel 上一请求仍在途的全量下载——下载不受
+    /// load token 校验中断，无此机制会占满线程与带宽直到自身超时
+    pub load_download_cancel: Arc<Mutex<Option<audio_engine_core::HttpCancelHandle>>>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
     snapshot: Arc<RwLock<Option<PlayerSnapshot>>>,
 }
@@ -137,6 +281,10 @@ impl AppState {
         let auto_advance_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fft_subscriber_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_next = Arc::new(Mutex::new(None));
+        let queue: Arc<Mutex<Option<QueueSnapshot>>> = Arc::new(Mutex::new(None));
+        let direct_boundary_event: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let load_download_cancel: Arc<Mutex<Option<audio_engine_core::HttpCancelHandle>>> =
+            Arc::new(Mutex::new(None));
         let now_playing: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
         let staged_meta: Arc<Mutex<Option<(u64, serde_json::Value)>>> = Arc::new(Mutex::new(None));
 
@@ -149,6 +297,16 @@ impl AppState {
             let now_playing = Arc::clone(&now_playing);
             let staged_meta = Arc::clone(&staged_meta);
             let pending_next = Arc::clone(&pending_next);
+            let direct_boundary_event = Arc::clone(&direct_boundary_event);
+            let queue = Arc::clone(&queue);
+            // 当前 source → 队列条目 track id（WS 每次状态推送随带，前端按 id 采纳）
+            let resolve_current_track_id = move |source: Option<&str>| -> Option<String> {
+                let source = source?;
+                queue
+                    .lock()
+                    .as_ref()
+                    .and_then(|q| q.track_id_for_source(source))
+            };
             Arc::new(move |event: PlayerEvent| {
                 // 先 clone 一份当前快照，避免持有读锁跨越后续写锁操作。
                 // 缓存承载完整 PlayerSnapshot：HTTP/WS 轮询不再碰 player 锁（A4）
@@ -165,11 +323,15 @@ impl AppState {
                 match event {
                     PlayerEvent::StateChanged { state } => {
                         authoritative.state = state;
+                        let current_source = authoritative.current_source.clone();
+                        let current_track_id = resolve_current_track_id(current_source.as_deref());
                         let ws_state = WsState {
                             position: authoritative.position,
                             duration: authoritative.duration,
                             volume: authoritative.volume,
                             state,
+                            current_source,
+                            current_track_id,
                         };
                         *snapshot.write() = Some(authoritative.clone());
                         if let Ok(data) = serde_json::to_value(&ws_state) {
@@ -180,11 +342,15 @@ impl AppState {
                     PlayerEvent::Position { position, duration } => {
                         authoritative.position = position;
                         authoritative.duration = duration;
+                        let current_source = authoritative.current_source.clone();
+                        let current_track_id = resolve_current_track_id(current_source.as_deref());
                         let ws_state = WsState {
                             position,
                             duration,
                             volume: authoritative.volume,
                             state: authoritative.state,
+                            current_source,
+                            current_track_id,
                         };
                         *snapshot.write() = Some(authoritative.clone());
                         if let Ok(data) = serde_json::to_value(&ws_state) {
@@ -206,6 +372,12 @@ impl AppState {
                         authoritative.duration = 0.0;
                         authoritative.state = PlayerState::Idle;
                         *snapshot.write() = Some(authoritative);
+                        // 接入输出恢复看门狗：音源中途失败（解码/读文件/格式突变）
+                        // 原先只置 Idle 广播 sourceError，无任何自动恢复 = 直接停播。
+                        // 复用 OutputStalled 同一条恢复链路（重载有次数上限与跳曲
+                        // 兜底，坏源不会无限循环）
+                        output_recovery_requested
+                            .store(unix_millis(), std::sync::atomic::Ordering::Release);
                         let _ =
                             ws_tx.send(serde_json::json!({ "type": "sourceError", "data": {} }));
                     }
@@ -214,22 +386,33 @@ impl AppState {
                         generation,
                     } => {
                         // 无缝边界：已 stage 的候选元数据转正为 now-playing 快照，
-                        // 保证重开页面/无浏览器场景都能显示正确曲目
+                        // 保证重开页面/无浏览器场景都能显示正确曲目。
+                        // generation 不匹配时保留 staged_meta：consume_boundary 的
+                        // 孤儿 boundary 兜底还要用它做簿记（取走会丢 source）
                         let mut promoted_source = None;
-                        if let Some((g, meta)) = staged_meta.lock().take() {
-                            if g == generation {
-                                promoted_source = meta
-                                    .get("source")
-                                    .and_then(|v| v.as_str())
-                                    .map(String::from);
-                                *now_playing.lock() = Some(meta);
+                        let mut promoted_track_id = None;
+                        {
+                            let mut guard = staged_meta.lock();
+                            if let Some((g, meta)) = guard.as_ref() {
+                                if *g == generation {
+                                    promoted_source = meta
+                                        .get("source")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                    promoted_track_id = meta
+                                        .get("track_id")
+                                        .and_then(|v| v.as_str())
+                                        .map(String::from);
+                                    *now_playing.lock() = Some(meta.clone());
+                                    guard.take();
+                                }
                             }
                         }
                         authoritative.position = 0.0;
                         authoritative.duration = duration;
                         authoritative.state = PlayerState::Playing;
                         if promoted_source.is_some() {
-                            authoritative.current_source = promoted_source;
+                            authoritative.current_source = promoted_source.clone();
                             authoritative.is_finished = false;
                         }
                         *snapshot.write() = Some(authoritative);
@@ -238,9 +421,16 @@ impl AppState {
                         // （引擎 current_source 不随边界更新，曲终时无法自证重复）。
                         // 浏览器在场时 position tick 一两秒内会重注册新的下一曲
                         *pending_next.lock() = None;
+                        // 交由看门狗自治消费：簿记提交 + 队列推进 + 再预载调度
+                        *direct_boundary_event.lock() = Some(generation);
                         let _ = ws_tx.send(serde_json::json!({
                             "type": "directTrackBoundary",
-                            "data": { "duration": duration, "generation": generation },
+                            "data": {
+                                "duration": duration,
+                                "generation": generation,
+                                "source": promoted_source,
+                                "track_id": promoted_track_id,
+                            },
                         }));
                     }
                     // 输出停滞/失败：置恢复请求标志交由输出恢复看门狗全量重载，
@@ -290,6 +480,9 @@ impl AppState {
             now_playing,
             staged_meta,
             pending_next,
+            queue,
+            direct_boundary_event,
+            load_download_cancel,
             snapshot,
         })
     }

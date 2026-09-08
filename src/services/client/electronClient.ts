@@ -7,7 +7,7 @@ import type {
   AudioDevice,
   FftData,
   PlayerEvent,
-} from "./types";
+  ServerQueueSnapshot } from "./types";
 
 /**
  * Electron IPC 播放器客户端实现
@@ -199,6 +199,16 @@ export class ElectronPlayerClient implements IPlayerClient {
 
   async clearNextCandidate(): Promise<IpcResponse> {
     return { success: true };
+  }
+
+  /** 桌面端队列由渲染进程驱动，无需服务端自治无缝预载 */
+  async pushQueueSnapshot(): Promise<IpcResponse> {
+    return { success: true };
+  }
+
+  /** 桌面端队列由渲染进程驱动，无需服务端快照 */
+  async getQueueSnapshot(): Promise<IpcResponse<ServerQueueSnapshot>> {
+    return { success: false, error: "getQueueSnapshot is only available in headless server mode" };
   }
 
   /** 桌面端曲目信息由渲染进程持久化恢复，无需服务端快照 */

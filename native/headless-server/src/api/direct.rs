@@ -125,30 +125,47 @@ pub(crate) fn create_memfd_file() -> anyhow::Result<(std::fs::File, String)> {
     Ok((file, format!("/proc/self/fd/{fd}")))
 }
 
-/// 把已建立的响应写入 memfd 文件，超过 DIRECT_PRELOAD_MAX_BYTES 即失败。
-/// 响应体自此被消费，调用方不得再将其用于磁盘回退
-#[cfg(target_os = "linux")]
-pub(crate) fn write_response_to_memfd(
-    file: &mut std::fs::File,
-    response: &mut reqwest::blocking::Response,
-) -> anyhow::Result<()> {
-    use std::io::{Read, Write};
-
-    let mut limited = response.take(DIRECT_PRELOAD_MAX_BYTES);
-    std::io::copy(&mut limited, file)?;
-    anyhow::ensure!(
-        limited.limit() > 0,
-        "在线音源超过 preload 大小上限 {DIRECT_PRELOAD_MAX_BYTES} 字节"
-    );
-    file.flush()?;
-    Ok(())
+/// 把 reader 内容写入 writer，超过 DIRECT_PRELOAD_MAX_BYTES 即超限返回；
+/// 每个 chunk 边界检查 abort 谓词（新 load/预载失效时即时中止，不占线程
+/// 与带宽跑满全程）。返回（已写入字节数, 是否超限）
+fn copy_with_abort(
+    reader: &mut impl std::io::Read,
+    writer: &mut impl std::io::Write,
+    abort: impl Fn() -> bool,
+) -> anyhow::Result<(u64, bool)> {
+    let mut chunk = vec![0u8; 256 * 1024];
+    let mut written: u64 = 0;
+    loop {
+        if abort() {
+            anyhow::bail!("在线音源下载已中止（被新请求取代/预载失效）");
+        }
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok((written, false));
+        }
+        writer.write_all(&chunk[..n])?;
+        written += n as u64;
+        if written > DIRECT_PRELOAD_MAX_BYTES {
+            return Ok((written, true));
+        }
+    }
 }
 
 /// 将远端 HTTP(S) 音频流物化到本地可解码输入（preload 模式：优先 memfd 纯内存，
-/// memfd 不可用时回退磁盘缓存），以便 Diretta Source Direct 模式进行精确解码与传输
-pub(crate) fn materialize_direct_input(url: &str) -> anyhow::Result<DirectInput> {
+/// memfd 不可用时回退磁盘缓存），以便 Diretta Source Direct 模式进行精确解码与传输。
+///
+/// 下载通道：优先 Range 流式读取器（HttpAudioSource：单次读空闲 10s 超时、
+/// 断流指数退避重连、cancel 即时中断），无整体时长上限——慢速大文件
+/// （DSD 整轨数百 MB）合法耗用任意时长；打开失败（典型：服务器不支持
+/// Range）回退一次性 GET（60s 整体超时，小文件兜底）。`abort` 在每个
+/// chunk 边界检查；`cancel` 供 Range 通道即时掐断在途读/重连
+pub(crate) fn materialize_direct_input(
+    url: &str,
+    cancel: &audio_engine_core::HttpCancelHandle,
+    abort: impl Fn() -> bool,
+) -> anyhow::Result<DirectInput> {
     use std::fs::{self, File};
-    use std::io::Read;
+    use std::io::Write;
 
     let cache_dir = get_stream_cache_dir();
     clean_old_stream_cache(&cache_dir);
@@ -181,44 +198,55 @@ pub(crate) fn materialize_direct_input(url: &str) -> anyhow::Result<DirectInput>
         }
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-
-    let mut response = client
-        .get(url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        )
-        .header("Accept", "*/*")
-        .header("Accept-Encoding", "identity")
-        .send()?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("下载在线流媒体音频失败: HTTP {}", response.status());
-    }
-
-    if ext.is_empty() {
-        if let Some(ct) = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-        {
-            let ct = ct.to_lowercase();
-            if ct.contains("flac") {
-                ext = "flac";
-            } else if ct.contains("mpeg") || ct.contains("mp3") {
-                ext = "mp3";
-            } else if ct.contains("mp4") || ct.contains("m4a") || ct.contains("aac") {
-                ext = "m4a";
-            } else if ct.contains("wav") {
-                ext = "wav";
-            } else if ct.contains("dsf") {
-                ext = "dsf";
+    let mut reader: Box<dyn std::io::Read> = {
+        match audio_engine_core::ffmpeg_audio::HttpAudioSource::new_with_cancel_handle(
+            url,
+            cancel.clone(),
+        ) {
+            Ok(source) => Box::new(source),
+            Err(error) => {
+                tracing::warn!(url = %url, %error, "Range 流式下载通道不可用，回退一次性 GET");
+                let client = reqwest::blocking::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()?;
+                let response = client
+                    .get(url)
+                    .header(
+                        "User-Agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    )
+                    .header("Accept", "*/*")
+                    .header("Accept-Encoding", "identity")
+                    .send()?;
+                if !response.status().is_success() {
+                    anyhow::bail!("下载在线流媒体音频失败: HTTP {}", response.status());
+                }
+                // 扩展名嗅探仅此分支可行：Range 通道不暴露响应头
+                if ext.is_empty() {
+                    if let Some(ct) = response
+                        .headers()
+                        .get("content-type")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        let ct = ct.to_lowercase();
+                        if ct.contains("flac") {
+                            ext = "flac";
+                        } else if ct.contains("mpeg") || ct.contains("mp3") {
+                            ext = "mp3";
+                        } else if ct.contains("mp4") || ct.contains("m4a") || ct.contains("aac") {
+                            ext = "m4a";
+                        } else if ct.contains("wav") {
+                            ext = "wav";
+                        } else if ct.contains("dsf") {
+                            ext = "dsf";
+                        }
+                    }
+                }
+                Box::new(response)
             }
         }
-    }
+    };
     if ext.is_empty() {
         ext = "audio";
     }
@@ -232,15 +260,19 @@ pub(crate) fn materialize_direct_input(url: &str) -> anyhow::Result<DirectInput>
         return Ok(DirectInput::Path(target_file.to_string_lossy().to_string()));
     }
 
-    // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO，与 header 嗅探共用
-    // 同一次 GET）。仅 memfd 不可用（创建失败/非 Linux）时回退磁盘——一旦开始写
-    // memfd，响应体已被消费，磁盘回退只能拿到不完整内容，中途失败直接报错
+    // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO）。仅 memfd
+    // 不可用（创建失败/非 Linux）时回退磁盘——一旦开始写 memfd，响应体已被
+    // 消费，磁盘回退只能拿到不完整内容，中途失败直接报错
     #[cfg(target_os = "linux")]
     {
         match create_memfd_file() {
             Ok((mut file, path)) => {
-                write_response_to_memfd(&mut file, &mut response)?;
-                tracing::info!(url = %url, path = %path, "在线音源已下载至 memfd 纯内存缓存");
+                let (written, exceeded) = copy_with_abort(&mut reader, &mut file, &abort)?;
+                if exceeded {
+                    anyhow::bail!("在线音源超过 preload 大小上限 {DIRECT_PRELOAD_MAX_BYTES} 字节");
+                }
+                file.flush()?;
+                tracing::info!(url = %url, path = %path, written, "在线音源已下载至 memfd 纯内存缓存");
                 return Ok(DirectInput::Memfd { file, path });
             }
             Err(error) => {
@@ -251,9 +283,7 @@ pub(crate) fn materialize_direct_input(url: &str) -> anyhow::Result<DirectInput>
 
     let part_file = cache_dir.join(format!("{}.{}.part", hash, ext));
     let mut file = File::create(&part_file)?;
-    let mut limited = response.take(DIRECT_PRELOAD_MAX_BYTES);
-    std::io::copy(&mut limited, &mut file)?;
-    let exceeded = limited.limit() == 0;
+    let (written, exceeded) = copy_with_abort(&mut reader, &mut file, &abort)?;
     file.sync_all()?;
     drop(file);
 
@@ -263,6 +293,7 @@ pub(crate) fn materialize_direct_input(url: &str) -> anyhow::Result<DirectInput>
     }
 
     fs::rename(&part_file, &target_file)?;
+    tracing::info!(url = %url, path = %target_file.to_string_lossy(), written, "在线音源已下载至磁盘缓存");
     Ok(DirectInput::Path(target_file.to_string_lossy().to_string()))
 }
 
@@ -306,6 +337,9 @@ pub struct DirectStageRequest {
     pub artist: Option<String>,
     pub album: Option<String>,
     pub cover: Option<String>,
+    /// 前端曲目 id：boundary 转正后随 WS 带回，前端按 id 采纳新曲
+    #[serde(default)]
+    pub track_id: Option<String>,
 }
 
 /// Direct 提交切歌边界请求体
@@ -315,82 +349,123 @@ pub struct DirectCommitBoundaryRequest {
     pub duration_secs: f64,
 }
 
-/// Diretta 预加载下一曲（支持远程流媒体预先下载至 RAM）
-pub(crate) async fn direct_stage_next_handler(
-    State(state): State<AppState>,
-    Json(payload): Json<DirectStageRequest>,
-) -> Result<Json<PlayerResponse>, ApiError> {
-    let source = payload.source;
-    let duration = payload.duration_secs.unwrap_or(0.0);
-    let generation = payload.generation.unwrap_or(0);
+/// stage 核心入参：REST handler 与 direct_preloader 共用
+pub(crate) struct DirectStageInput {
+    pub source: String,
+    pub duration_secs: f64,
+    pub generation: u64,
+    /// 候选曲元数据（None = 不更新 staged_meta）
+    pub meta: Option<serde_json::Value>,
+}
 
-    let stage_handle = state.player.lock().direct_stage_handle();
+/// stage 核心结果：
+/// - `Ok(None)`：已 stage
+/// - `Ok(Some(reason))`：未 stage 且非错误（runtime 不活跃 / stream 模式跳过）
+/// - `Err`：stage 被拒（典型 wire format 不一致）
+///
+/// 同步阻塞（内部含 HTTP 物化与 producer 握手等待），调用方需在
+/// `spawn_isolated_blocking` 或专用阻塞线程上执行。
+/// `abort`：物化下载的中止谓词（每个 chunk 边界检查）；预载链路传
+/// preload token 失效检查，重新调度时旧下载即时退出
+pub(crate) fn stage_direct_core(
+    state: &AppState,
+    input: DirectStageInput,
+    abort: impl Fn() -> bool,
+) -> anyhow::Result<Option<&'static str>> {
+    let DirectStageInput {
+        source,
+        duration_secs: duration,
+        generation,
+        meta,
+    } = input;
 
-    let Some(handle) = stage_handle else {
-        return Ok(Json(PlayerResponse::ok(json!({
-            "staged": false,
-            "reason": "Direct runtime inactive",
-        }))));
+    let Some(handle) = state.player.lock().direct_stage_handle() else {
+        return Ok(Some("Direct runtime inactive"));
     };
 
     let is_http = source.starts_with("http://") || source.starts_with("https://");
     // stream 模式下在线源不做全量下载 stage（与用户选择的流式策略冲突）
-    if is_http && online_source_mode(&state) == "stream" {
-        return Ok(Json(PlayerResponse::ok(json!({
-            "staged": false,
-            "reason": "onlineSourceMode=stream skips online preloading",
-        }))));
+    if is_http && online_source_mode(state) == "stream" {
+        return Ok(Some("onlineSourceMode=stream skips online preloading"));
     }
 
+    // HTTP 源预先物化为本地可 seek 输入（native stage 仅支持本地源）。
+    // cancel 用一次性句柄：本链路的中止由 abort 谓词（预载失效令牌）承担
     let physical_source = if is_http {
-        let src_clone = source.clone();
-        spawn_isolated_blocking("direct-stage-preload", move || {
-            materialize_direct_input(&src_clone)
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("Stage preload error: {e}")))?
-        .map_err(|e| ApiError::bad_request(format!("Failed to preload stream to RAM: {e}")))?
+        materialize_direct_input(&source, &audio_engine_core::HttpCancelHandle::new(), abort)
+            .map_err(|e| anyhow::anyhow!("Failed to preload stream to RAM: {e}"))?
     } else {
         DirectInput::Path(source.clone())
     };
 
     // 候选元数据直传存 staged_meta：boundary 无缝切换后 now-playing 快照立即
     // 显示新曲信息。source 用请求原始串，与 boundary commit 后的 current_source 一致
-    *state.staged_meta.lock() = Some((
-        generation,
-        json!({
-            "source": source.clone(),
-            "title": payload.title,
-            "artist": payload.artist,
-            "album": payload.album,
-            "cover": payload.cover,
-            "duration_secs": duration,
-        }),
-    ));
+    if let Some(meta) = meta {
+        *state.staged_meta.lock() = Some((generation, meta));
+    }
 
-    let result = spawn_isolated_blocking("direct-stage-next-worker", move || {
-        // DirectInput（含 memfd 的 File）随闭包存活整个 stage 过程：
-        // producer 在此期间同步打开解码器，路径解析始终有 fd 支撑
-        handle.stage_local(physical_source.path(), duration, generation)
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("Stage next worker error: {e}")))?;
-
-    match result {
+    // DirectInput（含 memfd 的 File）随闭包存活整个 stage 过程：
+    // producer 在此期间同步打开解码器，路径解析始终有 fd 支撑
+    match handle.stage_local(physical_source.path(), duration, generation) {
         Ok(()) => {
             tracing::info!(source = %source, generation, "无缝候选已 stage");
-            Ok(Json(PlayerResponse::ok(json!({
-                "staged": true,
-                "source": source,
-                "generation": generation,
-            }))))
+            Ok(None)
         }
         Err(err) => {
             // 常见拒绝原因：wire format 与当前连接不一致（采样率/位深跳变，
             // 引擎拒绝跨格式无缝）——这条日志用于与曲终自动连播、输出停滞关联
             tracing::info!(source = %source, error = %err, "无缝 stage 被拒，回退曲终接力");
-            Err(ApiError::bad_request(format!("Direct stage failed: {err}")))
+            Err(err)
         }
+    }
+}
+
+/// Diretta 预加载下一曲（支持远程流媒体预先下载至 RAM）
+pub(crate) async fn direct_stage_next_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<DirectStageRequest>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let source = payload.source.clone();
+    let duration = payload.duration_secs.unwrap_or(0.0);
+    let generation = payload.generation.unwrap_or(0);
+    let meta = json!({
+        "source": source.clone(),
+        "title": payload.title,
+        "artist": payload.artist,
+        "album": payload.album,
+        "cover": payload.cover,
+        "duration_secs": duration,
+        "track_id": payload.track_id,
+    });
+
+    let state_for_worker = state.clone();
+    let outcome = spawn_isolated_blocking("direct-stage-next-worker", move || {
+        stage_direct_core(
+            &state_for_worker,
+            DirectStageInput {
+                source,
+                duration_secs: duration,
+                generation,
+                meta: Some(meta),
+            },
+            // 旧前端驱动链路无预载失效令牌：物化下载不做中途取消
+            || false,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("Stage next worker error: {e}")))?
+    .map_err(|err| ApiError::bad_request(format!("Direct stage failed: {err}")))?;
+
+    match outcome {
+        None => Ok(Json(PlayerResponse::ok(json!({
+            "staged": true,
+            "source": payload.source,
+            "generation": generation,
+        })))),
+        Some(reason) => Ok(Json(PlayerResponse::ok(json!({
+            "staged": false,
+            "reason": reason,
+        })))),
     }
 }
 

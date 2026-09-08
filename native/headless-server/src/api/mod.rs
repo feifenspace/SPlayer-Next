@@ -1,6 +1,7 @@
 //! REST API 路由组装与共享基础设施（控制器层）。
 
 mod direct;
+mod direct_preloader;
 mod diretta_api;
 mod fs;
 mod library;
@@ -31,6 +32,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::error::ApiError;
 use crate::state::AppState;
 use direct::*;
+use direct_preloader::*;
 use diretta_api::*;
 use fs::*;
 use library::*;
@@ -112,6 +114,13 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/player/queue/next-candidate",
             axum::routing::post(queue_next_candidate_handler)
                 .delete(queue_next_candidate_cancel_handler),
+        )
+        // 服务端播放队列快照（Direct 无缝预载与 boundary 自治推进的队列权威）
+        .route(
+            "/api/v1/player/queue",
+            axum::routing::get(get_queue_handler)
+                .put(queue_snapshot_handler)
+                .delete(queue_clear_handler),
         )
         // 媒体库操作
         .route(

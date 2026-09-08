@@ -1,3 +1,23 @@
+export interface ServerQueueItem {
+  source: string;
+  duration_ms: number | null;
+  title: string | null;
+  artist: string | null;
+  album: string | null;
+  cover: string | null;
+  /** 完整曲目快照（新版快照携带；旧版快照/未推快照时为 null） */
+  track?: Track | null;
+}
+
+export interface ServerQueueSnapshot {
+  registered: boolean;
+  items: ServerQueueItem[];
+  index: number;
+  pos: number;
+  repeat: string;
+  total: number;
+}
+
 import type {
   PlayerApi,
   PlayerEvent,
@@ -95,7 +115,27 @@ export interface IPlayerClient extends PlayerApi {
   registerNextCandidate(source: string, durationHintSecs?: number): Promise<IpcResponse>;
   /** 清除下一曲候选 */
   clearNextCandidate(): Promise<IpcResponse>;
+  /**
+   * 推送服务端播放队列快照（headless 服务端自治无缝预载）：
+   * 注册后服务端自治完成"下一曲 stage → boundary 簿记/队列推进 → 再预载"，
+   * 浏览器离场无缝播放与曲终接力照常
+   */
+  pushQueueSnapshot(payload: {
+    items: Array<{
+      source: string;
+      duration_ms: number | null;
+      title: string | null;
+      artist: string | null;
+      album: string | null;
+      cover: string | null;
+    }>;
+    index: number;
+    repeat: string;
+    shuffle: boolean;
+  }): Promise<IpcResponse>;
   /** 服务端权威"正在播放"快照（headless：重开页面恢复曲目显示） */
+  /** 获取服务端权威播放队列快照（headless：重开/刷新页面恢复对齐队列与索引） */
+  getQueueSnapshot(): Promise<IpcResponse<ServerQueueSnapshot>>;
   getNowPlaying(): Promise<IpcResponse<any>>;
 }
 

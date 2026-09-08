@@ -12,6 +12,7 @@ import { playerClient } from "@/services/client";
 import { peekNextTrackPreload } from "@/services/nextTrackPreloader";
 import { resolveTrackSource } from "@/services/audioSource";
 import { buildStagingSource } from "@/core/player/gapless";
+import { pushServerQueueSnapshot } from "./serverQueue";
 import { getNextTrackCandidate } from "./candidate";
 import type { CandidateResult } from "./candidate";
 import * as lyricLoader from "@/services/lyric/loader";
@@ -71,14 +72,15 @@ export const maybeRegisterNextCandidate = (): void => {
   resolveThenRegister(candidate);
 };
 
-/** 解析成功/拿到可用音源后统一注册入口（单槽后写覆盖） */
+/** 解析成功/拿到可用音源后统一注册入口：整表推送服务端队列快照。
+ * 服务端 preloader 拿到已解析直链后自治 stage（幂等重调度）；
+ * 服务端 stage 被拒（跨 wire 格式）时自行登记接力候选，曲终加载 */
 const registerCandidate = (candidate: CandidateResult, source: string): void => {
   if (source === registeredForSource) return;
   registeredForSource = source;
   registeredNext = { source, track: candidate.track, index: candidate.index };
   resolvingTrackId = null;
-  const durationHintSecs = candidate.track.duration > 0 ? candidate.track.duration / 1000 : 0;
-  void playerClient.registerNextCandidate(source, durationHintSecs).catch(() => {});
+  pushServerQueueSnapshot();
 };
 
 /**
@@ -108,11 +110,20 @@ const resolveThenRegister = (candidate: CandidateResult): void => {
 
 /**
  * 服务端自动接力后采纳新曲：推进 queue/media/歌词（播放已在服务端发生，不重载）。
- * 仅当 source 与已注册候选一致时生效；采纳后清空注册状态
+ * 匹配优先按队列曲目 id（直链每次解析结果不同，串比对先天脆弱），
+ * source 串精确相等作为旧服务端/本地直链的回退；
+ * 两者都不可用时放弃采纳（UI 保持原曲，避免错位推进）。
+ * 采纳后清空注册状态
  */
-export const adoptServerAdvancedTrack = (source: string): boolean => {
-  if (!registeredNext || registeredNext.source !== source) return false;
-  const { track, index } = registeredNext;
+export const adoptServerAdvancedTrack = (match: {
+  source?: string;
+  trackId?: string;
+}): boolean => {
+  if (!registeredNext) return false;
+  const byTrackId = !!match.trackId && registeredNext.track.id === match.trackId;
+  const bySource = !!match.source && registeredNext.source === match.source;
+  if (!byTrackId && !bySource) return false;
+  const { track, index, source } = registeredNext;
   registeredNext = null;
   registeredForSource = null;
   resolvingTrackId = null;

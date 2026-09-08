@@ -135,6 +135,12 @@ impl InnerPlayer {
                 // 据，不视为停滞。首块消费前不计（Direct 启动握手可能慢于 1.2s）。
                 // 高码率（PCM >96k / 任意 DSD）块周期更长，阈值放宽（对齐 tinyLMS）
                 let stall_threshold: u32 = if monitor.is_high_rate() { 8 } else { 6 };
+                // 曲终判定宽限：EOF 后 staged 候选可能仍在准备（打开解码器/解码
+                // 首帧可达数百毫秒），装填完成后 finished 会复位。stage 窗口内
+                // 直接判 Ended 会造成假曲终——监视线程 break 死亡（后续边界/曲终
+                // 无人上报）且看门狗抢跑重放。连续多个 tick 仍 finished 才确认
+                let finished_confirm_ticks: u32 = 2;
+                let mut finished_ticks: u32 = 0;
                 let mut last_consumed = 0.0_f64;
                 let mut first_consumed_seen = false;
                 let mut stall_ticks: u32 = 0;
@@ -165,12 +171,17 @@ impl InnerPlayer {
                         });
                         break;
                     }
-                    if monitor.finished() {
-                        cb(PlayerEvent::Ended);
-                        cb(PlayerEvent::StateChanged {
-                            state: PlayerState::Stopped,
-                        });
-                        break;
+                    if monitor.finished() && !monitor.staging() {
+                        finished_ticks += 1;
+                        if finished_ticks >= finished_confirm_ticks {
+                            cb(PlayerEvent::Ended);
+                            cb(PlayerEvent::StateChanged {
+                                state: PlayerState::Stopped,
+                            });
+                            break;
+                        }
+                    } else {
+                        finished_ticks = 0;
                     }
 
                     let consumed = monitor.consumed_position();

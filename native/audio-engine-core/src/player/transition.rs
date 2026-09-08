@@ -28,6 +28,10 @@ pub struct OldThreads {
     pub fade_handle: Option<JoinHandle<()>>,
     #[cfg(any(feature = "diretta", test))]
     pub direct_playback: Option<DirectPlayback>,
+    /// stop 触发的 Diretta 排空+关流后台线程：join 后才 drop direct_playback /
+    /// 打开新连接，保证旧连接彻底关闭（消除 stop+load 组合的双会话重叠）
+    #[cfg(any(feature = "diretta", test))]
+    pub direct_close: Option<JoinHandle<()>>,
 }
 
 impl OldThreads {
@@ -35,7 +39,14 @@ impl OldThreads {
     /// 忽略 join 错误：辅助线程 panic 不阻止新加载，主播放路径不依赖它们
     pub fn join_aux(self) -> Option<JoinHandle<decoder::DecoderData>> {
         #[cfg(any(feature = "diretta", test))]
-        drop(self.direct_playback);
+        {
+            // Phase2：先等 stop 触发的排空+关流线程收尾（通常已结束，瞬时返回），
+            // 再 drop 旧连接——顺序保证同一 Target 上不会新旧会话重叠
+            if let Some(h) = self.direct_close {
+                let _ = h.join();
+            }
+            drop(self.direct_playback);
+        }
         for h in [self.position_timer, self.fft_timer, self.fade_handle]
             .into_iter()
             .flatten()
@@ -131,6 +142,8 @@ impl InnerPlayer {
             fade_handle: self.fade_handle.take(),
             #[cfg(any(feature = "diretta", test))]
             direct_playback: self.direct_playback.take(),
+            #[cfg(any(feature = "diretta", test))]
+            direct_close: self.direct_close_thread.take(),
         };
         (old_threads, token)
     }
@@ -218,6 +231,8 @@ impl InnerPlayer {
             fade_handle: self.fade_handle.take(),
             #[cfg(any(feature = "diretta", test))]
             direct_playback: None,
+            #[cfg(any(feature = "diretta", test))]
+            direct_close: self.direct_close_thread.take(),
         };
 
         let (norm_enabled, norm_gain) = match self.shared.take() {
@@ -461,16 +476,24 @@ impl InnerPlayer {
         self.direct_playback.as_ref().map(DirectPlayback::format)
     }
 
-    /// 播放中启动 Direct 源级淡出（暂停/无连接时为无害 no-op）
+    /// 播放中启动 Direct 源级淡出/排空（PCM=淡出、DSD=静音垫请求）。
+    ///
+    /// 生效条件是"连接活跃且设备正在/即将消费"：
+    /// - 播放中：常规手动切歌排空；
+    /// - 已 finished（曲末自然结束后的接力）：设备仍在拉静音块，静音垫
+    ///   仍需置换设备端缓冲——此分支不依赖 state：曲末自然结束后引擎
+    ///   state 残留 Playing 而快照是 Stopped，接力排空曾隐式依赖该残留值，
+    ///   finished() 兜底后即使未来修正曲末状态此处也不退化；
+    /// - 暂停态：SDK 未在消费、Target 缓冲已自然播空，排空是纯等待 → 跳过
     #[cfg(any(feature = "diretta", test))]
     pub fn begin_direct_fade_out(&mut self) -> Result<()> {
-        if self.state != PlayerState::Playing {
+        let playback = match self.direct_playback.as_ref() {
+            Some(playback) => playback,
+            None => return Ok(()),
+        };
+        if self.state != PlayerState::Playing && !playback.finished() {
             return Ok(());
         }
-        let playback = self
-            .direct_playback
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("[Direct] 无活跃 Direct 连接可淡出"))?;
         playback.begin_fade_out();
         Ok(())
     }
@@ -484,19 +507,25 @@ impl InnerPlayer {
         }
     }
 
-    /// 取 Direct 排空等待句柄：None = 无需排空（无连接/非播放态）。
+    /// 取 Direct 排空等待句柄：None = 无需排空。生效条件与
+    /// begin_direct_fade_out 一致（播放中，或曲末接力时的 finished 兜底——
+    /// 不依赖曲末 state 残留值；暂停态 SDK 未在消费、缓冲已播空，跳过）。
     /// 句柄持有 ring 的 Arc 引用——排空最长可等 600ms，
     /// 调用方必须在释放 player 锁之后用它等待
     #[cfg(any(feature = "diretta", test))]
     pub fn direct_drain_handle(&self) -> Option<DirectMonitor> {
-        if self.state != PlayerState::Playing {
+        let playback = self.direct_playback.as_ref()?;
+        if self.state != PlayerState::Playing && !playback.finished() {
             return None;
         }
-        self.direct_playback.as_ref().map(DirectPlayback::monitor)
+        Some(playback.monitor())
     }
 
     /// Direct 载入编排（headless 与 NAPI 两侧调用方共用）：
     /// 淡出旧源 → 锁外排空 → 块边界原子换源。
+    ///
+    /// `open_path`：打开用物理路径（在线源 preload 物化产物 memfd/磁盘缓存），
+    /// None = 按 source 打开（本地源原行为）。
     ///
     /// 返回：
     /// - `Ok(Some(format))`：已切到新源，连接复用成功
@@ -506,10 +535,12 @@ impl InnerPlayer {
     ///
     /// 淡出与提交分段持锁；最长 600ms 的排空等待在 player 锁外进行
     #[cfg(any(feature = "diretta", test))]
+    #[allow(clippy::too_many_arguments)]
     pub fn try_direct_handoff(
         player: &Mutex<InnerPlayer>,
         token: u64,
         source: &str,
+        open_path: Option<&str>,
         duration_secs: f64,
         auto_play: bool,
         current_format: DirectFormat,
@@ -543,9 +574,12 @@ impl InnerPlayer {
         // 2) 锁外事件驱动排空：渐零完成 + 交付足量数字静音块（顶掉设备端
         //    缓冲里的旧音频尾巴）；暂停态/无连接时句柄为 None 瞬时通过
         if let Some(monitor) = &drain {
+            // 超时与动态排空目标联动：drain_target + EXTRA，ring 未注入时
+            // drain_target 退回旧常量 200ms（行为等价改动前）
             if !monitor.wait_fade_drained(
                 crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_BLOCKS,
-                crate::direct_runtime::DIRECT_FADE_DRAIN_TIMEOUT,
+                std::time::Duration::from_micros(monitor.drain_target_micros())
+                    + crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
             ) {
                 debug!(
                     target: "diretta_handoff",
@@ -556,7 +590,7 @@ impl InnerPlayer {
         }
         // 3) 块边界原子换源（格式不一致时 Err，旧连接保持静音原状）
         let mut player = player.lock();
-        player.commit_direct_handoff(token, source, duration_secs, auto_play)
+        player.commit_direct_handoff(token, source, open_path, duration_secs, auto_play)
     }
 
     /// 同格式 Direct handoff 提交：保留 Diretta 连接，生产者线程在块边界原子换源。
@@ -571,6 +605,7 @@ impl InnerPlayer {
         &mut self,
         token: u64,
         source: &str,
+        open_path: Option<&str>,
         duration: f64,
         auto_play: bool,
     ) -> Result<Option<DirectFormat>> {
@@ -588,7 +623,7 @@ impl InnerPlayer {
             .pending_load_handle
             .clone()
             .ok_or_else(|| anyhow::anyhow!("[Direct] handoff 前缺少 load 取消句柄"))?;
-        let format = playback.handoff_drained_source(source, duration, cancel)?;
+        let format = playback.handoff_drained_source(source, open_path, duration, cancel)?;
         self.current_source = Some(source.to_owned());
         self.audio_duration = if duration > 0.0 {
             duration

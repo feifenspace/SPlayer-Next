@@ -298,7 +298,9 @@ fn open_device_internal(
         None => {
             let default = host.default_output_device().context("没有可用的输出设备")?;
             let default_id = device_id_string(&default).context("读取默认输出设备 ID 失败")?;
-            find_device(&host, &default_id).context("解析默认输出设备端点失败")?
+            // ALSA 等后端的默认设备不在 output_devices() 枚举内，按 ID 重解析会落空；
+            // default 本身就是合法 Device 句柄，直接使用
+            find_device(&host, &default_id).unwrap_or(default)
         }
     };
     let default_config = device

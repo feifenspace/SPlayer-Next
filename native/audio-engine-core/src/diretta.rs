@@ -107,6 +107,19 @@ pub fn selector_for(target_id: &str) -> String {
     format!("{DEVICE_PREFIX}{target_id}")
 }
 
+/// 排空目标时长（µs，Phase2）：Sink 实测延迟 / 自报缓冲取大者，+50% 余量，
+/// 下限保持旧常量 DIRECT_FADE_DRAIN_MIN_MICROS（不劣于改动前），上限 1s（防异常值）。
+/// 两个读数均不可用（0）时返回 0 → ring 退回旧常量，等价改动前行为
+#[cfg(feature = "diretta")]
+pub fn compute_drain_target_micros(latency_us: u64, buffer_us: u64) -> u64 {
+    use crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_MICROS;
+    let base = latency_us.max(buffer_us);
+    if base == 0 {
+        return 0;
+    }
+    (base + base / 2).clamp(DIRECT_FADE_DRAIN_MIN_MICROS, 1_000_000)
+}
+
 #[cfg(feature = "diretta")]
 mod imp {
     use std::ffi::{c_char, c_void, CStr, CString};
@@ -122,10 +135,12 @@ mod imp {
         DirectPcmStageHandle,
     };
     use diretta_sys::{
-        splayer_diretta_close, splayer_diretta_last_error, splayer_diretta_open_direct,
-        splayer_diretta_open_dsd_direct, splayer_diretta_pause, splayer_diretta_play,
-        splayer_diretta_query_target_caps, splayer_diretta_scan, SPlayerDirettaDevice,
-        SPlayerDirettaTargetCaps, TARGET_FW_MAX, TARGET_TEXT_MAX, TEXT_CAPACITY,
+        splayer_diretta_close, splayer_diretta_cycle_size, splayer_diretta_last_error,
+        splayer_diretta_mute_byte, splayer_diretta_open_direct, splayer_diretta_open_dsd_direct,
+        splayer_diretta_pause, splayer_diretta_play, splayer_diretta_query_target_caps,
+        splayer_diretta_scan, splayer_diretta_sink_buffer_us, splayer_diretta_sink_latency_us,
+        SPlayerDirettaDevice, SPlayerDirettaTargetCaps, TARGET_FW_MAX, TARGET_TEXT_MAX,
+        TEXT_CAPACITY,
     };
 
     const MAX_SCAN_DEVICES: usize = 32;
@@ -298,7 +313,9 @@ mod imp {
             };
             let raw = NonNull::new(raw)
                 .ok_or_else(|| last_error("failed to open Diretta Source Direct target"))?;
-            Ok((Self { raw, source }, actual_position))
+            let connection = Self { raw, source };
+            connection.configure_drain_after_open(&format);
+            Ok((connection, actual_position))
         }
 
         /// 以流式 Reader 打开（在线音源 stream 模式，wire-format 协商与本地路径一致）
@@ -325,11 +342,36 @@ mod imp {
             };
             let raw = NonNull::new(raw)
                 .ok_or_else(|| last_error("failed to open Diretta Source Direct target"))?;
-            Ok((Self { raw, source }, actual_position))
+            let connection = Self { raw, source };
+            connection.configure_drain_after_open(&format);
+            Ok((connection, actual_position))
         }
 
         pub fn format(&self) -> DirectPcmFormat {
             self.source.format()
+        }
+
+        /// 建连后采集 Sink 实测参数并注入排空目标（Phase0 诊断 + Phase2 动态排空）。
+        /// PCM 静音固定 0x00（signed 零点），不采信 SDK mute_byte。
+        /// 任何 FFI 读数失败均返回 0 → 排空目标退回旧常量（默认行为可回退）
+        fn configure_drain_after_open(&self, wire_format: &DirectPcmFormat) {
+            let latency_us = unsafe { splayer_diretta_sink_latency_us(self.raw.as_ptr()) };
+            let buffer_us = unsafe { splayer_diretta_sink_buffer_us(self.raw.as_ptr()) };
+            let cycle_size = unsafe { splayer_diretta_cycle_size(self.raw.as_ptr()) };
+            let mute_byte = unsafe { splayer_diretta_mute_byte(self.raw.as_ptr()) };
+            let drain_target_micros = compute_drain_target_micros(latency_us, buffer_us);
+            self.source.set_drain_target_micros(drain_target_micros);
+            tracing::info!(
+                target: "diretta_handoff",
+                phase = "sink_params",
+                latency_us = %latency_us,
+                buffer_us = %buffer_us,
+                cycle_size = %cycle_size,
+                mute_byte = %mute_byte,
+                drain_target_micros = %drain_target_micros,
+                wire_format = ?wire_format,
+                "Diretta sink 实测参数（Phase0 诊断）"
+            );
         }
 
         pub fn play(&mut self) -> Result<()> {
@@ -400,6 +442,19 @@ mod imp {
         pub fn wait_fade_drained(&self, min_blocks: u32, timeout: Duration) -> bool {
             self.source.wait_fade_drained(min_blocks, timeout)
         }
+
+        /// 软暂停（Phase3）：淡出到零电平并交付至少一个静音块（或超时）。
+        /// 供 InnerPlayer::pause 在 sync->stop 前调用，消除暂停末块阶跃
+        pub fn begin_soft_pause_and_wait(&self, timeout: Duration) -> bool {
+            self.source.begin_fade_out();
+            self.source.wait_soft_pause(timeout)
+        }
+
+        /// 恢复播放淡入：清除软暂停静音态并从零增益渐入。
+        /// 不清除则恢复后永久静音（正确性关键）
+        pub fn resume_soft(&self) {
+            self.source.begin_fade_in();
+        }
     }
 
     impl Drop for DirettaDirectConnection {
@@ -464,11 +519,37 @@ mod imp {
                     ));
                 }
             }
-            Ok((Self { raw, source }, actual_position))
+            let connection = Self { raw, source };
+            connection.configure_drain_after_open(&format);
+            Ok((connection, actual_position))
         }
 
         pub fn format(&self) -> DirectDsdFormat {
             self.source.format()
+        }
+
+        /// 建连后采集 Sink 实测参数并注入排空目标与静音字节
+        /// （Phase0 诊断 + Phase2/3：DSD 静音字节以 SDK getMuteByte 为准，
+        /// 读数失败返回 0 → ring 退回 0x69 硬编码；排空目标退回旧常量）
+        fn configure_drain_after_open(&self, wire_format: &DirectDsdFormat) {
+            let latency_us = unsafe { splayer_diretta_sink_latency_us(self.raw.as_ptr()) };
+            let buffer_us = unsafe { splayer_diretta_sink_buffer_us(self.raw.as_ptr()) };
+            let cycle_size = unsafe { splayer_diretta_cycle_size(self.raw.as_ptr()) };
+            let mute_byte = unsafe { splayer_diretta_mute_byte(self.raw.as_ptr()) };
+            let drain_target_micros = compute_drain_target_micros(latency_us, buffer_us);
+            self.source.set_drain_target_micros(drain_target_micros);
+            self.source.set_mute_byte(mute_byte);
+            tracing::info!(
+                target: "diretta_dsd",
+                phase = "sink_params",
+                latency_us = %latency_us,
+                buffer_us = %buffer_us,
+                cycle_size = %cycle_size,
+                mute_byte = %mute_byte,
+                drain_target_micros = %drain_target_micros,
+                bit_rate = %wire_format.bit_rate,
+                "Diretta DSD sink 实测参数（Phase0 诊断）"
+            );
         }
 
         pub fn play(&mut self) -> Result<()> {
@@ -489,6 +570,23 @@ mod imp {
 
         pub fn seek_while_paused(&mut self, position_secs: f64) -> Result<f64> {
             self.source.seek_while_paused(position_secs)
+        }
+
+        /// 换源/拆线前的源级排空请求（DSD 无淡出通道，排空 = 回调侧交付 0x69 静音垫）
+        pub fn begin_drain(&self) {
+            self.source.begin_drain();
+        }
+
+        /// 软暂停（Phase3）：交付块替换为 0x69 零电平并至少交付一个静音块
+        ///（或超时）。供 InnerPlayer::pause 在 sync->stop 前调用
+        pub fn begin_soft_pause_and_wait(&self, timeout: Duration) -> bool {
+            self.begin_drain();
+            self.source.wait_soft_pause(timeout)
+        }
+
+        /// 恢复播放：清除排空请求。不清除则恢复后永久静音（正确性关键）
+        pub fn resume_soft(&self) {
+            self.source.clear_drain();
         }
 
         pub fn replace_drained_local_source(
@@ -651,11 +749,18 @@ mod tests {
         assert!(dsd_open.contains("FMT_DSD1"));
         assert!(dsd_open.contains("FMT_DSD_SIZ_32"));
         assert!(dsd_open.contains("FMT_DSD_BIG"));
+        assert!(dsd_open.contains("FMT_DSD_LITTLE"));
         assert!(dsd_open.contains("FMT_DSD_LSB"));
         assert!(dsd_open.contains("FMT_DSD_MSB"));
         assert!(dsd_open.contains("source_lsb_first"));
         assert!(dsd_open.contains("wire_lsb_first"));
-        assert!(dsd_open.contains("alternate_format_id"));
+        // R8 位图协商：LSB/MSB × BIG/LITTLE 四组合按偏好顺序构建候选表，
+        // 委托 open_direct_with_format 逐个 checkSinkSupport 探测
+        // （源位序优先，避免 Rust 侧位重排；探测为本地校验，无网络往返）
+        assert!(dsd_open.contains("bit_orders"));
+        assert!(dsd_open.contains("byte_orders"));
+        assert!(dsd_open.contains("candidates"));
+        assert!(dsd_open.contains("open_direct_with_format"));
         for forbidden in ["DSD2PCM", "DoP", "memcpy", "reverse_bits"] {
             assert!(
                 !dsd_open.contains(forbidden),

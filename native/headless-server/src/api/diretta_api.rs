@@ -72,31 +72,46 @@ pub(crate) async fn diretta_select_handler(
     State(state): State<AppState>,
     Json(payload): Json<DirettaSelectRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
-    let dev_name = payload.target.as_ref().and_then(|t| {
-        let trimmed = t.trim();
-        if trimmed.is_empty()
-            || trimmed == "undefined"
-            || trimmed == "diretta:undefined"
-            || trimmed == "null"
-            || trimmed == "diretta:null"
-            || trimmed == "system-default"
-        {
-            None
-        } else if trimmed.starts_with("diretta:")
-            || trimmed.starts_with("diretta@")
-            || trimmed.starts_with("alsammap:")
-        {
-            // alsammap: 本地直出选择器（B9），非 Diretta 目标，原样保留
-            Some(trimmed.to_string())
-        } else {
-            Some(format!("diretta:{}", trimmed))
-        }
+    let raw_target = payload.target.as_deref().map(str::trim).filter(|trimmed| {
+        !trimmed.is_empty()
+            && *trimmed != "undefined"
+            && *trimmed != "diretta:undefined"
+            && *trimmed != "null"
+            && *trimmed != "diretta:null"
+            && *trimmed != "system-default"
     });
+    // 裸名（无 diretta:/alsammap: 前缀）有歧义：可能是 Diretta 目标名，也可能是
+    // 本地 CPAL 设备 ID（Linux 下形如 alsa:xxx）。对照 /player/devices 同源的
+    // 设备表判定：命中按本地输出原样保留，否则视为 Diretta 目标补 diretta: 前缀。
+    // 此前一律补前缀，本地声卡被当成 Diretta 目标，PCM/DSD 全部无法播放
+    let (dev_name, is_local_device) = match raw_target {
+        None => (None, false),
+        // alsammap: 本地直出选择器（B9），非 Diretta 目标，原样保留
+        Some(trimmed) if trimmed.starts_with("alsammap:") => (Some(trimmed.to_string()), true),
+        Some(trimmed) if trimmed.starts_with("diretta:") || trimmed.starts_with("diretta@") => {
+            (Some(trimmed.to_string()), false)
+        }
+        Some(trimmed) => {
+            let lookup = trimmed.to_string();
+            let is_local = spawn_isolated_blocking("diretta-select-local-lookup", move || {
+                audio_engine_core::audio_output::list_output_devices()
+                    .iter()
+                    .any(|(id, _, _)| *id == lookup)
+            })
+            .await
+            .unwrap_or(false);
+            if is_local {
+                (Some(trimmed.to_string()), true)
+            } else {
+                (Some(format!("diretta:{}", trimmed)), false)
+            }
+        }
+    };
 
-    // alsammap 本地设备不做 Diretta 可达性探测（本地 ALSA 打开失败会在
+    // 本地设备（alsammap / CPAL）不做 Diretta 可达性探测（本地打开失败会在
     // load 时显式报错）
     let reachable = match &dev_name {
-        Some(target) if target.starts_with("alsammap:") => true,
+        Some(_) if is_local_device => true,
         Some(target) => {
             let target = target.clone();
             // DKS 探测内部无超时（3 轮发现重试 + MTU 测量），Target 被占用/半死时

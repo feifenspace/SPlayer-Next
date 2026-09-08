@@ -174,6 +174,7 @@ export const hasStagedDirectNext = (): boolean => stagedTrackId !== "";
 export const advanceGaplessBoundary = async (
   durationMs: number,
   _generation: number,
+  trackId?: string,
 ): Promise<boolean> => {
   const status = useStatusStore();
   const settings = useSettingsStore();
@@ -186,6 +187,17 @@ export const advanceGaplessBoundary = async (
     fuckDjMode: settings.preset.fuckDjMode,
     shuffleMode: status.shuffleMode,
   });
+  // 服务端自治无缝切曲的曲目 id 与前端队列推导不一致 = 队列权威失同步信号
+  // （前端仍按推导推进，warn 供联调定位）
+  if (trackId && candidate && candidate.track.id !== trackId) {
+    console.warn(
+      "[gapless] boundary 曲目与前端队列推导不一致",
+      "server:",
+      trackId,
+      "local:",
+      candidate.track.id,
+    );
+  }
   // 引擎已切入下一曲但前端无法定位候选：只能提交时长，保持引擎侧状态正确
   if (!candidate) {
     await window.api.player
