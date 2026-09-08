@@ -4,7 +4,7 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::spawn_isolated_blocking;
 use axum::{
@@ -19,6 +19,23 @@ use serde::Deserialize;
 
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// 单次发送超时：对端停止读取（移动端后台冻结/NAT 静默重置导致的 TCP
+/// 零窗口）时，无超时的 send 会永久阻塞 select 循环——recv 分支饿死、
+/// Close 永远收不到、FFT 订阅无法释放。超时即放弃本连接。
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// 服务端心跳周期：浏览器对 Ping 自动回 Pong，超时无 Pong 判定半开连接
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// 允许的最大 Pong 静默期（略大于两个心跳周期，容忍偶发丢包）
+const PONG_DEADLINE: Duration = Duration::from_secs(65);
+
+/// 带超时的单条发送；返回 false 表示连接应终止
+async fn send_msg(socket: &mut WebSocket, msg: Message) -> bool {
+    matches!(
+        tokio::time::timeout(SEND_TIMEOUT, socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
 
 /// WebSocket 查询参数
 #[derive(Debug, Deserialize)]
@@ -46,6 +63,9 @@ pub(crate) async fn ws_run(mut socket: WebSocket, state: AppState) {
     let mut rx_scan = state.scan_tx.subscribe();
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut heartbeat = tokio::time::interval(PING_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pong = Instant::now();
     // 本连接是否订阅 FFT 频谱（默认关闭；订阅计数归零时关闭引擎 FFT 定时器）
     let mut fft_subscribed = false;
 
@@ -55,7 +75,17 @@ pub(crate) async fn ws_run(mut socket: WebSocket, state: AppState) {
                 // 定时推送当前播放器快照
                 let snapshot = state.snapshot();
                 let payload = serde_json::json!({ "type": "snapshot", "data": snapshot }).to_string();
-                if socket.send(Message::Text(payload.into())).await.is_err() {
+                if !send_msg(&mut socket, Message::Text(payload.into())).await {
+                    break;
+                }
+            }
+            _ = heartbeat.tick() => {
+                // 半开连接检测：一个 PONG_DEADLINE 内无任何 Pong 即判死
+                if last_pong.elapsed() > PONG_DEADLINE {
+                    tracing::debug!("ws 连接心跳超时，主动断开");
+                    break;
+                }
+                if !send_msg(&mut socket, Message::Ping(vec![].into())).await {
                     break;
                 }
             }
@@ -66,7 +96,7 @@ pub(crate) async fn ws_run(mut socket: WebSocket, state: AppState) {
                     continue;
                 }
                 let payload = serde_json::to_string(&msg).unwrap_or_else(|_| "{}".into());
-                if socket.send(Message::Text(payload.into())).await.is_err() {
+                if !send_msg(&mut socket, Message::Text(payload.into())).await {
                     break;
                 }
             }
@@ -77,7 +107,7 @@ pub(crate) async fn ws_run(mut socket: WebSocket, state: AppState) {
                     "data": scan_msg,
                 })
                 .to_string();
-                if socket.send(Message::Text(payload.into())).await.is_err() {
+                if !send_msg(&mut socket, Message::Text(payload.into())).await {
                     break;
                 }
             }
@@ -114,6 +144,9 @@ pub(crate) async fn ws_run(mut socket: WebSocket, state: AppState) {
                             fft_release(&state).await;
                         }
                     }
+                    Some(Ok(Message::Pong(_))) => {
+                        last_pong = Instant::now();
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }
@@ -130,11 +163,26 @@ pub(crate) async fn ws_run(mut socket: WebSocket, state: AppState) {
 
 /// FFT 订阅计数 -1，归零时关闭播放器 FFT 定时器（避免无消费空转）
 pub(crate) async fn fft_release(state: &AppState) {
-    let last = state
+    // CAS 防负：理论上每连接仅释放自己的订阅，但 send 超时/心跳超时
+    // 新增了非常规退出路径，计数器不允许下穿 0
+    let mut current = state
         .fft_subscriber_count
-        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-        == 1;
-    if last {
+        .load(std::sync::atomic::Ordering::Acquire);
+    let released = loop {
+        if current == 0 {
+            break false;
+        }
+        match state.fft_subscriber_count.compare_exchange_weak(
+            current,
+            current - 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => break true,
+            Err(actual) => current = actual,
+        }
+    };
+    if released {
         let st = state.clone();
         let _ = spawn_isolated_blocking("fft-disable", move || {
             st.player.lock().set_fft_enabled(false);
