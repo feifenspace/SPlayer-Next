@@ -538,3 +538,35 @@ fn unix_millis() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// WS state 消息契约：前端接力采纳（adoptServerAdvancedTrack）依赖
+    /// current_source/current_track_id 字段，序列化命名不得漂移
+    #[test]
+    fn ws_state_serializes_adoption_fields() {
+        let ws = WsState {
+            position: 1.0,
+            duration: 2.0,
+            volume: 0.5,
+            state: PlayerState::Playing,
+            current_source: Some("/music/01.flac".into()),
+            current_track_id: Some("local:1a2b".into()),
+        };
+        let v = serde_json::to_value(&ws).unwrap();
+        assert_eq!(v["current_source"], "/music/01.flac");
+        assert_eq!(v["current_track_id"], "local:1a2b");
+        assert_eq!(v["state"], "playing");
+        // 缺省时序列化为 null 而非省略键（前端以 presence 判断是否采纳）
+        let ws_empty = WsState {
+            current_source: None,
+            current_track_id: None,
+            ..ws
+        };
+        let v = serde_json::to_value(&ws_empty).unwrap();
+        assert!(v.get("current_source").is_some());
+        assert!(v["current_source"].is_null());
+    }
+}
