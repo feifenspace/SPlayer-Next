@@ -22,11 +22,26 @@ pub struct FilePathQuery {
     pub path: Option<String>,
 }
 
+/// 封面 id 成分校验：id 会被 `join` 进封面目录，含路径分隔符或 `..` 即可
+/// 穿越（`GET /api/v1/covers/..%2F..%2Fetc%2Fpasswd` 已实测可回读任意文件）。
+/// 合法 id 形如 `local:{md5:x}` 或缓存文件名，均不含分隔符。
+fn is_cover_id_safe(id: &str) -> bool {
+    !id.is_empty() && !id.contains('/') && !id.contains('\\') && !id.contains("..")
+}
+
+/// 查询 path 成分校验：库内文件路径（绝对路径）合法，但拒绝 `..` 跳转成分
+fn path_has_traversal(path: &str) -> bool {
+    path.contains("..")
+}
+
 /// 根据 ID 或缓存文件名获取封面流（文件读取为阻塞 IO，隔离到独立线程）
 pub(crate) async fn cover_get_handler(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
+    if !is_cover_id_safe(&id) {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
     let cover_dir = state.config.resolved_cover_cache_dir();
     spawn_isolated_blocking("cover-file-read", move || {
         let possible_paths = [
@@ -75,6 +90,9 @@ pub(crate) async fn cover_file_handler(
     let Some(path) = query.path else {
         return axum::http::StatusCode::BAD_REQUEST.into_response();
     };
+    if path_has_traversal(&path) {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
 
     spawn_isolated_blocking("cover-embed-read", move || {
         let p = std::path::Path::new(&path);
@@ -119,6 +137,11 @@ pub(crate) async fn lyric_file_handler(
     let path = query
         .path
         .ok_or_else(|| ApiError::bad_request("Missing path parameter"))?;
+    if path_has_traversal(&path) {
+        return Err(ApiError::bad_request(
+            "path must not contain '..' components",
+        ));
+    }
 
     spawn_isolated_blocking("lyric-file-read", move || {
         let p = std::path::Path::new(&path);
@@ -298,5 +321,26 @@ mod tests {
         assert!(!resp.success);
         assert!(resp.data.is_none());
         assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn cover_id_traversal_rejected() {
+        // 合法 id：local:{md5:x} / 缓存文件名（含扩展名）
+        assert!(is_cover_id_safe("local:1a2b3c"));
+        assert!(is_cover_id_safe("d41d8cd98f00b204e9800998ecf8427e.jpg"));
+        // 穿越：分隔符与相对成分
+        assert!(!is_cover_id_safe("../etc/passwd"));
+        assert!(!is_cover_id_safe("..%2Fetc%2Fpasswd")); // 解码后含 '/'
+        assert!(!is_cover_id_safe("a\\b"));
+        assert!(!is_cover_id_safe(".."));
+        assert!(!is_cover_id_safe(""));
+    }
+
+    #[test]
+    fn query_path_traversal_rejected() {
+        assert!(!path_has_traversal("/music/album/01.flac"));
+        assert!(!path_has_traversal("cue://abc|0|120000|1"));
+        assert!(path_has_traversal("/music/../secret.txt"));
+        assert!(path_has_traversal(".."));
     }
 }
