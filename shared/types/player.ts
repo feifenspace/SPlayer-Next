@@ -194,6 +194,9 @@ export interface PlayerStatus {
   isFinished: boolean;
   /** 服务端当前音源（仅 headless WS snapshot 附带，用于自动连播采纳） */
   currentSource?: string;
+  /** 服务端当前曲的队列曲目 id：接力/无缝边界切曲后按 id 采纳（直链串
+   * 每次解析不同，不可作匹配键） */
+  currentTrackId?: string;
 }
 
 /** 音频输出设备 */
@@ -220,7 +223,7 @@ export type PlayerEvent =
   | {
       type: "directTrackBoundary";
       /** 无缝切换后新曲时长（毫秒） */
-      data: { duration: number; generation: number };
+      data: { duration: number; generation: number; source?: string; trackId?: string };
     }
   | { type: "play" }
   | { type: "pause" }
