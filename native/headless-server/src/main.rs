@@ -22,12 +22,12 @@ struct Cli {
     /// 监听地址（如 192.168.1.10:14558，设置后忽略 --host/--port）
     #[arg(long, value_name = "ADDR")]
     listen: Option<String>,
-    /// 监听主机（仅在 listen_addr 为默认值时生效）
-    #[arg(long, value_name = "HOST", default_value = "0.0.0.0")]
-    host: String,
-    /// 监听端口（仅在 listen_addr 为默认值时生效）
-    #[arg(long, value_name = "PORT", default_value_t = 14558)]
-    port: u16,
+    /// 监听主机（显式传参时无条件覆盖配置文件 listen_addr 的主机部分）
+    #[arg(long, value_name = "HOST")]
+    host: Option<String>,
+    /// 监听端口（显式传参时无条件覆盖配置文件 listen_addr 的端口部分）
+    #[arg(long, value_name = "PORT")]
+    port: Option<u16>,
     /// API Token（可选，为空则不校验）
     #[arg(long, value_name = "TOKEN")]
     token: Option<String>,
@@ -48,6 +48,7 @@ struct Cli {
 impl Cli {
     /// 参数覆盖配置文件（参数名与历史版本完全兼容）
     fn apply_to(self, config: &mut Config) {
+        let listen_given = self.listen.is_some();
         if let Some(web_root) = self.web_root {
             config.web_root = Some(web_root);
         }
@@ -70,9 +71,24 @@ impl Cli {
         if let Some(target) = self.diretta_target {
             config.diretta_target = Some(target);
         }
-        // 历史 quirk 保持：--host/--port 仅在 listen_addr 为默认值/空时生效
-        if config.listen_addr == "127.0.0.1:14558" || config.listen_addr.is_empty() {
-            config.listen_addr = format!("{}:{}", self.host, self.port);
+        // 显式 CLI 传参无条件覆盖配置文件。历史实现里配置文件的 listen_addr
+        // 会静默吞掉 --host/--port（实测传 --host 127.0.0.1 --port 14799 仍绑
+        // 配置的 0.0.0.0:14558），导致运维显式收窄监听面时实际不生效。
+        // 无任何传参时保持配置文件值（默认 127.0.0.1:14558，仅回环）。
+        // --listen 已给出时独占生效，忽略 --host/--port
+        if !listen_given && (self.host.is_some() || self.port.is_some()) {
+            let (host, port) = config
+                .listen_addr
+                .rsplit_once(':')
+                .map(|(h, p)| (h.to_string(), p.to_string()))
+                .unwrap_or_else(|| ("127.0.0.1".to_string(), "14558".to_string()));
+            config.listen_addr = format!(
+                "{}:{}",
+                self.host.unwrap_or(host),
+                self.port
+                    .map(|p| p.to_string())
+                    .unwrap_or(port)
+            );
         }
     }
 }
