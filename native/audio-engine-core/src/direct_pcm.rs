@@ -1758,6 +1758,18 @@ enum DirectPcmCommand {
         cancel: HttpCancelHandle,
         response: mpsc::SyncSender<Result<DirectPcmFormat>>,
     },
+    /// v12-A：手动 handoff 并行开源 —— 优先装填 arm 阶段后台预打开的 staged
+    /// 候选（generation 匹配才可信），未就绪/不符时在 wait 内短等，仍无则
+    /// 回退与 ReplaceLocal 完全相同的同步开源路径（无回归）
+    ReplaceStaged {
+        source: String,
+        start_secs: f64,
+        stop_micros: u64,
+        cancel: HttpCancelHandle,
+        expected_generation: u64,
+        wait: Duration,
+        response: mpsc::SyncSender<Result<DirectPcmFormat>>,
+    },
     StageLocal {
         path: PathBuf,
         start_secs: f64,
@@ -1769,6 +1781,11 @@ enum DirectPcmCommand {
     },
     CancelStaged,
 }
+
+/// v12-A：手动 handoff stage 预打开的专用 generation 命名空间。
+/// 从 2e9 起与 preloader 使用的 ring boundary_generation（小步进）天然隔离，
+/// ReplaceStaged 以 generation 相等作为"装填的确实是本次 arm 的候选"的凭据
+static HANDOFF_STAGE_GENERATION: AtomicU64 = AtomicU64::new(2_000_000_000);
 
 /// 消费端源级淡出状态：手动切歌/停止关流前，把输出线性渐零到静音，消除
 /// mid-sample 硬切爆音。增益以 1e-6 定点表示（1_000_000 = 1.0）；
@@ -2370,6 +2387,30 @@ fn install_staged_pcm_slot(
     Ok((staged.decoder, staged.format, staged.start_secs, staged.stop_micros))
 }
 
+/// 收取后台 stage prepare 的就绪结果（producer 主循环与 ReplaceStaged
+/// 等待循环共用）：epoch 匹配才装填（过期结果丢弃，decoder 随 drop 关闭）；
+/// 失败仅清除 stage_pending
+fn collect_stage_outcomes(
+    stage_result_rx: &mpsc::Receiver<StagePrepareOutcome>,
+    ring: &Arc<DirectPcmRing>,
+    staged: &mut Option<StagedPcmSource>,
+) {
+    while let Ok(outcome) = stage_result_rx.try_recv() {
+        match outcome {
+            StagePrepareOutcome::Ready(epoch, candidate) => {
+                if epoch == ring.stage_epoch.load(Ordering::Acquire) {
+                    *staged = Some(candidate);
+                }
+            }
+            StagePrepareOutcome::Failed(epoch) => {
+                if epoch == ring.stage_epoch.load(Ordering::Acquire) {
+                    ring.stage_pending.store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+}
+
 fn replace_pcm_ring(
     source: &str,
     start_secs: f64,
@@ -2422,6 +2463,20 @@ fn replace_pcm_ring(
         "replace_pcm_ring first frame decoded"
     );
 
+    install_prepared_first_frame(ring, prepared, new_format, &decoder)?;
+    Ok((decoder, new_format))
+}
+
+/// 将已解码首帧装填进 ring slot[0] 并完成换源复位（v12-A 重构提取）：
+/// ReplaceLocal 的同步开源路径与 ReplaceStaged 的 staged 装填路径共用，
+/// 保证两条路径的簿记语义（pre-mute/reset_for_transition/boundary/R3 块几何）
+/// 完全一致。decoder 仅用于 repack 预分配的 frame_samples_hint
+fn install_prepared_first_frame(
+    ring: &DirectPcmRing,
+    mut prepared: DirectPcmFrame,
+    new_format: DirectPcmFormat,
+    decoder: &DirectPcmDecoder,
+) -> Result<()> {
     if new_format.memory_path == DirectPcmMemoryPath::BitPerfectRepack {
         let max_samples_per_channel = decoder
             .frame_samples_hint()
@@ -2441,6 +2496,7 @@ fn replace_pcm_ring(
     first_slot.state.store(SLOT_FILLING, Ordering::Relaxed);
     let first_frame = unsafe { &mut *first_slot.frame.get() };
     std::mem::swap(first_frame, &mut prepared);
+    drop(prepared);
     if new_format.memory_path == DirectPcmMemoryPath::BitPerfectRepack {
         let max_samples_per_channel = decoder
             .frame_samples_hint()
@@ -2489,7 +2545,7 @@ fn replace_pcm_ring(
         consumed_frames = %ring.consumed_frames.load(Ordering::Acquire),
         "replace_pcm_ring slot swap complete"
     );
-    Ok((decoder, new_format))
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -2806,6 +2862,121 @@ impl DirectPcmSource {
                                     file_pos_secs = start_secs;
                                     bound_stop_secs = if stop_micros > 0 {
                                         Some(stop_micros as f64 / 1_000_000.0)
+                                    } else {
+                                        None
+                                    };
+                                    // 推进代数：旧候选的在途 prepare 结果作废
+                                    producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
+                                    producer_ring
+                                        .stage_pending
+                                        .store(false, Ordering::Release);
+                                    let _ = response.send(Ok(new_format));
+                                    next_slot = 1;
+                                }
+                                Err(error) => {
+                                    let _ = response.send(Err(error));
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(DirectPcmCommand::ReplaceStaged {
+                            source,
+                            start_secs,
+                            stop_micros,
+                            cancel,
+                            expected_generation,
+                            wait,
+                            response,
+                        }) => {
+                            // v12-A：优先装填 arm 阶段预打开的 staged 候选。
+                            // 等待期间不产块，依赖排空垫顶住的 Target 缓冲静音
+                            // （与 ReplaceLocal 同步开源窗口的欠载语义一致）
+                            let deadline = std::time::Instant::now() + wait;
+                            let mut generation_matched = false;
+                            loop {
+                                collect_stage_outcomes(
+                                    &stage_result_rx,
+                                    &producer_ring,
+                                    &mut staged,
+                                );
+                                if staged.as_ref().map(|c| c.generation)
+                                    == Some(expected_generation)
+                                {
+                                    generation_matched = true;
+                                    break;
+                                }
+                                let remaining = deadline
+                                    .saturating_duration_since(std::time::Instant::now());
+                                if remaining.is_zero() {
+                                    break;
+                                }
+                                producer_ring.wait_for(
+                                    |ring| {
+                                        ring.staged_ready.load(Ordering::Acquire)
+                                            || ring.command_pending.load(Ordering::Acquire)
+                                    },
+                                    remaining,
+                                );
+                            }
+                            let outcome: Result<(
+                                DirectPcmDecoder,
+                                DirectPcmFormat,
+                                f64,
+                                u64,
+                            )> = if generation_matched {
+                                let candidate =
+                                    staged.take().expect("generation 已匹配必有候选");
+                                let StagedPcmSource {
+                                    decoder: new_decoder,
+                                    first_frame,
+                                    format: new_format,
+                                    start_secs: cand_start,
+                                    stop_micros: cand_stop,
+                                    ..
+                                } = candidate;
+                                match install_prepared_first_frame(
+                                    &producer_ring,
+                                    first_frame,
+                                    new_format,
+                                    &new_decoder,
+                                ) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            target: "diretta_handoff",
+                                            phase = "pcm_handoff_staged_install",
+                                            source = %source,
+                                            sample_rate = %new_format.sample_rate,
+                                            channels = %new_format.channels,
+                                            "staged 预打开候选已装填（并行开源生效）"
+                                        );
+                                        Ok((new_decoder, new_format, cand_start, cand_stop))
+                                    }
+                                    Err(error) => {
+                                        producer_ring.failed.store(true, Ordering::Release);
+                                        Err(error)
+                                    }
+                                }
+                            } else {
+                                // 回退：候选缺失/过期/generation 不符，丢弃候选后
+                                // 走与 ReplaceLocal 完全相同的同步开源路径
+                                staged = None;
+                                replace_pcm_ring(
+                                    &source,
+                                    start_secs,
+                                    &producer_ring,
+                                    active_format,
+                                    &cancel,
+                                )
+                                .map(|(decoder, format)| (decoder, format, start_secs, stop_micros))
+                            };
+                            match outcome {
+                                Ok((new_decoder, new_format, eff_start, eff_stop)) => {
+                                    decoder = new_decoder;
+                                    active_format = new_format;
+                                    staged = None;
+                                    file_pos_secs = eff_start;
+                                    bound_stop_secs = if eff_stop > 0 {
+                                        Some(eff_stop as f64 / 1_000_000.0)
                                     } else {
                                         None
                                     };
@@ -3378,6 +3549,108 @@ impl DirectPcmSource {
             sample_rate = %format.sample_rate,
             channels = %format.channels,
             "DirectPcmSource::replace_drained_local received format"
+        );
+        Ok(format)
+    }
+
+    /// v12-A：手动 handoff 并行开源——先取消既有 staged 候选（含在途 prepare），
+    /// 再以专用 generation 命名空间投递后台预打开。返回 Some(generation) 供
+    /// replace_with_staged 做装填凭据校验；非本地路径（无法 open_local）返回 None。
+    /// fire-and-forget：不等待 prepare 完成（其结果由 ReplaceStaged 收取）；
+    /// spawn 失败无法在此感知，由 ReplaceStaged 超时回退兜底
+    pub fn arm_handoff_stage(
+        &self,
+        path: &Path,
+        start_secs: f64,
+        stop_secs: f64,
+        duration_secs: f64,
+    ) -> Option<u64> {
+        let path_str = path.to_str()?;
+        // 仅本地可 open_local 的路径（含 memfd /proc/self/fd/N）；远程 URL 不支持
+        if !path_str.starts_with('/') {
+            return None;
+        }
+        let duration_micros = (duration_secs * 1_000_000.0)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
+        let stop_micros = (stop_secs * 1_000_000.0)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
+        let generation = HANDOFF_STAGE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.control_tx
+            .send(DirectPcmCommand::CancelStaged)
+            .ok()?;
+        self.ring.signal_command();
+        let (response_tx, response_rx) = mpsc::sync_channel(0);
+        self.control_tx
+            .send(DirectPcmCommand::StageLocal {
+                path: path.to_owned(),
+                start_secs,
+                duration_micros,
+                stop_micros,
+                generation,
+                response: response_tx,
+            })
+            .ok()?;
+        self.ring.signal_command();
+        // 不 recv：StageLocal 的 response 在 prepare 完成时才回发，
+        // 丢弃接收端不影响 prepare 线程运行与结果投递
+        drop(response_rx);
+        debug!(
+            target: "diretta_handoff",
+            phase = "pcm_handoff_stage_armed",
+            path = %path_str,
+            generation = %generation,
+            start_secs = %start_secs,
+            "handoff 并行开源已武装（排空窗口内后台预打开）"
+        );
+        Some(generation)
+    }
+
+    /// v12-A：优先装填 arm 阶段预打开的 staged 候选完成换源；候选未就绪/
+    /// generation 不符时在 DIRECT_HANDOFF_STAGE_WAIT 内短等，仍无则由 producer
+    /// 回退同步开源。对外语义与 replace_drained_local 完全一致
+    pub fn replace_with_staged(
+        &mut self,
+        source: &str,
+        start_secs: f64,
+        stop_secs: f64,
+        cancel: HttpCancelHandle,
+        expected_generation: u64,
+    ) -> Result<DirectPcmFormat> {
+        debug!(
+            target: "diretta_handoff",
+            phase = "pcm_api_send",
+            source = %source,
+            expected_generation = %expected_generation,
+            "DirectPcmSource::replace_with_staged send command"
+        );
+        let (response_tx, response_rx) = mpsc::sync_channel(0);
+        let stop_micros = (stop_secs * 1_000_000.0)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
+        self.control_tx
+            .send(DirectPcmCommand::ReplaceStaged {
+                source: source.to_owned(),
+                start_secs,
+                stop_micros,
+                cancel,
+                expected_generation,
+                wait: crate::direct_runtime::DIRECT_HANDOFF_STAGE_WAIT,
+                response: response_tx,
+            })
+            .context("提交 Source Direct PCM staged handoff 失败")?;
+        self.ring.signal_command();
+        let format = response_rx
+            .recv()
+            .context("等待 Source Direct PCM staged handoff 结果失败")??;
+        self.format = format;
+        debug!(
+            target: "diretta_handoff",
+            phase = "pcm_api_recv",
+            sample_rate = %format.sample_rate,
+            channels = %format.channels,
+            "DirectPcmSource::replace_with_staged received format"
         );
         Ok(format)
     }

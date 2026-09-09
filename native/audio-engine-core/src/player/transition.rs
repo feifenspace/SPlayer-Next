@@ -19,6 +19,15 @@ use tracing::debug;
 
 use super::{InnerPlayer, PlayerEvent, PlayerState};
 
+/// v12-A: 手动 handoff 并行开源开关。默认启用；SPLAYER_DIRECT_PARALLEL_OPEN=
+/// 0/false/off 关闭（回退同步开源路径，行为等价改动前）
+fn direct_parallel_open_enabled() -> bool {
+    match std::env::var("SPLAYER_DIRECT_PARALLEL_OPEN") {
+        Ok(value) => !matches!(value.as_str(), "0" | "false" | "off" | "OFF"),
+        Err(_) => true,
+    }
+}
+
 /// 切换/seek 时要 join 的旧线程集合，全部挪到 spawn_blocking 工作线程 join，
 /// 主线程持锁阶段只 take handle，避免最坏 200ms+ 的卡顿
 pub struct OldThreads {
@@ -521,6 +530,52 @@ impl InnerPlayer {
         Some(playback.monitor())
     }
 
+    /// v12-A: 手动 handoff 并行开源武装——格式预检通过后、淡出排空前调用，
+    /// 用排空窗口并行完成候选源的后台预打开（消除原先串行在排空之后的
+    /// 开源耗时）。返回 generation 凭据供 commit_direct_handoff 走
+    /// ReplaceStaged 装填；None = 不适用（非本地路径/DSD/无连接，走同步开源）
+    #[cfg(any(feature = "diretta", test))]
+    pub fn arm_direct_handoff_stage(
+        &self,
+        source: &str,
+        open_path: Option<&str>,
+        duration_secs: f64,
+    ) -> Option<u64> {
+        let playback = self.direct_playback.as_ref()?;
+        // 打开参数解析与 DirectPlayback::handoff_drained_source 保持一致：
+        // cue/sacd 虚拟路径 → 物理路径 + 有界播放区间。同一换源的 arm 与
+        // commit 必须用完全相同的 open 参数，generation 凭据才有意义
+        let (path_str, cue_start, cue_dur, cue_stop) =
+            if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
+                let dur = if cue.duration > 0.0 {
+                    cue.duration
+                } else {
+                    duration_secs
+                };
+                (
+                    cue.physical_path,
+                    cue.start_time,
+                    dur,
+                    cue.start_time + dur,
+                )
+            } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
+                (
+                    source.to_owned(),
+                    0.0,
+                    if sacd.duration_secs > 0.0 {
+                        sacd.duration_secs
+                    } else {
+                        duration_secs
+                    },
+                    0.0,
+                )
+            } else {
+                (source.to_owned(), 0.0, duration_secs, 0.0)
+            };
+        let open_str = open_path.unwrap_or(&path_str);
+        playback.arm_handoff_stage(open_str, cue_start, cue_stop, cue_dur)
+    }
+
     /// Direct 载入编排（headless 与 NAPI 两侧调用方共用）：
     /// 淡出旧源 → 锁外排空 → 块边界原子换源。
     ///
@@ -565,6 +620,16 @@ impl InnerPlayer {
             "[Direct] handoff 格式预检不通过，回退全量重连"
         );
 
+        // 0) v12-A 并行开源：淡出排空窗口（~140ms+）内后台预打开候选源，
+        //    消除原先串行在排空之后的开源耗时。默认启用；
+        //    SPLAYER_DIRECT_PARALLEL_OPEN=0/false/off 关闭（回退同步开源）。
+        //    凭据为 None 时 commit 走原 ReplaceLocal 路径，行为等价改动前
+        let staged_generation = if direct_parallel_open_enabled() {
+            player.lock().arm_direct_handoff_stage(source, open_path, duration_secs)
+        } else {
+            None
+        };
+
         // 1) 源级淡出（暂停态为无害 no-op）；短锁取排空句柄
         let drain = {
             let mut player = player.lock();
@@ -590,7 +655,14 @@ impl InnerPlayer {
         }
         // 3) 块边界原子换源（格式不一致时 Err，旧连接保持静音原状）
         let mut player = player.lock();
-        player.commit_direct_handoff(token, source, open_path, duration_secs, auto_play)
+        player.commit_direct_handoff(
+            token,
+            source,
+            open_path,
+            duration_secs,
+            auto_play,
+            staged_generation,
+        )
     }
 
     /// 同格式 Direct handoff 提交：保留 Diretta 连接，生产者线程在块边界原子换源。
@@ -608,6 +680,7 @@ impl InnerPlayer {
         open_path: Option<&str>,
         duration: f64,
         auto_play: bool,
+        staged_generation: Option<u64>,
     ) -> Result<Option<DirectFormat>> {
         if token != self.load_token.load(Ordering::Acquire) {
             return Ok(None);
@@ -623,7 +696,13 @@ impl InnerPlayer {
             .pending_load_handle
             .clone()
             .ok_or_else(|| anyhow::anyhow!("[Direct] handoff 前缺少 load 取消句柄"))?;
-        let format = playback.handoff_drained_source(source, open_path, duration, cancel)?;
+        let format = playback.handoff_drained_source(
+            source,
+            open_path,
+            duration,
+            cancel,
+            staged_generation,
+        )?;
         // 手动 handoff 新源淡入：换源提交前已交付排空静音（设备端处于零电平），
         // 新源首采样非零时从静音一步阶跃到全幅会在 DAC 端产生咔哒声；10ms
         // raised-cosine 淡入消除该阶跃。PCM=begin_fade_in(0→1)；DSD=clear_drain
@@ -717,8 +796,11 @@ impl InnerPlayer {
             return Err(error);
         }
         // ② armed 旁路换源（SDK 此刻从旧环拉排空静音，块边界原子换新源）
+        // v12-A: 热重配路径不走 staged 并行开源——跨格式候选会被 stage 预检
+        // 拒绝，且 arm 的 CancelStaged 可能与 armed 旗标时序交叉，保守传 None
         playback.arm_cross_format_replace();
-        let format = playback.handoff_drained_source(source, open_path, duration, cancel)?;
+        let format =
+            playback.handoff_drained_source(source, open_path, duration, cancel, None)?;
         let DirectFormat::Pcm(pcm_format) = &format else {
             anyhow::bail!("[Direct] 热重配不支持 DSD 家族");
         };

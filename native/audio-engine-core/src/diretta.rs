@@ -107,17 +107,27 @@ pub fn selector_for(target_id: &str) -> String {
     format!("{DEVICE_PREFIX}{target_id}")
 }
 
-/// 排空目标时长（µs，Phase2）：Sink 实测延迟 / 自报缓冲取大者，+50% 余量，
-/// 下限保持旧常量 DIRECT_FADE_DRAIN_MIN_MICROS（不劣于改动前），上限 1s（防异常值）。
+/// 排空目标时长（µs，Phase2）：Sink 实测延迟 / 自报缓冲取大者，+25% 余量，
+/// 下限 DIRECT_FADE_DRAIN_FLOOR_MICROS（默认 120ms，v12-B 收紧；
+/// SPLAYER_DIRECT_DRAIN_FLOOR_MS 可覆盖），上限 1s（防异常值）。
 /// 两个读数均不可用（0）时返回 0 → ring 退回旧常量，等价改动前行为
 #[cfg(feature = "diretta")]
 pub fn compute_drain_target_micros(latency_us: u64, buffer_us: u64) -> u64 {
-    use crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_MICROS;
+    use crate::direct_runtime::DIRECT_FADE_DRAIN_FLOOR_MICROS;
     let base = latency_us.max(buffer_us);
     if base == 0 {
         return 0;
     }
-    (base + base / 2).clamp(DIRECT_FADE_DRAIN_MIN_MICROS, 1_000_000)
+    // v12-B：垫只需覆盖 Target 端缓冲深度（base=latency），1.25× 余量足够
+    // 吸收拉取抖动；下限从 200ms 收紧到 120ms（可经 SPLAYER_DIRECT_DRAIN_FLOOR_MS
+    // 覆盖，设 200 恢复旧行为），未注入/读数为 0 时调用方仍退回旧常量
+    let floor = std::env::var("SPLAYER_DIRECT_DRAIN_FLOOR_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|ms| ms.saturating_mul(1_000))
+        .filter(|micros| *micros > 0)
+        .unwrap_or(DIRECT_FADE_DRAIN_FLOOR_MICROS);
+    (base + base / 4).clamp(floor, 1_000_000)
 }
 
 #[cfg(feature = "diretta")]
@@ -407,6 +417,37 @@ mod imp {
         ) -> Result<DirectPcmFormat> {
             self.source
                 .replace_drained_local(source, start_secs, stop_secs, cancel)
+        }
+
+        /// v12-A：手动 handoff 并行开源武装——详见 DirectPcmSource::arm_handoff_stage
+        pub fn arm_handoff_stage(
+            &self,
+            path: &Path,
+            start_secs: f64,
+            stop_secs: f64,
+            duration_secs: f64,
+        ) -> Option<u64> {
+            self.source
+                .arm_handoff_stage(path, start_secs, stop_secs, duration_secs)
+        }
+
+        /// v12-A：装填 staged 预打开候选完成换源——详见
+        /// DirectPcmSource::replace_with_staged
+        pub fn replace_with_staged_source(
+            &mut self,
+            source: &str,
+            start_secs: f64,
+            stop_secs: f64,
+            cancel: crate::ffmpeg_audio::HttpCancelHandle,
+            expected_generation: u64,
+        ) -> Result<DirectPcmFormat> {
+            self.source.replace_with_staged(
+                source,
+                start_secs,
+                stop_secs,
+                cancel,
+                expected_generation,
+            )
         }
 
         /// v11-3: 武装下一次换源的跨格式旁路（消费一次自动复位），

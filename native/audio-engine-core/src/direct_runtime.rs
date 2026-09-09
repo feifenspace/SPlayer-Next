@@ -36,6 +36,17 @@ pub const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
 /// 达到该时长即视为设备端缓冲已置换完成，块数谓词保留为兜底
 pub const DIRECT_FADE_DRAIN_MIN_MICROS: u64 = 200_000;
 
+/// v12-B 动态排空目标的时长下限（微秒）：Sink 实测 latency ~110ms 时
+/// 200ms 旧下限会把垫顶到 200ms（base×1.5=165ms 被下限覆盖），徒增可闻静音。
+/// 垫只需 ≥ Target 缓冲深度（latency）即可置换旧音频，故下限收紧到 120ms；
+/// SPLAYER_DIRECT_DRAIN_FLOOR_MS 可覆盖（设 200 恢复旧行为）
+pub const DIRECT_FADE_DRAIN_FLOOR_MICROS: u64 = 120_000;
+
+/// v12-A 手动 handoff 并行开源：arm 后 ReplaceStaged 等待 stage 预打开
+/// 就绪的上限。stage 与淡出排空并行（正常在排空完成前就绪）；超时/失败/
+/// generation 不符则回退 ReplaceLocal 同步开源（行为与改动前一致，无回归）
+pub const DIRECT_HANDOFF_STAGE_WAIT: Duration = Duration::from_millis(800);
+
 /// Direct 排空的事件等待上限（超时兜底，正常远快于此值）。
 /// ring 未注入动态排空目标时使用；已注入时调用方按 drain_target + EXTRA 计算
 pub const DIRECT_FADE_DRAIN_TIMEOUT: Duration = Duration::from_millis(600);
@@ -437,6 +448,59 @@ impl DirectTransport {
             _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
+
+    /// v12-A: 手动 handoff 并行开源武装（排空窗口内后台预打开候选源）。
+    /// 仅 PCM 传输支持；DSD/Fake 返回 None（走原同步开源路径）
+    #[cfg(any(feature = "diretta", test))]
+    fn arm_handoff_stage(
+        &self,
+        path: &Path,
+        start_secs: f64,
+        stop_secs: f64,
+        duration_secs: f64,
+    ) -> Option<u64> {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => {
+                value.arm_handoff_stage(path, start_secs, stop_secs, duration_secs)
+            }
+            #[cfg(feature = "diretta")]
+            Self::Dsd(_) => None,
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => None,
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// v12-A: 装填 staged 预打开候选完成换源（generation 凭据校验，
+    /// 未就绪由 producer 短等后回退同步开源）。仅 PCM 传输支持
+    #[cfg(any(feature = "diretta", test))]
+    fn replace_with_staged_source(
+        &mut self,
+        open_str: &str,
+        start_secs: f64,
+        stop_secs: f64,
+        cancel: crate::ffmpeg_audio::HttpCancelHandle,
+        expected_generation: u64,
+    ) -> Result<DirectPcmFormat> {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.replace_with_staged_source(
+                open_str,
+                start_secs,
+                stop_secs,
+                cancel,
+                expected_generation,
+            ),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(_) => bail!("[Direct] DSD 传输不支持 staged handoff"),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => bail!("[Direct] Fake 传输不支持 staged handoff"),
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -691,7 +755,9 @@ impl DirectPlayback {
     /// 缓存），与逻辑 `source` 分离：cue/sacd 解析与 DSD 家族嗅探仍基于 source
     /// （物化路径无原始扩展名；HTTP DSD 源物化后仍是原始 DSF/DFF，家族判定
     /// 按 URL 才正确），连接与 current_source 记录的也是 source；
-    /// `None` = 直接按 source 打开（本地源原行为）
+    /// `None` = 直接按 source 打开（本地源原行为）。
+    /// v12-A: `staged_generation` 为并行开源的装填凭据（arm_handoff_stage 返回值）；
+    /// None 走原同步开源路径
     #[cfg(feature = "diretta")]
     pub fn handoff_drained_source(
         &mut self,
@@ -699,6 +765,7 @@ impl DirectPlayback {
         open_path: Option<&str>,
         duration: f64,
         cancel: crate::ffmpeg_audio::HttpCancelHandle,
+        staged_generation: Option<u64>,
     ) -> Result<DirectFormat> {
         let (path_str, cue_start, cue_dur, cue_stop) =
             if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
@@ -746,9 +813,21 @@ impl DirectPlayback {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
                 value.set_duration(cue_dur);
-                let format =
-                    value.replace_drained_local_source(open_str, cue_start, cue_stop, cancel)?;
-                DirectFormat::Pcm(format)
+                // v12-A：有 staged 凭据则优先装填预打开候选（并行开源），
+                // producer 侧短等后回退同步开源，语义与同步路径一致
+                let pcm_format = match staged_generation {
+                    Some(expected_generation) => value.replace_with_staged_source(
+                        open_str,
+                        cue_start,
+                        cue_stop,
+                        cancel,
+                        expected_generation,
+                    )?,
+                    None => {
+                        value.replace_drained_local_source(open_str, cue_start, cue_stop, cancel)?
+                    }
+                };
+                DirectFormat::Pcm(pcm_format)
             }
             DirectTransport::Dsd(value) => {
                 if !is_dsd {
@@ -870,6 +949,21 @@ impl DirectPlayback {
         self.transport.hot_reconfigure(format)
     }
 
+    /// v12-A: 手动 handoff 并行开源武装——排空窗口内后台预打开候选源，
+    /// 返回 generation 凭据供 handoff_drained_source 走 ReplaceStaged 装填。
+    /// 仅 PCM 传输支持（DSD/Fake 返回 None）
+    #[cfg(any(feature = "diretta", test))]
+    pub fn arm_handoff_stage(
+        &self,
+        open_path: &str,
+        start_secs: f64,
+        stop_secs: f64,
+        duration_secs: f64,
+    ) -> Option<u64> {
+        self.transport
+            .arm_handoff_stage(Path::new(open_path), start_secs, stop_secs, duration_secs)
+    }
+
     /// open 后启动验证：等待首块被设备真正消费。
     /// 首块消费前失败/提前结束/被新 load 取代即报错；超时返回 Ok(false)，
     /// 由调用方决定回退方式。事件驱动等待，单次 100ms 上限保证 load 取消的响应性
@@ -947,8 +1041,9 @@ impl DirectPlayback {
         open_path: Option<&str>,
         duration: f64,
         cancel: crate::ffmpeg_audio::HttpCancelHandle,
+        staged_generation: Option<u64>,
     ) -> Result<DirectFormat> {
-        let _ = (open_path, cancel);
+        let _ = (open_path, cancel, staged_generation);
         self.duration = duration;
         self.start_offset = crate::cue::parse_cue_virtual_path(source)
             .map(|cue| cue.start_time)
