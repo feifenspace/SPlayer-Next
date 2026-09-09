@@ -2,7 +2,7 @@
 import { useStatusStore } from "@/stores/status";
 import { useSettingsStore } from "@/stores/settings";
 import { refreshDevices, switchDevice } from "@/core/player";
-import { playerClient } from "@/services/client";
+import { playerClient, isElectron } from "@/services/client";
 import type { DirettaTarget } from "@/services/client/types";
 import IconRefresh from "~icons/lucide/rotate-cw";
 
@@ -12,7 +12,9 @@ const { t } = useI18n();
 const status = useStatusStore();
 const settings = useSettingsStore();
 
-// 系统默认
+// 系统默认：仅桌面端暴露——headless 输出路径只有 ALSA MMAP 与 Diretta，
+// "系统默认"会落回 cpal/ALSA dmix 混音路径（非位纯真），不应可选
+const isDesktop = isElectron();
 const SYSTEM_DEFAULT = "system-default";
 
 const current = computed(() => settings.player.outputDevice ?? SYSTEM_DEFAULT);
@@ -40,14 +42,16 @@ const options = computed(() => {
     : t("settings.outputDevice.default");
 
   const opts = [
-    { value: SYSTEM_DEFAULT, label: defaultLabel },
+    ...(isDesktop
+      ? [{ value: SYSTEM_DEFAULT, label: defaultLabel }]
+      : []),
     ...status.outputDevices.map((device) => ({ value: device.id, label: device.name })),
   ];
 
   // 加入扫描到的 Diretta 网络 DAC 设备
   if (direttaTargets.value.length > 0) {
     for (const target of direttaTargets.value) {
-      const displayName = target.target_name || target.output_name || target.model_name || (target as any).name || "Target";
+      const displayName = target.output_name || target.model_name || (target as any).name || target.target_name || "Target";
       const targetVal = typeof (target as any).id === "string" && (target as any).id.startsWith("diretta:")
         ? (target as any).id
         : `diretta:${target.full_addr || target.ipv6_addr || (target as any).id}`;

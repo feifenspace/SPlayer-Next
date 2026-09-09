@@ -163,6 +163,19 @@ export const cancelStagedDirectNext = (): void => {
   void window.api.player.cancelDirectNext().catch(() => {});
 };
 
+/** 最近一次手动切歌（loadTrack）时刻：边界事件竞态防护用 */
+let lastManualDirectLoadAt = 0;
+
+/**
+ * 手动切歌时标记（loadTrack 调用）。手动切歌已 cancelStagedDirectNext 清空
+ * 引擎 staged 槽，其后极短时间内到达的 directTrackBoundary 事件只可能是
+ * 取消前武装的旧候选的迟到边界——若照常按 playIndex+1 推进队列，会与手动
+ * 切歌叠加成双跳（曲 1 直接跳曲 3）
+ */
+export const markManualDirectLoad = (): void => {
+  lastManualDirectLoadAt = Date.now();
+};
+
 /** 当前是否已有已 stage 的下一曲（用于抑制引擎边界前的前端切曲逻辑） */
 export const hasStagedDirectNext = (): boolean => stagedTrackId !== "";
 
@@ -179,6 +192,21 @@ export const advanceGaplessBoundary = async (
   const status = useStatusStore();
   const settings = useSettingsStore();
   const media = useMediaStore();
+
+  // 手动切歌竞态防护：loadTrack 已 cancelStagedDirectNext（引擎 staged 槽清空），
+  // 3s 窗口内到达的边界事件只可能来自被取消的旧候选（新源至少要播到曲末才会
+  // 产生真实边界）。此时不推进队列（避免与手动切歌叠加双跳），仅向引擎提交
+  // 簿记保持状态一致；trackId 可用时以服务端权威曲目为准做二次校验
+  const staleByManualLoad =
+    Date.now() - lastManualDirectLoadAt < 3000 ||
+    (trackId != null && trackId === media.track?.id);
+  if (staleByManualLoad) {
+    console.warn("[gapless] 忽略手动切歌窗口内的迟到边界事件", trackId ?? "(no trackId)");
+    await window.api.player
+      .commitDirectBoundary(media.track?.path ?? media.track?.id ?? "", durationMs / 1000)
+      .catch(() => {});
+    return true;
+  }
 
   const candidate = getNextTrackCandidate({
     playIndex: status.playIndex,

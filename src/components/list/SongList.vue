@@ -198,6 +198,21 @@ const playingIndex = computed(() => {
   return sortedItems.value.findIndex((track) => track.id === playingId.value);
 });
 
+/** 双击竞态去重：单击即播 + dblclick 会让同一次双击触发 2-3 次 playFrom
+ * （click、click、dblclick），同曲重复 load 浪费且可能打断刚建立的会话。
+ * 同一曲目 450ms 窗口内的重复 playFrom 视为同一次操作，只执行首次 */
+let lastRowPlayKey: string | number | null = null;
+let lastRowPlayAt = 0;
+const playFromRow = (index: number): void => {
+  const item = sortedItems.value[index];
+  const key = item?.id ?? item?.path ?? index;
+  const now = Date.now();
+  if (key === lastRowPlayKey && now - lastRowPlayAt < 450) return;
+  lastRowPlayKey = key;
+  lastRowPlayAt = now;
+  void player.playFrom(sortedItems.value, index, props.playbackContext);
+};
+
 /** 虚拟列表引用 */
 const virtualListRef = shallowRef<SVirtualListExposed | null>(null);
 
@@ -510,11 +525,9 @@ defineExpose({
                     ? 'bg-primary/16 border-primary/40'
                     : 'bg-surface-panel border-primary/12 hover:border-primary/30 hover:bg-on-surface/8 active:bg-on-surface/12'
               "
-              @click="batch.active.value ? batch.toggle(item.id) : player.playFrom(sortedItems, index, props.playbackContext)"
+              @click="batch.active.value ? batch.toggle(item.id) : playFromRow(index)"
               @dblclick="
-                batch.active.value
-                  ? undefined
-                  : player.playFrom(sortedItems, index, props.playbackContext)
+                batch.active.value ? undefined : playFromRow(index)
               "
               @contextmenu="contextTrack = item"
             >

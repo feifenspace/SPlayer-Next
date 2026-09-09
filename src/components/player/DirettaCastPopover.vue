@@ -2,7 +2,7 @@
 import { useStatusStore } from "@/stores/status";
 import { useSettingsStore } from "@/stores/settings";
 import { refreshDevices, switchDevice } from "@/core/player";
-import { playerClient } from "@/services/client";
+import { playerClient, isElectron } from "@/services/client";
 import type { DirettaTarget, DirettaTargetCapabilities } from "@/services/client/types";
 import IconCast from "~icons/lucide/cast";
 import IconCheck from "~icons/lucide/check";
@@ -23,6 +23,9 @@ const status = useStatusStore();
 const settings = useSettingsStore();
 
 const SYSTEM_DEFAULT = "system-default";
+// 系统默认：仅桌面端暴露——headless 输出路径只有 ALSA MMAP 与 Diretta，
+// "系统默认"会落回 cpal/ALSA dmix 混音路径（非位纯真），不应可选
+const isDesktop = isElectron();
 const currentDevice = computed(() => settings.player.outputDevice ?? SYSTEM_DEFAULT);
 const isDirettaActive = computed(() =>
   Boolean(settings.player.outputDevice?.startsWith("diretta:") || settings.player.outputDevice?.startsWith("diretta@")),
@@ -164,8 +167,9 @@ onMounted(() => {
             本地输出
           </div>
           <div class="mt-1 space-y-1">
-            <!-- 系统默认 -->
+            <!-- 系统默认（仅桌面端暴露） -->
             <div
+              v-if="isDesktop"
               class="flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer transition-colors"
               :class="[
                 currentDevice === SYSTEM_DEFAULT
@@ -183,25 +187,27 @@ onMounted(() => {
               <IconCheck v-if="currentDevice === SYSTEM_DEFAULT" class="text-sm shrink-0" />
             </div>
 
-            <!-- 本地硬件声卡 -->
+            <!-- 本地硬件声卡（key/选中判断/切换一律用稳定 id，name 仅展示；
+                 此前用 dev.name：同名设备重复 key 扰乱渲染，且把显示名当
+                 id 传给 /diretta/select 会被误判成 Diretta 目标） -->
             <div
               v-for="dev in status.outputDevices"
-              :key="dev.name"
+              :key="dev.id"
               class="flex items-center justify-between px-2.5 py-2 rounded-lg cursor-pointer transition-colors"
               :class="[
-                currentDevice === dev.name
+                currentDevice === dev.id
                   ? 'bg-primary/12 text-primary font-medium'
                   : cover
                     ? 'hover:bg-white/8 text-cover/80'
                     : 'hover:bg-on-surface/6 text-on-surface',
               ]"
-              @click="handleSelect(dev.name)"
+              @click="handleSelect(dev.id)"
             >
               <div class="flex items-center gap-2 truncate">
                 <IconLaptop class="text-sm shrink-0" />
                 <span class="truncate">{{ dev.name }}</span>
               </div>
-              <IconCheck v-if="currentDevice === dev.name" class="text-sm shrink-0" />
+              <IconCheck v-if="currentDevice === dev.id" class="text-sm shrink-0" />
             </div>
           </div>
         </div>
@@ -236,10 +242,10 @@ onMounted(() => {
                 <span class="size-2 rounded-full bg-emerald-500 shrink-0" />
                 <div class="flex flex-col truncate">
                   <span class="truncate text-xs">
-                    {{ target.target_name || target.output_name || target.model_name || (target as any).name || "Diretta Target" }}
+                    {{ target.output_name || (target as any).name || target.model_name || target.target_name || "Diretta Target" }}
                   </span>
                   <span class="text-[10px] opacity-60 font-mono truncate">
-                    {{ target.ipv6_addr || target.full_addr || getTargetAddr(target) }}
+                    {{ [target.target_name, target.ipv6_addr || target.full_addr || getTargetAddr(target)].filter(Boolean).join(" · ") }}
                   </span>
                 </div>
               </div>
@@ -295,12 +301,12 @@ onMounted(() => {
     <div v-else-if="currentCaps" class="space-y-3 text-xs">
       <div class="p-3 rounded-lg bg-primary/8 border border-primary/15 space-y-1">
         <div class="font-medium text-sm text-primary">
-          {{ currentCaps.target_name || currentCaps.output_name || "Diretta Target" }}
+          {{ currentCaps.output_name || currentCaps.target_name || "Diretta Target" }}
           <span
             v-if="currentCaps.output_name && currentCaps.target_name"
             class="text-[10px] opacity-60 font-normal"
           >
-            ({{ currentCaps.output_name }})
+            ({{ currentCaps.target_name }})
           </span>
         </div>
         <div class="text-[11px] opacity-75 font-mono truncate">

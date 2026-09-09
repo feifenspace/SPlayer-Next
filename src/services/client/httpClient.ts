@@ -981,7 +981,33 @@ export class HttpPlayerClient implements IPlayerClient {
   }
 
   async getOutputDevices(): Promise<IpcResponse<AudioDevice[]>> {
-    return { success: true, data: [] };
+    // headless：本地声卡（cpal alsa:* / ALSA MMAP alsammap:*）与 Diretta 目标
+    // 同走 /player/devices + /diretta/select，此前空实现导致设备面板缺失
+    // 本地声卡条目（设置 DeviceSelector 与投屏面板共用本列表）
+    try {
+      const res = await this.request<{
+        devices: Array<{ id: string; name: string; is_default: boolean; mmap: boolean }>;
+      }>("/api/v1/player/devices");
+      if (res.success && res.data?.devices) {
+        // 只暴露每张物理声卡的 ALSA MMAP 直出条目（每卡一条，位纯真）：
+        // /player/devices 还返回 20+ 个 ALSA 插件层设备（front/surround*/
+        // iec958/plughw/dmix…同一张卡），全部展示会淹没设备面板；
+        // mmap 打开失败时服务端会自动降级 cpal（sibling plughw），无需并列暴露
+        const seen = new Set<string>();
+        const devices = res.data.devices
+          .filter((d) => d.id.startsWith("alsammap:") && !seen.has(d.id) && seen.add(d.id))
+          .map((d) => ({
+            id: d.id,
+            name: d.name,
+            isDefault: Boolean(d.is_default),
+          }));
+        return { success: true, data: devices };
+      }
+      return { success: true, data: [] };
+    } catch (error) {
+      console.error("Failed to list output devices:", error);
+      return { success: true, data: [] };
+    }
   }
 
   async getDefaultDeviceName(): Promise<IpcResponse<string | null>> {
