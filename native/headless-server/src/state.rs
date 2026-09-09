@@ -140,25 +140,27 @@ impl QueueSnapshot {
 
     pub fn new(items: Vec<QueueItem>, index: usize, repeat: QueueRepeat, shuffle: bool) -> Self {
         let n = items.len();
+        let start = if n == 0 { 0 } else { index.min(n - 1) };
         let mut order: Vec<usize> = (0..n).collect();
         if shuffle && n > 1 {
-            // 确定性洗牌：注册时固定顺序，服务端自治推进时顺序自洽即可
-            let mut seed = n as u64 ^ 0x9E37_79B9_7F4A_7C15;
-            for i in (1..n).rev() {
+            // 确定性洗牌：当前播放条目固定在播放顺序首位（repeat=off 时其余
+            // 曲目全部可播到，不会因当前曲落在排列中段而被截断跳过），
+            // 其余条目 LCG 确定性洗牌接在其后——服务端自治推进时顺序自洽
+            order.remove(start);
+            let mut seed = n as u64 ^ 0x9E37_79B9_7F4A_7C15 ^ ((start as u64) << 32);
+            for i in (1..order.len()).rev() {
                 seed = seed
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407);
                 let j = (seed >> 33) as usize % (i + 1);
                 order.swap(i, j);
             }
+            order.insert(0, start);
         }
         let pos = if n == 0 {
             0
         } else {
-            order
-                .iter()
-                .position(|&v| v == index.min(n - 1))
-                .unwrap_or(0)
+            order.iter().position(|&v| v == start).unwrap_or(0)
         };
         Self {
             items,
@@ -246,8 +248,10 @@ impl AppState {
         let db_conn = crate::db::init_db(&db_path)?;
 
         // 输出设备恢复：显式配置的 diretta_target 优先（运营者写死，不被浏览器
-        // 上次的选择覆盖）；否则用服务端记忆的上次选择（headless 自恢复，
-        // 不依赖浏览器在场）
+        // 上次的选择覆盖）；headless 输出路径只有 ALSA MMAP 与 Diretta——
+        // 记忆的 Diretta 目标直接恢复；本地设备（alsammap）与空选择均不自动
+        // 连接，转为后台扫描局域网 Diretta 自动补位（运行时选择，不覆盖 db
+        // 中的用户显式选择）
         let saved_output_device = if config.diretta_target.is_none() {
             crate::db::get_server_state(&db_conn, OUTPUT_DEVICE_STATE_KEY)
                 .ok()
@@ -262,15 +266,46 @@ impl AppState {
         if let Some(cover_str) = cover_dir.to_str() {
             inner_player.set_cover_cache_dir(cover_str.to_string());
         }
+        let mut auto_scan_diretta = false;
         if let Some(ref target) = config.diretta_target {
             let diretta_dev = format!("diretta:{}", target);
             inner_player.set_output_device(Some(diretta_dev));
-        } else if let Some(saved) = saved_output_device {
-            let dev = if saved.is_empty() { None } else { Some(saved) };
-            info!(device = ?dev, "恢复上次输出设备");
-            inner_player.set_output_device(dev);
+        } else {
+            let saved = saved_output_device.filter(|s| !s.is_empty());
+            match saved.as_deref() {
+                Some(dev) if dev.starts_with("diretta:") || dev.starts_with("diretta@") => {
+                    info!(device = %dev, "恢复上次输出设备（Diretta）");
+                    inner_player.set_output_device(Some(dev.to_owned()));
+                }
+                other => {
+                    info!(device = ?other, "非 Diretta 记忆，不自动连接本地设备，转入局域网 Diretta 自动发现");
+                    auto_scan_diretta = true;
+                }
+            }
         }
         let player = Arc::new(Mutex::new(inner_player));
+
+        // 后台自动发现：未记忆 Diretta 目标时扫描局域网，首个在线目标设为
+        // 运行时输出（不写 db——db 保留用户显式选择，下次启动仍按本规则判定）。
+        // 扫描阻塞（DKS 发现重试），不能卡 AppState::new 主链路
+        if auto_scan_diretta {
+            let player_for_auto_scan = Arc::clone(&player);
+            let _ = std::thread::Builder::new()
+                .name("diretta-autoselect".into())
+                .spawn(move || {
+                    let targets = audio_engine_core::diretta::scan_devices().unwrap_or_default();
+                    if let Some(first) = targets.first() {
+                        info!(
+                            device = %first.id,
+                            name = %first.output_name,
+                            "局域网 Diretta 自动发现，设为默认输出"
+                        );
+                        player_for_auto_scan.lock().set_output_device(Some(first.id.clone()));
+                    } else {
+                        info!("局域网未发现 Diretta 目标，保持未选择输出（等待手动选择）");
+                    }
+                });
+        }
 
         let (ws_tx, _rx) = broadcast::channel(128);
         let (scan_tx, _rx_scan) = broadcast::channel(128);

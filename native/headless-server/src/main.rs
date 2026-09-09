@@ -126,7 +126,12 @@ async fn main() -> Result<()> {
         .with_env_filter(
             std::env::var("RUST_LOG")
                 .as_deref()
-                .unwrap_or("headless_server=info,audio_engine_core=info,axum=warn"),
+                // 自定义 target（diretta_handoff/diretta_dsd）不匹配按模块路径
+                // 的指令，会被 EnvFilter 静默丢弃——排查 handoff/DSD 问题时
+                // 无需再手动 RUST_LOG 重启，默认即可见
+                .unwrap_or(
+                    "headless_server=info,audio_engine_core=info,diretta_handoff=debug,diretta_dsd=info,axum=warn",
+                ),
         )
         .init();
 

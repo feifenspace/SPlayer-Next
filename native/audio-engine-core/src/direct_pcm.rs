@@ -40,7 +40,8 @@ pub struct DirectPcmFormat {
 
 enum DirectPcmRepackBuffer {
     None,
-    Signed16(Box<[i16]>),
+    // v11-1: 线格式统一 32-bit 容器后，所有 repack 目标都是 i32
+    //（S16 源左移 16 位升位），i16 缓冲退役
     Signed32(Box<[i32]>),
 }
 
@@ -50,6 +51,9 @@ pub struct DirectPcmFrame {
     payload_len: usize,
     sample_offset: usize,
     repack: DirectPcmRepackBuffer,
+    /// v11-1: 多声道 S16 源 downmix 复用暂存（i16 → i32 升位中转），
+    /// 避免每帧重新分配；downmix 结果整体左移 16 位写入 repack 缓冲
+    downmix_scratch: Vec<i16>,
 }
 
 impl DirectPcmFrame {
@@ -62,6 +66,7 @@ impl DirectPcmFrame {
             payload_len: 0,
             sample_offset: 0,
             repack: DirectPcmRepackBuffer::None,
+            downmix_scratch: Vec::new(),
         })
     }
 
@@ -89,7 +94,6 @@ impl DirectPcmFrame {
                 Ok(unsafe { ptr.add(offset) }.cast_const())
             }
             DirectPcmMemoryPath::BitPerfectRepack => match &self.repack {
-                DirectPcmRepackBuffer::Signed16(buffer) => Ok(buffer.as_ptr().cast()),
                 DirectPcmRepackBuffer::Signed32(buffer) => Ok(buffer.as_ptr().cast()),
                 DirectPcmRepackBuffer::None => bail!("Source Direct planar PCM 缺少 repack buffer"),
             },
@@ -101,33 +105,24 @@ impl DirectPcmFrame {
         Ok(unsafe { slice::from_raw_parts(ptr, self.payload_len) })
     }
 
+    /// v11-1: repack 目标统一 i32（32-bit 容器）。源位深变化（16↔24↔32）
+    /// 不再造成缓冲类型冲突——这是同 transport 位深免重连切换的前提。
+    /// 保留 sample_format 参数仅为调用点兼容，转换分派以 frame 实际格式为准
     fn preallocate_repack(
         &mut self,
-        sample_format: DirectPcmSampleFormat,
+        _sample_format: DirectPcmSampleFormat,
         samples: usize,
     ) -> Result<()> {
         if samples == 0 {
             return Ok(());
         }
-        let needs_replacement = match (&self.repack, sample_format) {
-            (DirectPcmRepackBuffer::None, _) => true,
-            (DirectPcmRepackBuffer::Signed16(buffer), DirectPcmSampleFormat::Signed16) => {
-                buffer.len() < samples
-            }
-            (DirectPcmRepackBuffer::Signed32(buffer), DirectPcmSampleFormat::Signed32) => {
-                buffer.len() < samples
-            }
-            _ => bail!("Source Direct planar PCM sample format 在播放中发生变化"),
+        let needs_replacement = match &self.repack {
+            DirectPcmRepackBuffer::None => true,
+            DirectPcmRepackBuffer::Signed32(buffer) => buffer.len() < samples,
         };
         if needs_replacement {
-            self.repack = match sample_format {
-                DirectPcmSampleFormat::Signed16 => {
-                    DirectPcmRepackBuffer::Signed16(vec![0_i16; samples].into_boxed_slice())
-                }
-                DirectPcmSampleFormat::Signed32 => {
-                    DirectPcmRepackBuffer::Signed32(vec![0_i32; samples].into_boxed_slice())
-                }
-            };
+            self.repack =
+                DirectPcmRepackBuffer::Signed32(vec![0_i32; samples].into_boxed_slice());
         }
         Ok(())
     }
@@ -191,35 +186,80 @@ impl DirectPcmFrame {
                         bail!("Source Direct packed repack buffer 类型不匹配");
                     }
                 },
-                sys::AVSampleFormat_AV_SAMPLE_FMT_S16P => unsafe {
-                    if let DirectPcmRepackBuffer::Signed16(output) = &mut self.repack {
+                sys::AVSampleFormat_AV_SAMPLE_FMT_S16P => {
+                    // v11-1: S16 源 downmix 到 i16 暂存后整体左移 16 位升位为 i32，
+                    // downmix 数值域与原 i16 路径一致（clamp ±32768），升位不丢精度
+                    ensure!(
+                        !frame.extended_data.is_null(),
+                        "Source Direct planar PCM 缺少 extended_data"
+                    );
+                    {
+                        let scratch = &mut self.downmix_scratch;
+                        if scratch.len() < total_output_samples {
+                            scratch.resize(total_output_samples, 0);
+                        }
+                        unsafe {
+                            downmix_planar_i16(
+                                frame.extended_data,
+                                source_channels,
+                                start_sample,
+                                samples,
+                                scratch,
+                            )?;
+                        }
+                    }
+                    if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
                         ensure!(
-                            !frame.extended_data.is_null(),
-                            "Source Direct planar PCM 缺少 extended_data"
+                            output.len() >= total_output_samples,
+                            "Source Direct planar repack buffer 太小"
                         );
-                        downmix_planar_i16(
-                            frame.extended_data,
-                            source_channels,
-                            start_sample,
-                            samples,
-                            output,
-                        )?;
+                        for (dst, src) in output[..total_output_samples]
+                            .iter_mut()
+                            .zip(self.downmix_scratch[..total_output_samples].iter())
+                        {
+                            *dst = i32::from(*src) << 16;
+                        }
                     } else {
                         bail!("Source Direct planar repack buffer 类型不匹配");
                     }
-                },
-                sys::AVSampleFormat_AV_SAMPLE_FMT_S16 => unsafe {
-                    if let DirectPcmRepackBuffer::Signed16(output) = &mut self.repack {
-                        let ptr = frame.data[0].cast::<i16>();
+                }
+                sys::AVSampleFormat_AV_SAMPLE_FMT_S16 => {
+                    // v11-1: packed 多声道 S16 同样经 i16 暂存升位
+                    {
+                        let scratch = &mut self.downmix_scratch;
+                        if scratch.len() < total_output_samples {
+                            scratch.resize(total_output_samples, 0);
+                        }
+                        unsafe {
+                            let ptr = frame.data[0].cast::<i16>();
+                            ensure!(
+                                !ptr.is_null(),
+                                "Source Direct packed 16-bit PCM 缺少 data[0]"
+                            );
+                            downmix_packed_i16(
+                                ptr,
+                                source_channels,
+                                start_sample,
+                                samples,
+                                scratch,
+                            )?;
+                        }
+                    }
+                    if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
                         ensure!(
-                            !ptr.is_null(),
-                            "Source Direct packed 16-bit PCM 缺少 data[0]"
+                            output.len() >= total_output_samples,
+                            "Source Direct planar repack buffer 太小"
                         );
-                        downmix_packed_i16(ptr, source_channels, start_sample, samples, output)?;
+                        for (dst, src) in output[..total_output_samples]
+                            .iter_mut()
+                            .zip(self.downmix_scratch[..total_output_samples].iter())
+                        {
+                            *dst = i32::from(*src) << 16;
+                        }
                     } else {
                         bail!("Source Direct packed repack buffer 类型不匹配");
                     }
-                },
+                }
                 sys::AVSampleFormat_AV_SAMPLE_FMT_S32P => unsafe {
                     if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
                         ensure!(
@@ -290,17 +330,42 @@ impl DirectPcmFrame {
                     bail!("Source Direct packed repack buffer 类型不匹配");
                 }
             },
-            _ => match (&mut self.repack, sample_format) {
-                (DirectPcmRepackBuffer::Signed16(output), DirectPcmSampleFormat::Signed16) => unsafe {
-                    interleave_planar::<i16>(
+            // v11-1: repack 目标统一 i32——S16P 源交错时逐样本左移 16 位升位；
+            // packed S16（单声道/立体声，原 ZeroCopy 直通，因容器归一化改走
+            // repack）同样升位；S32P 保持原样交错
+            sys::AVSampleFormat_AV_SAMPLE_FMT_S16P => unsafe {
+                if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
+                    interleave_planar_i16_to_i32(
                         frame.extended_data,
                         source_channels,
                         start_sample,
                         samples,
                         output,
                     )?;
-                },
-                (DirectPcmRepackBuffer::Signed32(output), DirectPcmSampleFormat::Signed32) => unsafe {
+                } else {
+                    bail!("Source Direct planar repack buffer 类型不匹配");
+                }
+            },
+            sys::AVSampleFormat_AV_SAMPLE_FMT_S16 => unsafe {
+                if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
+                    let ptr = frame.data[0].cast::<i16>();
+                    ensure!(
+                        !ptr.is_null(),
+                        "Source Direct packed 16-bit PCM 缺少 data[0]"
+                    );
+                    repack_packed_i16_to_i32(
+                        ptr,
+                        source_channels,
+                        start_sample,
+                        samples,
+                        output,
+                    )?;
+                } else {
+                    bail!("Source Direct packed repack buffer 类型不匹配");
+                }
+            },
+            sys::AVSampleFormat_AV_SAMPLE_FMT_S32P => unsafe {
+                if let DirectPcmRepackBuffer::Signed32(output) = &mut self.repack {
                     interleave_planar::<i32>(
                         frame.extended_data,
                         source_channels,
@@ -308,9 +373,11 @@ impl DirectPcmFrame {
                         samples,
                         output,
                     )?;
-                },
-                _ => bail!("Source Direct planar repack buffer 类型不匹配"),
+                } else {
+                    bail!("Source Direct planar repack buffer 类型不匹配");
+                }
             },
+            other => bail!("Source Direct 不支持的单声道/立体声 FFmpeg 格式: {other}"),
         }
         Ok(())
     }
@@ -373,10 +440,14 @@ impl DirectPcmFrame {
             memory_path = DirectPcmMemoryPath::BitPerfectRepack;
         }
 
-        let storage_bits = match sample_format {
-            DirectPcmSampleFormat::Signed16 => 16,
-            DirectPcmSampleFormat::Signed32 => 32,
-        };
+        // v11-1: 线格式统一 32-bit 容器 —— S16 源强制走 BitPerfectRepack 左移
+        // 16 位升位到 i32，16/24/32-bit 全部以 S32LE 上 wire；同采样率/声道下
+        // 位深切换（storage_bits 恒为 32）不再触发全量重连。valid_bits 保留源
+        // 真实位深，供 fade 有效位对齐与 32-bit 槽低有效位语义使用
+        if matches!(sample_format, DirectPcmSampleFormat::Signed16) {
+            memory_path = DirectPcmMemoryPath::BitPerfectRepack;
+        }
+        let storage_bits: u8 = 32;
         let valid_bits = if valid_bits_hint > 0 && valid_bits_hint <= storage_bits {
             valid_bits_hint
         } else {
@@ -408,8 +479,17 @@ impl DirectPcmFrame {
                         frame.linesize[0] >= 0,
                         "Source Direct planar PCM linesize 无效"
                     );
+                    // v11-1: 校验用源位深字节宽——S16 源平面仍是 2 字节/样本
+                    //（wire 容器统一 32-bit 只影响 repack 输出缓冲，不影响
+                    // FFmpeg 实际分配的输入平面大小）
+                    let source_bytes_per_sample =
+                        if matches!(sample_format, DirectPcmSampleFormat::Signed16) {
+                            2_usize
+                        } else {
+                            4_usize
+                        };
                     let plane_len = samples_per_channel
-                        .checked_mul(bytes_per_sample)
+                        .checked_mul(source_bytes_per_sample)
                         .context("Source Direct planar plane 长度溢出")?;
                     ensure!(
                         usize::try_from(frame.linesize[0]).unwrap_or(0) >= plane_len,
@@ -986,6 +1066,72 @@ unsafe fn interleave_planar<T: Copy>(
         for index in 0..samples {
             output[index * channels + channel] = unsafe { *plane.add(start_sample + index) };
         }
+    }
+    Ok(())
+}
+
+/// v11-1: 平面 S16 → 交错 i32（左移 16 位，bit-perfect 升位，低位补零）。
+/// 32-bit 容器归一化的核心转换：S16 源的有效信息占高 16 位
+unsafe fn interleave_planar_i16_to_i32(
+    extended_data: *mut *mut u8,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i32],
+) -> Result<()> {
+    let total_samples = samples
+        .checked_mul(channels)
+        .context("Source Direct planar sample count 溢出")?;
+    ensure!(
+        output.len() >= total_samples,
+        "Source Direct planar repack buffer 太小"
+    );
+
+    if channels == 2 {
+        let left = unsafe { *extended_data }.cast::<i16>();
+        let right = unsafe { *extended_data.add(1) }.cast::<i16>();
+        ensure!(
+            !left.is_null() && !right.is_null(),
+            "Source Direct planar PCM plane 为空"
+        );
+        for index in 0..samples {
+            let source_index = start_sample + index;
+            output[index * 2] = i32::from(unsafe { *left.add(source_index) }) << 16;
+            output[index * 2 + 1] = i32::from(unsafe { *right.add(source_index) }) << 16;
+        }
+        return Ok(());
+    }
+
+    for channel in 0..channels {
+        let plane = unsafe { *extended_data.add(channel) }.cast::<i16>();
+        ensure!(!plane.is_null(), "Source Direct planar PCM plane 为空");
+        for index in 0..samples {
+            output[index * channels + channel] =
+                i32::from(unsafe { *plane.add(start_sample + index) }) << 16;
+        }
+    }
+    Ok(())
+}
+
+/// v11-1: packed S16 → 交错 i32（左移 16 位升位）。packed 单声道/立体声源
+/// 原走 ZeroCopy 直通，因容器归一化改经 repack
+unsafe fn repack_packed_i16_to_i32(
+    ptr: *const i16,
+    channels: usize,
+    start_sample: usize,
+    samples: usize,
+    output: &mut [i32],
+) -> Result<()> {
+    let total_samples = samples
+        .checked_mul(channels)
+        .context("Source Direct packed sample count 溢出")?;
+    ensure!(
+        output.len() >= total_samples,
+        "Source Direct packed repack buffer 太小"
+    );
+    for index in 0..total_samples {
+        let source_index = start_sample * channels + index;
+        output[index] = i32::from(unsafe { *ptr.add(source_index) }) << 16;
     }
     Ok(())
 }
@@ -1607,6 +1753,8 @@ enum DirectPcmCommand {
     ReplaceLocal {
         source: String,
         start_secs: f64,
+        /// CUE 有界播放：文件时间轴虚拟 EOF（start+轨长），0=无界
+        stop_micros: u64,
         cancel: HttpCancelHandle,
         response: mpsc::SyncSender<Result<DirectPcmFormat>>,
     },
@@ -1614,6 +1762,8 @@ enum DirectPcmCommand {
         path: PathBuf,
         start_secs: f64,
         duration_micros: u64,
+        /// CUE 有界播放：文件时间轴虚拟 EOF（start+轨长），0=无界
+        stop_micros: u64,
         generation: u64,
         response: mpsc::SyncSender<Result<()>>,
     },
@@ -1779,6 +1929,10 @@ struct DirectPcmRing {
     /// 后台 prepare 已产出 Ready 结果待 producer 收取（finished 分支等待的
     /// 唤醒提示位；producer 收空通道后复位）
     staged_ready: AtomicBool,
+    /// v11-3: 跨格式换源武装（消费一次后自动复位）：热重配实验路径先经 FFI
+    /// 重配 wire 位深/采样率，再武装本旗标跳过 replace 的同 transport 校验。
+    /// 仅 SPLAYER_DIRECT_HOT_RECONFIG=1 的编排路径置位
+    cross_format_armed: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -1817,6 +1971,7 @@ impl DirectPcmRing {
             stage_pending: AtomicBool::new(false),
             stage_epoch: AtomicU64::new(0),
             staged_ready: AtomicBool::new(false),
+            cross_format_armed: AtomicBool::new(false),
         })
     }
 
@@ -2139,6 +2294,9 @@ struct StagedPcmSource {
     format: DirectPcmFormat,
     duration_micros: u64,
     generation: u64,
+    /// 装填后有界播放状态：解码器文件时间轴起点与虚拟 EOF 边界（0=无界）
+    start_secs: f64,
+    stop_micros: u64,
 }
 
 /// 后台 stage prepare 线程的结果。epoch 为 ring 的 stage 代数：
@@ -2153,6 +2311,7 @@ fn prepare_staged_pcm_source(
     start_secs: f64,
     current_format: DirectPcmFormat,
     duration_micros: u64,
+    stop_micros: u64,
     generation: u64,
 ) -> Result<StagedPcmSource> {
     let mut decoder = DirectPcmDecoder::open_local(path)?;
@@ -2186,13 +2345,15 @@ fn prepare_staged_pcm_source(
         format,
         duration_micros,
         generation,
+        start_secs,
+        stop_micros,
     })
 }
 
 fn install_staged_pcm_slot(
     mut staged: StagedPcmSource,
     slot: &DirectPcmSlot,
-) -> Result<(DirectPcmDecoder, DirectPcmFormat)> {
+) -> Result<(DirectPcmDecoder, DirectPcmFormat, f64, u64)> {
     let frame = unsafe { &mut *slot.frame.get() };
     std::mem::swap(frame, &mut staged.first_frame);
     slot.payload_ptr
@@ -2206,7 +2367,7 @@ fn install_staged_pcm_slot(
         .store(staged.generation, Ordering::Relaxed);
     slot.boundary.store(true, Ordering::Relaxed);
     slot.state.store(SLOT_READY, Ordering::Release);
-    Ok((staged.decoder, staged.format))
+    Ok((staged.decoder, staged.format, staged.start_secs, staged.stop_micros))
 }
 
 fn replace_pcm_ring(
@@ -2233,10 +2394,24 @@ fn replace_pcm_ring(
         );
     }
     let new_format = prepared.format()?;
-    ensure!(
-        same_pcm_transport(current_format, new_format),
-        "[Direct] 新音源 PCM wire format 与当前 Diretta connection 不一致"
-    );
+    // v11-3: 热重配实验路径——armed 旗标（消费一次自动复位）表示 wire 已由
+    // FFI reconfigure 同步重配为新格式，此处跳过同 transport 校验。
+    // 常规路径保持严格校验（未武装的跨格式换源仍然拒绝）
+    let cross_format_armed = ring.cross_format_armed.swap(false, Ordering::AcqRel);
+    if cross_format_armed {
+        tracing::warn!(
+            target: "diretta_handoff",
+            phase = "pcm_ring_cross_format_armed",
+            old_rate = %current_format.sample_rate,
+            new_rate = %new_format.sample_rate,
+            "跨格式换源旁路生效（热重配实验）"
+        );
+    } else {
+        ensure!(
+            same_pcm_transport(current_format, new_format),
+            "[Direct] 新音源 PCM wire format 与当前 Diretta connection 不一致"
+        );
+    }
     debug!(
         target: "diretta_handoff",
         phase = "pcm_ring_open_done",
@@ -2444,6 +2619,7 @@ impl DirectPcmStageHandle {
         path: &Path,
         start_secs: f64,
         duration_secs: f64,
+        stop_secs: f64,
         generation: u64,
     ) -> Result<()> {
         ensure!(
@@ -2457,12 +2633,16 @@ impl DirectPcmStageHandle {
         let duration_micros = (duration_secs * 1_000_000.0)
             .round()
             .clamp(0.0, u64::MAX as f64) as u64;
+        let stop_micros = (stop_secs * 1_000_000.0)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
             .send(DirectPcmCommand::StageLocal {
                 path: path.to_owned(),
                 start_secs,
                 duration_micros,
+                stop_micros,
                 generation,
                 response: response_tx,
             })
@@ -2488,23 +2668,27 @@ pub struct DirectPcmSource {
 
 impl DirectPcmSource {
     pub fn open_local(path: &Path) -> Result<Self> {
-        let (source, _) = Self::open_local_at(path, 0.0)?;
+        let (source, _) = Self::open_local_at(path, 0.0, 0.0)?;
         Ok(source)
     }
 
-    pub fn open_local_at(path: &Path, position_secs: f64) -> Result<(Self, f64)> {
+    pub fn open_local_at(path: &Path, position_secs: f64, stop_file_secs: f64) -> Result<(Self, f64)> {
         let decoder = DirectPcmDecoder::open_local(path)?;
-        Self::open_with_decoder(decoder, position_secs)
+        Self::open_with_decoder(decoder, position_secs, stop_file_secs)
     }
 
     /// 以流式 Reader 打开（在线音源 stream 模式）。
     /// `position_secs > 0` 由 demuxer 级 accurate seek 完成（Reader 层触发 Range 重连）。
-    pub fn open_reader_at(reader: Box<dyn ReadSeek>, position_secs: f64) -> Result<(Self, f64)> {
+    pub fn open_reader_at(reader: Box<dyn ReadSeek>, position_secs: f64, stop_file_secs: f64) -> Result<(Self, f64)> {
         let decoder = DirectPcmDecoder::open_reader(reader)?;
-        Self::open_with_decoder(decoder, position_secs)
+        Self::open_with_decoder(decoder, position_secs, stop_file_secs)
     }
 
-    fn open_with_decoder(decoder: DirectPcmDecoder, position_secs: f64) -> Result<(Self, f64)> {
+    fn open_with_decoder(
+        decoder: DirectPcmDecoder,
+        position_secs: f64,
+        stop_file_secs: f64,
+    ) -> Result<(Self, f64)> {
         let mut decoder = decoder;
         let ring = Arc::new(DirectPcmRing::new()?);
         let first_slot = &ring.slots[0];
@@ -2557,6 +2741,15 @@ impl DirectPcmSource {
                 boost_current_audio_thread("diretta-direct-decode");
                 let mut active_format = format;
                 let mut staged: Option<StagedPcmSource> = None;
+                // CUE 分轨有界播放：解码器文件时间轴位置与虚拟 EOF 边界。
+                // stop = start + 轨长（文件时间轴绝对秒），到达即按 EOF 处理
+                //（装填 staged 候选或曲终 Ended），否则会越过曲界继续播共享音频
+                let mut file_pos_secs: f64 = actual_position;
+                let mut bound_stop_secs: Option<f64> = if stop_file_secs > 0.0 {
+                    Some(stop_file_secs)
+                } else {
+                    None
+                };
                 // 后台 stage prepare 的结果通道：prepare 在独立线程执行（打开解码器/
                 // 首帧解码/CUE seek 可达数百 ms，绝不能阻塞 producer 数据通路，
                 // 否则 fresh ring 被吃空 → 欠载静音 → 恢复时静音跳回音频=可闻咔哒）
@@ -2582,6 +2775,10 @@ impl DirectPcmSource {
                             if result.is_err() {
                                 producer_ring.failed.store(true, Ordering::Release);
                             }
+                            // 同步有界播放的文件时间轴（seek 返回实际落点）
+                            if let Ok(actual) = &result {
+                                file_pos_secs = *actual;
+                            }
                             let _ = response.send(result);
                             next_slot = 1;
                             continue;
@@ -2589,6 +2786,7 @@ impl DirectPcmSource {
                         Ok(DirectPcmCommand::ReplaceLocal {
                             source,
                             start_secs,
+                            stop_micros,
                             cancel,
                             response,
                         }) => {
@@ -2604,6 +2802,13 @@ impl DirectPcmSource {
                                     decoder = new_decoder;
                                     active_format = new_format;
                                     staged = None;
+                                    // 换源后重置有界播放状态（CUE 分轨：stop = start + 轨长）
+                                    file_pos_secs = start_secs;
+                                    bound_stop_secs = if stop_micros > 0 {
+                                        Some(stop_micros as f64 / 1_000_000.0)
+                                    } else {
+                                        None
+                                    };
                                     // 推进代数：旧候选的在途 prepare 结果作废
                                     producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
                                     producer_ring
@@ -2622,6 +2827,7 @@ impl DirectPcmSource {
                             path,
                             start_secs,
                             duration_micros,
+                            stop_micros,
                             generation,
                             response,
                         }) => {
@@ -2641,6 +2847,7 @@ impl DirectPcmSource {
                                         start_secs,
                                         fmt,
                                         duration_micros,
+                                        stop_micros,
                                         generation,
                                     );
                                     match result {
@@ -2751,9 +2958,15 @@ impl DirectPcmSource {
                                 continue;
                             }
                             match install_staged_pcm_slot(candidate, slot) {
-                                Ok((new_decoder, new_format)) => {
+                                Ok((new_decoder, new_format, cand_start, cand_stop)) => {
                                     decoder = new_decoder;
                                     active_format = new_format;
+                                    file_pos_secs = cand_start;
+                                    bound_stop_secs = if cand_stop > 0 {
+                                        Some(cand_stop as f64 / 1_000_000.0)
+                                    } else {
+                                        None
+                                    };
                                     producer_ring.finished.store(false, Ordering::Release);
                                     producer_ring
                                         .stage_pending
@@ -2832,7 +3045,22 @@ impl DirectPcmSource {
                     }
 
                     let frame = unsafe { &mut *slot.frame.get() };
-                    match decoder.read_frame(frame) {
+                    // CUE 分轨有界播放：文件时间轴到达轨末边界 → 视作 EOF，
+                    // 走既有 Ok(false) 通路（装填 staged 候选或曲终 finished），
+                    // 防止越过曲界继续解码共享音频（曲终不触发/播到下一轨）
+                    let at_bound =
+                        matches!(bound_stop_secs, Some(stop) if file_pos_secs >= stop);
+                    let read_out = if at_bound {
+                        Ok(false)
+                    } else {
+                        decoder.read_frame(frame).inspect(|got| {
+                            if *got {
+                                file_pos_secs += frame.samples_per_channel() as f64
+                                    / active_format.sample_rate as f64;
+                            }
+                        })
+                    };
+                    match read_out {
                         Ok(true) => {
                             let frame_format = match frame.format() {
                                 Ok(value) => value,
@@ -2887,28 +3115,68 @@ impl DirectPcmSource {
                             next_slot = (next_slot + 1) % producer_ring.slots.len();
                         }
                         Ok(false) => {
-                            if let Some(candidate) = staged.take() {
-                                match install_staged_pcm_slot(candidate, slot) {
-                                    Ok((new_decoder, new_format)) => {
-                                        decoder = new_decoder;
-                                        active_format = new_format;
-                                        producer_ring.finished.store(false, Ordering::Release);
-                                        producer_ring
-                                            .stage_pending
-                                            .store(false, Ordering::Release);
-                                        next_slot = (next_slot + 1) % producer_ring.slots.len();
-                                    }
-                                    Err(_) => {
-                                        slot.state.store(SLOT_FREE, Ordering::Release);
-                                        producer_ring.failed.store(true, Ordering::Release);
-                                        producer_ring
-                                            .stage_pending
-                                            .store(false, Ordering::Release);
+                            // EOF：staged 候选可能已 prepare 完成但尚未被本循环
+                            // 收取——stage_local 返回即保证结果已在结果通道内，
+                            // 此处先排空通道再判定。否则 finished 置位与下一轮
+                            // 收取之间留有一拍空窗，consumer 命中供数空窗会交付
+                            // 静音，无缝边界被夹进静音（与 direct_dsd 同款修复）
+                            if staged.is_none() {
+                                while let Ok(outcome) = stage_result_rx.try_recv() {
+                                    match outcome {
+                                        StagePrepareOutcome::Ready(epoch, candidate) => {
+                                            if epoch
+                                                == producer_ring
+                                                    .stage_epoch
+                                                    .load(Ordering::Acquire)
+                                            {
+                                                staged = Some(candidate);
+                                            }
+                                        }
+                                        StagePrepareOutcome::Failed(epoch) => {
+                                            if epoch
+                                                == producer_ring
+                                                    .stage_epoch
+                                                    .load(Ordering::Acquire)
+                                            {
+                                                producer_ring
+                                                    .stage_pending
+                                                    .store(false, Ordering::Release);
+                                            }
+                                        }
                                     }
                                 }
-                            } else {
-                                slot.state.store(SLOT_FREE, Ordering::Release);
-                                producer_ring.finished.store(true, Ordering::Release);
+                            }
+                            match staged.take() {
+                                Some(candidate) => {
+                                    match install_staged_pcm_slot(candidate, slot) {
+                                        Ok((new_decoder, new_format, cand_start, cand_stop)) => {
+                                            decoder = new_decoder;
+                                            active_format = new_format;
+                                            file_pos_secs = cand_start;
+                                            bound_stop_secs = if cand_stop > 0 {
+                                                Some(cand_stop as f64 / 1_000_000.0)
+                                            } else {
+                                                None
+                                            };
+                                            producer_ring.finished.store(false, Ordering::Release);
+                                            producer_ring
+                                                .stage_pending
+                                                .store(false, Ordering::Release);
+                                            next_slot = (next_slot + 1) % producer_ring.slots.len();
+                                        }
+                                        Err(_) => {
+                                            slot.state.store(SLOT_FREE, Ordering::Release);
+                                            producer_ring.failed.store(true, Ordering::Release);
+                                            producer_ring
+                                                .stage_pending
+                                                .store(false, Ordering::Release);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    slot.state.store(SLOT_FREE, Ordering::Release);
+                                    producer_ring.finished.store(true, Ordering::Release);
+                                }
                             }
                         }
                         Err(error) => {
@@ -3064,10 +3332,20 @@ impl DirectPcmSource {
             .store(micros, Ordering::Release);
     }
 
+    /// v11-3: 武装下一次 ReplaceLocal 的跨格式旁路（消费一次后自动复位）。
+    /// 仅热重配实验路径使用：wire 已由 FFI reconfigure 同步重配，源与 wire
+    /// 的格式一致性由编排层（transition.rs）保证
+    pub fn arm_cross_format_replace(&self) {
+        self.ring
+            .cross_format_armed
+            .store(true, Ordering::Release);
+    }
+
     pub fn replace_drained_local(
         &mut self,
         source: &str,
         start_secs: f64,
+        stop_secs: f64,
         cancel: HttpCancelHandle,
     ) -> Result<DirectPcmFormat> {
         debug!(
@@ -3077,10 +3355,14 @@ impl DirectPcmSource {
             "DirectPcmSource::replace_drained_local send command"
         );
         let (response_tx, response_rx) = mpsc::sync_channel(0);
+        let stop_micros = (stop_secs * 1_000_000.0)
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
         self.control_tx
             .send(DirectPcmCommand::ReplaceLocal {
                 source: source.to_owned(),
                 start_secs,
+                stop_micros,
                 cancel,
                 response: response_tx,
             })
@@ -3267,11 +3549,16 @@ mod tests {
     }
 
     #[test]
-    fn s16_wav_payload_is_bit_exact_and_keeps_source_rate() {
+    fn s16_wav_is_promoted_to_s32_container_bit_exact() {
         let samples = [-32768_i16, 32767, -12345, 12345, -1, 1, 0, 42];
         let pcm: Vec<u8> = samples
             .iter()
             .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        // v11-1: 期望 payload = 源 i16 左移 16 位后的 i32 LE 字节
+        let expected_payload: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| (i32::from(*sample) << 16).to_le_bytes())
             .collect();
         let fixture = TempAudioFile::wav(44_100, 16, &pcm);
         let mut decoder = DirectPcmDecoder::open_local(&fixture.path).unwrap();
@@ -3284,13 +3571,13 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 2,
                 valid_bits: 16,
-                storage_bits: 16,
+                storage_bits: 32,
                 sample_format: DirectPcmSampleFormat::Signed16,
-                memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+                memory_path: DirectPcmMemoryPath::BitPerfectRepack,
             }
         );
         assert_eq!(frame.samples_per_channel(), 4);
-        assert_eq!(frame.payload_bytes().unwrap(), pcm);
+        assert_eq!(frame.payload_bytes().unwrap(), expected_payload);
     }
 
     /// stream 模式核心路径：AVIO 自定义 Reader 输入必须与本地文件解码逐位一致
@@ -3340,7 +3627,12 @@ mod tests {
             streamed_blocks, local_blocks,
             "AVIO 流式解码输出必须与本地文件逐位一致"
         );
-        assert_eq!(streamed_blocks, pcm, "s16 WAV 经 AVIO 解码后应保持位精确");
+        // v11-1: payload 已是 32-bit 容器，期望值按源 i16 左移 16 位构造
+        let promoted: Vec<u8> = (0..4096_i32)
+            .map(|i| ((i * 37) % 20000 - 10000) as i16)
+            .flat_map(|sample| (i32::from(sample) << 16).to_le_bytes())
+            .collect();
+        assert_eq!(streamed_blocks, promoted, "s16 WAV 经 AVIO 解码后应保持位精确");
     }
 
     #[test]
@@ -3528,7 +3820,7 @@ mod tests {
                 sample_rate: 44_100,
                 channels: 2,
                 valid_bits: 16,
-                storage_bits: 16,
+                storage_bits: 32,
                 sample_format: DirectPcmSampleFormat::Signed16,
                 memory_path: DirectPcmMemoryPath::BitPerfectRepack,
             }
@@ -3544,9 +3836,10 @@ mod tests {
             -32768_i16, 32767, -12345, 12345, -1, 1, 0, 42, -22222, 22222, -7, 7, 1024, -1024,
             30000, -30000,
         ];
+        // v11-1: 期望 payload = 源 i16 左移 16 位后的 i32 LE 字节
         let expected_bytes: Vec<u8> = expected
             .iter()
-            .flat_map(|sample| sample.to_le_bytes())
+            .flat_map(|sample| (i32::from(*sample) << 16).to_le_bytes())
             .collect();
 
         for (extension, encoded) in [("m4a", ALAC16), ("wv", WAVPACK16)] {
@@ -3564,7 +3857,7 @@ mod tests {
                     sample_rate: 44_100,
                     channels: 2,
                     valid_bits: 16,
-                    storage_bits: 16,
+                    storage_bits: 32,
                     sample_format: DirectPcmSampleFormat::Signed16,
                     memory_path: DirectPcmMemoryPath::BitPerfectRepack,
                 }
@@ -3704,10 +3997,10 @@ mod tests {
         for slot in &source.ring.slots {
             let frame = unsafe { &*slot.frame.get() };
             match &frame.repack {
-                DirectPcmRepackBuffer::Signed16(buffer) => {
+                DirectPcmRepackBuffer::Signed32(buffer) => {
                     assert!(buffer.len() >= initial_samples)
                 }
-                _ => panic!("WavPack16 Source Direct slot 应预分配 S16 repack buffer"),
+                _ => panic!("WavPack16 Source Direct slot 应预分配 S32 repack buffer"),
             }
         }
 
@@ -3794,7 +4087,7 @@ mod tests {
         let target_frame = 16_usize;
         let target_secs = target_frame as f64 / f64::from(sample_rate);
         let (source, actual_position) =
-            DirectPcmSource::open_local_at(&fixture.path, target_secs).unwrap();
+            DirectPcmSource::open_local_at(&fixture.path, target_secs, 0.0).unwrap();
 
         assert_eq!(actual_position, target_secs);
         let first_frame = unsafe { &*source.ring.slots[0].frame.get() };
@@ -3803,14 +4096,26 @@ mod tests {
         let mut len = 0_usize;
         assert!(unsafe { direct_pcm_next_block(source.callback_context(), &mut data, &mut len) });
         assert_eq!(data, expected_ptr);
+        // v11-1: payload 已是 32-bit 容器（每帧 8 字节），期望值按源 i16 左移 16 位构造
+        let promoted: Vec<u8> = pcm
+            .chunks_exact(4)
+            .flat_map(|frame| {
+                let left = i16::from_le_bytes([frame[0], frame[1]]);
+                let right = i16::from_le_bytes([frame[2], frame[3]]);
+                let mut bytes = Vec::with_capacity(8);
+                bytes.extend_from_slice(&(i32::from(left) << 16).to_le_bytes());
+                bytes.extend_from_slice(&(i32::from(right) << 16).to_le_bytes());
+                bytes
+            })
+            .collect();
         assert_eq!(
             unsafe { slice::from_raw_parts(data, len) },
-            &pcm[target_frame * 4..target_frame * 4 + len]
+            &promoted[target_frame * 8..target_frame * 8 + len]
         );
         unsafe { direct_pcm_release_block(source.callback_context()) };
         assert_eq!(
             source.consumed_position(),
-            len as f64 / 4.0 / f64::from(sample_rate)
+            len as f64 / 8.0 / f64::from(sample_rate)
         );
     }
 
@@ -3837,9 +4142,21 @@ mod tests {
         let mut data = ptr::null();
         let mut len = 0_usize;
         assert!(unsafe { direct_pcm_next_block(source.callback_context(), &mut data, &mut len) });
+        // v11-1: payload 已是 32-bit 容器（每帧 8 字节），期望值按源 i16 左移 16 位构造
+        let promoted: Vec<u8> = pcm
+            .chunks_exact(4)
+            .flat_map(|frame| {
+                let left = i16::from_le_bytes([frame[0], frame[1]]);
+                let right = i16::from_le_bytes([frame[2], frame[3]]);
+                let mut bytes = Vec::with_capacity(8);
+                bytes.extend_from_slice(&(i32::from(left) << 16).to_le_bytes());
+                bytes.extend_from_slice(&(i32::from(right) << 16).to_le_bytes());
+                bytes
+            })
+            .collect();
         assert_eq!(
             unsafe { slice::from_raw_parts(data, len) },
-            &pcm[target_frame * 4..target_frame * 4 + len]
+            &promoted[target_frame * 8..target_frame * 8 + len]
         );
         unsafe { direct_pcm_release_block(source.callback_context()) };
     }
@@ -3935,20 +4252,23 @@ mod tests {
             -32768_i16, 32767, -12345, 12345, -1, 1, 0, 42, -22222, 22222, -7, 7, 1024, -1024,
             30000, -30000,
         ];
+        // v11-1: 期望 payload = 源 i16 左移 16 位后的 i32 LE 字节
         let expected_bytes: Vec<u8> = expected
             .iter()
-            .flat_map(|sample| sample.to_le_bytes())
+            .flat_map(|sample| (i32::from(*sample) << 16).to_le_bytes())
             .collect();
 
         let mut source = DirectPcmSource::open_local(&initial.path).unwrap();
         let context = source.callback_context();
+        // v11-1: S16 WAV 源也统一走 32-bit 容器 repack
         assert_eq!(
             source.format().memory_path,
-            DirectPcmMemoryPath::ZeroCopyPacked
+            DirectPcmMemoryPath::BitPerfectRepack
         );
         let new_format = source
             .replace_drained_local(
                 &replacement.path.to_string_lossy(),
+                0.0,
                 0.0,
                 HttpCancelHandle::new(),
             )
@@ -3956,7 +4276,7 @@ mod tests {
         assert_eq!(source.callback_context(), context);
         assert_eq!(new_format.sample_rate, 44_100);
         assert_eq!(new_format.channels, 2);
-        assert_eq!(new_format.storage_bits, 16);
+        assert_eq!(new_format.storage_bits, 32);
         assert_eq!(
             new_format.memory_path,
             DirectPcmMemoryPath::BitPerfectRepack
@@ -3981,6 +4301,7 @@ mod tests {
         let error = source
             .replace_drained_local(
                 &incompatible.path.to_string_lossy(),
+                0.0,
                 0.0,
                 HttpCancelHandle::new(),
             )
@@ -4010,12 +4331,12 @@ mod tests {
         let monitor = source.monitor();
         source
             .stage_handle()
-            .stage_local(&second.path, 0.0, 2.0, 7)
+            .stage_local(&second.path, 0.0, 2.0, 0.0, 7)
             .unwrap();
 
         let mut collected = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while collected.len() < first_pcm.len() + second_pcm.len()
+        while collected.len() < 2 * (first_pcm.len() + second_pcm.len())
             && std::time::Instant::now() < deadline
         {
             let mut data = ptr::null();
@@ -4028,8 +4349,16 @@ mod tests {
         }
         unsafe { direct_pcm_release_block(source.callback_context()) };
 
-        let mut expected = first_pcm;
-        expected.extend_from_slice(&second_pcm);
+        // v11-1: payload 是 32-bit 容器，拼接期望按源 i16 左移 16 位构造
+        let promoted = |raw: &[u8]| -> Vec<u8> {
+            raw.chunks_exact(2)
+                .flat_map(|sample| {
+                    (i32::from(i16::from_le_bytes([sample[0], sample[1]])) << 16).to_le_bytes()
+                })
+                .collect::<Vec<u8>>()
+        };
+        let mut expected = promoted(&first_pcm);
+        expected.extend_from_slice(&promoted(&second_pcm));
         assert_eq!(collected, expected);
         assert_eq!(monitor.transition_count(), 1);
         assert_eq!(monitor.boundary_generation(), 7);
@@ -4223,6 +4552,39 @@ mod tests {
         assert!(same_pcm_transport(f1, f2));
     }
 
+    /// v11-1：统一 32-bit 容器后，位深切换（16↔24↔32 源，valid_bits 不同、
+    /// storage_bits 同为 32）不再触发全量重连
+    #[test]
+    fn same_pcm_transport_accepts_bit_depth_change_within_s32_container() {
+        let s16_source = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 16,
+            storage_bits: 32,
+            sample_format: DirectPcmSampleFormat::Signed16,
+            memory_path: DirectPcmMemoryPath::BitPerfectRepack,
+        };
+        let s24_source = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 24,
+            storage_bits: 32,
+            sample_format: DirectPcmSampleFormat::Signed32,
+            memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+        let s32_source = DirectPcmFormat {
+            sample_rate: 44_100,
+            channels: 2,
+            valid_bits: 32,
+            storage_bits: 32,
+            sample_format: DirectPcmSampleFormat::Signed32,
+            memory_path: DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+        assert!(same_pcm_transport(s16_source, s24_source));
+        assert!(same_pcm_transport(s24_source, s32_source));
+        assert!(same_pcm_transport(s16_source, s32_source));
+    }
+
     /// same_pcm_transport：不同 sample_rate 应该拒绝
     #[test]
     fn same_pcm_transport_rejects_different_sample_rate() {
@@ -4333,6 +4695,7 @@ mod tests {
             .replace_drained_local(
                 &fixture_b.path.to_string_lossy(),
                 0.0,
+                0.0,
                 HttpCancelHandle::new(),
             )
             .unwrap();
@@ -4340,7 +4703,7 @@ mod tests {
         // 断言 1：新格式与原格式完全兼容
         assert_eq!(new_format.sample_rate, 44_100);
         assert_eq!(new_format.channels, 2);
-        assert_eq!(new_format.storage_bits, 16);
+        assert_eq!(new_format.storage_bits, 32);
 
         // 断言 2：handoff 后 ring 仍然可读（播放流不断）
         let mut data = ptr::null::<u8>();
@@ -4387,6 +4750,7 @@ mod tests {
 
         let result = source.replace_drained_local(
             &fixture_b.path.to_string_lossy(),
+            0.0,
             0.0,
             HttpCancelHandle::new(),
         );

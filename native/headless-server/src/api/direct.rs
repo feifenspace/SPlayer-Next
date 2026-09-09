@@ -4,7 +4,7 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use axum::{extract::State, Json};
 use serde::Deserialize;
@@ -104,6 +104,74 @@ impl DirectInput {
             Self::Path(path) => path,
         }
     }
+}
+
+/// 本地音源整曲物化进 memfd 纯内存缓存（L2 纯内存：handoff/stage/full-reconnect
+/// 均从 RAM 打开，播放期零 CIFS/磁盘 IO；设备无 swap，memfd 页面即常驻内存，
+/// 无需 mlock 兜底）。`Ok(None)` = 空文件/超上限/memfd 不可用，调用方回退
+/// 路径模式（行为不变，仅多一次源读取）。`abort` 在每个 chunk 边界检查
+/// （预载失效/新 load 抢占时即时退出，不占线程读完全程）
+pub(crate) fn materialize_local_to_ram(
+    path: &str,
+    max_bytes: u64,
+    abort: impl Fn() -> bool,
+) -> anyhow::Result<Option<DirectInput>> {
+    use anyhow::Context as _;
+    use std::io::{Read, Write};
+
+    let mut source =
+        std::fs::File::open(path).with_context(|| format!("打开待物化文件失败: {path}"))?;
+    let len = source.metadata()?.len();
+    if len == 0 || len > max_bytes {
+        tracing::info!(path, len, max_bytes, "本地音源超出 RAM 物化上限，回退路径模式");
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "linux")]
+    match create_memfd_file() {
+        Ok((mut file, fd_path)) => {
+            let mut chunk = vec![0u8; 512 * 1024];
+            loop {
+                if abort() {
+                    anyhow::bail!("本地音源物化已中止（被新请求取代/预载失效）");
+                }
+                let n = source.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&chunk[..n])?;
+            }
+            file.flush()?;
+            tracing::info!(path, len, fd_path = %fd_path, "本地音源已物化进 memfd 纯内存缓存");
+            return Ok(Some(DirectInput::Memfd { file, path: fd_path }));
+        }
+        Err(error) => {
+            tracing::warn!(%error, "memfd 不可用，本地音源回退路径模式");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = max_bytes;
+    }
+    Ok(None)
+}
+
+/// 本地源是否为原生 DSD（DSF/DFF/SACD ISO，含 CUE 指向 DSD 母版的情况）。
+/// 原生 DSD 不做 memfd 物化：DSD 家族 stage/handoff 有独立通道（direct_dsd），
+/// 且 DSD 源不经 PCM preload 语义
+fn local_source_is_native_dsd(source: &str) -> bool {
+    let physical = audio_engine_core::cue::parse_cue_virtual_path(source)
+        .map(|cue| cue.physical_path)
+        .unwrap_or_else(|| source.to_owned());
+    let ext = Path::new(&physical)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "dsf" | "dff" | "dsdiff" | "iso")
+        || physical.contains(".iso|")
+        || physical.contains(".ISO|")
+        || physical.to_ascii_lowercase().contains(".iso#")
 }
 
 /// preload 物化大小上限：防失控响应打爆内存（memfd 映射的就是 RAM），
@@ -389,13 +457,76 @@ pub(crate) fn stage_direct_core(
         return Ok(Some("onlineSourceMode=stream skips online preloading"));
     }
 
-    // HTTP 源预先物化为本地可 seek 输入（native stage 仅支持本地源）。
-    // cancel 用一次性句柄：本链路的中止由 abort 谓词（预载失效令牌）承担
-    let physical_source = if is_http {
-        materialize_direct_input(&source, &audio_engine_core::HttpCancelHandle::new(), abort)
-            .map_err(|e| anyhow::anyhow!("Failed to preload stream to RAM: {e}"))?
+    // cue:// 候选必须先查库重写为「物理路径|start|dur|track」管道格式：
+    // 引擎 stage/handoff 只认管道格式，原始 cue:// 下传 ffmpeg 会报
+    // Protocol not found（与 load 路径的 resolve_cue_source 同语义）
+    let source = if !is_http && source.starts_with("cue://") {
+        let resolved = {
+            let conn = state.db.lock();
+            crate::db::get_track_by_path(&conn, &source)
+                .ok()
+                .flatten()
+                .and_then(|track| {
+                    let audio_path = track.cue_audio_path.clone()?;
+                    let start_sec = track.cue_start_ms.unwrap_or(0) as f64 / 1000.0;
+                    let dur_sec = track.duration as f64 / 1000.0;
+                    let track_num = track.track.unwrap_or(1);
+                    Some(format!("{audio_path}|{start_sec:.3}|{dur_sec:.3}|{track_num}"))
+                })
+        };
+        match resolved {
+            Some(v) => v,
+            None => anyhow::bail!(
+                "cue:// 候选不在曲库中（或缺少母版路径），无法 stage: {source}"
+            ),
+        }
     } else {
-        DirectInput::Path(source.clone())
+        source
+    };
+
+    // HTTP 源预先物化为本地可 seek 输入（native stage 仅支持本地源）。
+    // cancel 用一次性句柄：本链路的中止由 abort 谓词（预载失效令牌）承担。
+    // HTTP 物化产物路径兼作 stage 逻辑源（原行为）：扩展名/DSD 家族嗅探依赖
+    // 真实扩展名，URL 不可靠
+    //
+    // 本地源 + ram_preload：整曲物化进 memfd 后 stage（gapless 预载解码器从
+    // RAM 供数，消除 stage/边界切换期的 CIFS 流式读）。CUE 管道格式解析仍由
+    // 引擎基于 source 完成，打开走 memfd（stage_local 的 open_path 分离）；
+    // 原生 DSD 不物化（独立 direct_dsd 通道）；物化超限/失败回退路径模式
+    let (stage_source, physical_source, stage_open_path) = if is_http {
+        let input = materialize_direct_input(
+            &source,
+            &audio_engine_core::HttpCancelHandle::new(),
+            abort,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to preload stream to RAM: {e}"))?;
+        let stage_source = input.path().to_owned();
+        (stage_source, input, None)
+    } else {
+        let ram_preload = state.config.playback.ram_preload;
+        let ram_max_bytes = state.config.resolved_ram_preload_max_bytes();
+        if ram_preload && !local_source_is_native_dsd(&source) {
+            let preload_physical = audio_engine_core::cue::parse_cue_virtual_path(&source)
+                .map(|cue| cue.physical_path)
+                .unwrap_or_else(|| source.clone());
+            match materialize_local_to_ram(&preload_physical, ram_max_bytes as u64, &abort) {
+                Ok(Some(input)) => {
+                    let open_path = input.path().to_owned();
+                    (source.clone(), input, Some(open_path))
+                }
+                Ok(None) => (source.clone(), DirectInput::Path(source.clone()), None),
+                Err(error) => {
+                    tracing::warn!(
+                        source = %source,
+                        %error,
+                        "本地源 memfd 物化失败，回退路径模式 stage"
+                    );
+                    (source.clone(), DirectInput::Path(source.clone()), None)
+                }
+            }
+        } else {
+            (source.clone(), DirectInput::Path(source.clone()), None)
+        }
     };
 
     // 候选元数据直传存 staged_meta：boundary 无缝切换后 now-playing 快照立即
@@ -405,8 +536,10 @@ pub(crate) fn stage_direct_core(
     }
 
     // DirectInput（含 memfd 的 File）随闭包存活整个 stage 过程：
-    // producer 在此期间同步打开解码器，路径解析始终有 fd 支撑
-    match handle.stage_local(physical_source.path(), duration, generation) {
+    // producer 在此期间同步完成解码器打开（prepare 线程在 stage_local 返回前
+    // 已完成），路径解析始终有 fd 支撑；解码器打开后持自身 fd，锚点可释放
+    let _ = &physical_source; // fd 存活锚点（Drop 即关 fd），显式引用消除 unused 警告
+    match handle.stage_local(&stage_source, stage_open_path.as_deref(), duration, generation) {
         Ok(()) => {
             tracing::info!(source = %source, generation, "无缝候选已 stage");
             Ok(None)

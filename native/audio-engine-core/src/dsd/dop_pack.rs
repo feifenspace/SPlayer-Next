@@ -118,7 +118,7 @@ mod tests {
         assert_eq!(marker_of(39), 0x05);
 
         // 跨缓冲：相位跨缓冲连续。再喂 8 帧后相位 48 % 32 = 16 → 0xFA
-        let mut eight = vec![0u8; 32];
+        let eight = vec![0u8; 32];
         let frames_extra = packer.pack_interleaved(&eight, 2, &mut [0i32; 16]);
         assert_eq!(frames_extra, 16 - 8); // 本周期仅剩 8 帧（40..48）
         let mut out2 = [0i32; 2];

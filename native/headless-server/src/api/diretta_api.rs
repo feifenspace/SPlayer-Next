@@ -15,8 +15,10 @@ use super::PlayerResponse;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Diretta 可达性/能力探测硬超时：DKS 调用（发现重试 + MTU 测量）内部无超时保护
-pub(crate) const DIRETTA_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Diretta 可达性/能力探测硬超时：DKS 调用（发现重试 + MTU 测量）内部无超时保护。
+/// target_info 探测包含完整建连（扫描 + MTU 测量 + setSink + connectWait，典型 2-3s），
+/// 3s 硬超时过于贴近正常耗时、易误杀，导致前端频繁查询失败 → 放宽到 6s
+pub(crate) const DIRETTA_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Deserialize)]
 pub struct DirettaSelectRequest {

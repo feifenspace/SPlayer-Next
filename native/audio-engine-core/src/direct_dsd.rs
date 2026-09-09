@@ -651,6 +651,10 @@ const NO_SLOT: usize = usize::MAX;
 /// 超时仅作为漏报兜底；到期后回到循环顶保持命令响应性
 const PRODUCER_WAIT_CEILING: Duration = Duration::from_millis(100);
 
+/// 无缝边界空窗的 consumer 等待上限：换真数据而非立即注入静音垫。
+/// 10ms 远小于 Target 端缓冲（实测 buffer_us=100000），不会造成设备欠载
+const DSD_BOUNDARY_GAP_WAIT: Duration = Duration::from_millis(10);
+
 struct DirectDsdSlot {
     state: AtomicU8,
     payload_ptr: AtomicPtr<u8>,
@@ -849,7 +853,29 @@ impl DirectDsdRing {
         // replace 前顶掉 Target 缓冲，新曲就绪即应立即开始，无需额外静音窗口
         let index = self.consumer_index.load(Ordering::Relaxed);
         let slot = &self.slots[index];
-        let slot_ready = slot.state.load(Ordering::Acquire) == SLOT_READY;
+        let mut slot_ready = slot.state.load(Ordering::Acquire) == SLOT_READY;
+        // 无缝边界空窗：finished/stage_pending 置位说明 producer 正在
+        // EOF→装填 staged 候选的临界区（stage 已 prepare 完成时为 µs 级）。
+        // 短暂事件等待换真数据，避免 0x69 静音垫被夹进无缝边界（staged
+        // 边界无排空语义，静音=可闻断裂；此即边界单测偶发失败的残留窗口）。
+        // pre-mute 窗口内（换源排空垫）保持既有静音语义；失败/超时回退静音垫。
+        // 等待上限 10ms 远小于 Target 缓冲（实测 buffer_us=100000），不致欠载
+        if !slot_ready
+            && !self.pre_mute_active()
+            && (self.finished.load(Ordering::Acquire) || self.stage_pending.load(Ordering::Acquire))
+        {
+            self.wait_for(
+                |ring| {
+                    let idx = ring.consumer_index.load(Ordering::Relaxed);
+                    ring.slots[idx].state.load(Ordering::Acquire) == SLOT_READY
+                        || ring.failed.load(Ordering::Acquire)
+                        || (!ring.finished.load(Ordering::Acquire)
+                            && !ring.stage_pending.load(Ordering::Acquire))
+                },
+                DSD_BOUNDARY_GAP_WAIT,
+            );
+            slot_ready = slot.state.load(Ordering::Acquire) == SLOT_READY;
+        }
         if self.pre_mute_active() && !slot_ready {
             if let Some(block) = self.pre_mute_block() {
                 return Some(block);
@@ -1671,34 +1697,69 @@ impl DirectDsdSource {
                     match fill_claimed_slot(&mut reader, slot, wire_bit_order) {
                         Ok(Some(())) => next_slot = (next_slot + 1) % producer_ring.slots.len(),
                         Ok(None) => {
-                            if let Some(candidate) = staged.take() {
-                                match install_staged_dsd_slot(candidate, slot, wire_bit_order) {
-                                    Ok((new_reader, new_format)) => {
-                                        reader = new_reader;
-                                        active_format = new_format;
-                                        producer_ring.finished.store(false, Ordering::Release);
-                                        producer_ring
-                                            .stage_pending
-                                            .store(false, Ordering::Release);
-                                        next_slot = (next_slot + 1) % producer_ring.slots.len();
-                                    }
-                                    Err(_) => {
-                                        slot.state.store(SLOT_FREE, Ordering::Release);
-                                        producer_ring.failed.store(true, Ordering::Release);
-                                        producer_ring
-                                            .stage_pending
-                                            .store(false, Ordering::Release);
+                            // EOF：staged 候选可能已 prepare 完成但尚未被本循环
+                            // 收取——stage_local 返回即保证结果已在结果通道内，
+                            // 此处先排空通道再判定。否则 finished 置位与下一轮
+                            // 收取之间留有一拍空窗，consumer 命中供数空窗会交付
+                            // 0x69 静音垫，无缝边界被夹进静音（单测
+                            // staged_dsd_handoff_is_bit_contiguous 偶发失败根因）
+                            if staged.is_none() {
+                                while let Ok(outcome) = stage_result_rx.try_recv() {
+                                    match outcome {
+                                        StagePrepareOutcome::Ready(epoch, candidate) => {
+                                            if epoch
+                                                == producer_ring
+                                                    .stage_epoch
+                                                    .load(Ordering::Acquire)
+                                            {
+                                                staged = Some(candidate);
+                                            }
+                                        }
+                                        StagePrepareOutcome::Failed(epoch) => {
+                                            if epoch
+                                                == producer_ring
+                                                    .stage_epoch
+                                                    .load(Ordering::Acquire)
+                                            {
+                                                producer_ring
+                                                    .stage_pending
+                                                    .store(false, Ordering::Release);
+                                            }
+                                        }
                                     }
                                 }
-                            } else {
-                                // fill 返回 None = reader 报告 EOF：若远早于曲目时长，
-                                // 即文件读取提前终止（CIFS/介质读失败常伪装成 EOF）
-                                tracing::warn!(
-                                    target: "diretta_dsd",
-                                    "Native DSD 源提前 EOF，production 结束"
-                                );
-                                slot.state.store(SLOT_FREE, Ordering::Release);
-                                producer_ring.finished.store(true, Ordering::Release);
+                            }
+                            match staged.take() {
+                                Some(candidate) => {
+                                    match install_staged_dsd_slot(candidate, slot, wire_bit_order) {
+                                        Ok((new_reader, new_format)) => {
+                                            reader = new_reader;
+                                            active_format = new_format;
+                                            producer_ring.finished.store(false, Ordering::Release);
+                                            producer_ring
+                                                .stage_pending
+                                                .store(false, Ordering::Release);
+                                            next_slot = (next_slot + 1) % producer_ring.slots.len();
+                                        }
+                                        Err(_) => {
+                                            slot.state.store(SLOT_FREE, Ordering::Release);
+                                            producer_ring.failed.store(true, Ordering::Release);
+                                            producer_ring
+                                                .stage_pending
+                                                .store(false, Ordering::Release);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    // fill 返回 None = reader 报告 EOF：若远早于曲目时长，
+                                    // 即文件读取提前终止（CIFS/介质读失败常伪装成 EOF）
+                                    tracing::warn!(
+                                        target: "diretta_dsd",
+                                        "Native DSD 源提前 EOF，production 结束"
+                                    );
+                                    slot.state.store(SLOT_FREE, Ordering::Release);
+                                    producer_ring.finished.store(true, Ordering::Release);
+                                }
                             }
                         }
                         Err(ref error) => {

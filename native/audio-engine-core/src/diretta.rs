@@ -137,10 +137,10 @@ mod imp {
     use diretta_sys::{
         splayer_diretta_close, splayer_diretta_cycle_size, splayer_diretta_last_error,
         splayer_diretta_mute_byte, splayer_diretta_open_direct, splayer_diretta_open_dsd_direct,
-        splayer_diretta_pause, splayer_diretta_play, splayer_diretta_query_target_caps,
-        splayer_diretta_scan, splayer_diretta_sink_buffer_us, splayer_diretta_sink_latency_us,
-        SPlayerDirettaDevice, SPlayerDirettaTargetCaps, TARGET_FW_MAX, TARGET_TEXT_MAX,
-        TEXT_CAPACITY,
+        splayer_diretta_pause, splayer_diretta_pcm_reconfigure, splayer_diretta_play,
+        splayer_diretta_query_target_caps, splayer_diretta_scan, splayer_diretta_sink_buffer_us,
+        splayer_diretta_sink_latency_us, SPlayerDirettaDevice, SPlayerDirettaTargetCaps,
+        TARGET_FW_MAX, TARGET_TEXT_MAX, TEXT_CAPACITY,
     };
 
     const MAX_SCAN_DEVICES: usize = 32;
@@ -286,7 +286,7 @@ mod imp {
 
     impl DirettaDirectConnection {
         pub fn open_local(selector: &str, path: &Path) -> Result<Self> {
-            let (connection, _) = Self::open_local_at(selector, path, 0.0)?;
+            let (connection, _) = Self::open_local_at(selector, path, 0.0, 0.0)?;
             Ok(connection)
         }
 
@@ -294,11 +294,13 @@ mod imp {
             selector: &str,
             path: &Path,
             position_secs: f64,
+            stop_file_secs: f64,
         ) -> Result<(Self, f64)> {
             let target = selector_target(selector)
                 .ok_or_else(|| anyhow!("invalid Diretta output selector"))?;
             let target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
-            let (source, actual_position) = DirectPcmSource::open_local_at(path, position_secs)?;
+            let (source, actual_position) =
+                DirectPcmSource::open_local_at(path, position_secs, stop_file_secs)?;
             let format = source.format();
             let raw = unsafe {
                 splayer_diretta_open_direct(
@@ -323,11 +325,13 @@ mod imp {
             selector: &str,
             reader: Box<dyn crate::direct_pcm::ReadSeek>,
             position_secs: f64,
+            stop_file_secs: f64,
         ) -> Result<(Self, f64)> {
             let target = selector_target(selector)
                 .ok_or_else(|| anyhow!("invalid Diretta output selector"))?;
             let target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
-            let (source, actual_position) = DirectPcmSource::open_reader_at(reader, position_secs)?;
+            let (source, actual_position) =
+                DirectPcmSource::open_reader_at(reader, position_secs, stop_file_secs)?;
             let format = source.format();
             let raw = unsafe {
                 splayer_diretta_open_direct(
@@ -398,10 +402,40 @@ mod imp {
             &mut self,
             source: &str,
             start_secs: f64,
+            stop_secs: f64,
             cancel: crate::ffmpeg_audio::HttpCancelHandle,
         ) -> Result<DirectPcmFormat> {
             self.source
-                .replace_drained_local(source, start_secs, cancel)
+                .replace_drained_local(source, start_secs, stop_secs, cancel)
+        }
+
+        /// v11-3: 武装下一次换源的跨格式旁路（消费一次自动复位），
+        /// 详见 DirectPcmSource::arm_cross_format_replace
+        pub fn arm_cross_format_replace(&self) {
+            self.source.arm_cross_format_replace();
+        }
+
+        /// v11-3: 热重配（不拆连接）：stop → setSinkConfigure → configTransferAuto
+        /// → preroll → play。仅同 wire 位深（32 容器统一后恒为 32）且 Target
+        /// 在线时可行；失败由调用方回退全量重连。
+        /// 实验开关：SPLAYER_DIRECT_HOT_RECONFIG=1 时编排层才走此路径
+        pub fn hot_reconfigure(&self, format: &DirectPcmFormat) -> Result<()> {
+            let bytes_per_second = f64::from(format.sample_rate)
+                * f64::from(format.channels)
+                * f64::from(format.storage_bits / 8);
+            if unsafe {
+                splayer_diretta_pcm_reconfigure(
+                    self.raw.as_ptr(),
+                    format.sample_rate,
+                    format.channels,
+                    format.storage_bits,
+                    bytes_per_second,
+                )
+            } {
+                Ok(())
+            } else {
+                Err(last_error("Diretta hot reconfigure failed"))
+            }
         }
 
         pub fn failed(&self) -> bool {
@@ -473,7 +507,7 @@ mod imp {
 
     impl DirettaDirectDsdConnection {
         pub fn open_local(selector: &str, path: &Path) -> Result<Self> {
-            let (connection, _) = Self::open_local_at(selector, path, 0.0)?;
+            let (connection, _) = Self::open_local_at(selector, path, 0.0, 0.0)?;
             Ok(connection)
         }
 
@@ -481,6 +515,7 @@ mod imp {
             selector: &str,
             path: &Path,
             position_secs: f64,
+            _stop_file_secs: f64,
         ) -> Result<(Self, f64)> {
             let target = selector_target(selector)
                 .ok_or_else(|| anyhow!("invalid Diretta output selector"))?;

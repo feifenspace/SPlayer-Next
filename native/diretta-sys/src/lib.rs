@@ -126,6 +126,15 @@ unsafe extern "C" {
     pub fn splayer_diretta_sink_buffer_us(handle: *mut c_void) -> u64;
     pub fn splayer_diretta_cycle_size(handle: *mut c_void) -> usize;
     pub fn splayer_diretta_mute_byte(handle: *mut c_void) -> u8;
+    // v11-3: 热重配（不拆连接）：stop → setSinkConfigure → configTransferAuto
+    // → preroll → play。位深/字节率以桥内协商 wire 为准，失配返回 false
+    pub fn splayer_diretta_pcm_reconfigure(
+        handle: *mut c_void,
+        sample_rate: u32,
+        channels: u16,
+        storage_bits: u8,
+        bytes_per_second: f64,
+    ) -> bool;
 }
 
 #[cfg(not(diretta_sdk_enabled))]
@@ -204,4 +213,15 @@ pub unsafe fn splayer_diretta_cycle_size(_handle: *mut c_void) -> usize {
 #[cfg(not(diretta_sdk_enabled))]
 pub unsafe fn splayer_diretta_mute_byte(_handle: *mut c_void) -> u8 {
     0
+}
+
+#[cfg(not(diretta_sdk_enabled))]
+pub unsafe fn splayer_diretta_pcm_reconfigure(
+    _handle: *mut c_void,
+    _sample_rate: u32,
+    _channels: u16,
+    _storage_bits: u8,
+    _bytes_per_second: f64,
+) -> bool {
+    false
 }

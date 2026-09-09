@@ -1086,7 +1086,7 @@ impl AudioPlayer {
                 return Ok(false);
             };
             tokio::task::spawn_blocking(move || {
-                handle.stage_local(&source, duration_secs, u64::from(generation))
+                handle.stage_local(&source, None, duration_secs, u64::from(generation))
             })
                 .await
                 .map_err(|error| {

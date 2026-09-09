@@ -52,6 +52,18 @@ void* splayer_diretta_open_dsd_direct(
 
 bool splayer_diretta_play(void* opaque);
 bool splayer_diretta_pause(void* opaque);
+
+/* v11 实验：不拆会话热重配（同族 PCM 采样率变化）。
+ * stop → setSinkConfigure → configTransferAuto（周期随新字节率重算）→ play，
+ * 会话保持；SDK148 未文档化连接中 setSinkConfigure 的外发行为，失败回退
+ * 全量重连。storage_bits 必须与当前连接的线格式存储位深一致。 */
+bool splayer_diretta_pcm_reconfigure(
+    void* opaque,
+    uint32_t sample_rate,
+    uint16_t channels,
+    uint8_t storage_bits,
+    double bytes_per_second
+);
 void splayer_diretta_close(void* opaque);
 
 // ============================================================================

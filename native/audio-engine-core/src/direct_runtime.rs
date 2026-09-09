@@ -221,20 +221,34 @@ pub enum DirectStageHandle {
 
 #[cfg(feature = "diretta")]
 impl DirectStageHandle {
-    pub fn stage_local(&self, source: &str, duration_secs: f64, generation: u64) -> Result<()> {
+    /// `open_path` 为打开用物理路径（在线源 memfd/磁盘缓存物化产物、本地源
+    /// preload memfd），与逻辑 `source` 分离：cue/sacd 解析与 DSD 家族嗅探仍
+    /// 基于 source（物化路径无原始扩展名与虚拟轨信息）；`None` = 按 source
+    /// 解析出的物理路径打开（原行为）
+    pub fn stage_local(
+        &self,
+        source: &str,
+        open_path: Option<&str>,
+        duration_secs: f64,
+        generation: u64,
+    ) -> Result<()> {
         if source.starts_with("http://") || source.starts_with("https://") {
             bail!("[Direct] 当前 gapless staging 仅支持本地 seekable 音源");
         }
-        let (path_str, start, cue_dur) =
+        // stop_secs：CUE 分轨有界播放的虚拟 EOF（文件时间轴 start+轨长）；
+        // 非 CUE 源为 0（自然 EOF 收尾），SACD/DSD 由解码器按轨界自然结束
+        let (path_str, start, cue_dur, stop_secs) =
             if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
+                let dur = if cue.duration > 0.0 {
+                    cue.duration
+                } else {
+                    duration_secs
+                };
                 (
                     cue.physical_path,
                     cue.start_time,
-                    if cue.duration > 0.0 {
-                        cue.duration
-                    } else {
-                        duration_secs
-                    },
+                    dur,
+                    cue.start_time + dur,
                 )
             } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
                 (
@@ -245,10 +259,12 @@ impl DirectStageHandle {
                     } else {
                         duration_secs
                     },
+                    0.0,
                 )
             } else {
-                (source.to_owned(), 0.0, duration_secs)
+                (source.to_owned(), 0.0, duration_secs, 0.0)
             };
+        let open_str = open_path.unwrap_or(&path_str);
         let path = Path::new(&path_str);
         let extension = path
             .extension()
@@ -264,13 +280,13 @@ impl DirectStageHandle {
                 if is_dsd {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
-                value.stage_local(path, start, cue_dur, generation)
+                value.stage_local(Path::new(open_str), start, cue_dur, stop_secs, generation)
             }
             Self::Dsd(value) => {
                 if !is_dsd {
                     bail!("[Direct] Native DSD → PCM 需要重新协商 Diretta connection");
                 }
-                value.stage_local(path, start, cue_dur, generation)
+                value.stage_local(Path::new(open_str), start, cue_dur, generation)
             }
         }
     }
@@ -389,6 +405,38 @@ impl DirectTransport {
             _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
     }
+
+    /// v11-3: 武装下一次换源的跨格式旁路（仅 PCM 传输有意义；
+    /// 消费一次自动复位，常规 handoff 不受影响）
+    #[cfg(any(feature = "diretta", test))]
+    fn arm_cross_format_replace(&self) {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.arm_cross_format_replace(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(_) => {}
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => {}
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// v11-3: 热重配 wire（不拆连接）。仅 PCM 传输支持；
+    /// DSD 家族切换不在实验范围（DSD 位率/位序协商复杂度高，回退全量重连）
+    #[cfg(any(feature = "diretta", test))]
+    fn hot_reconfigure(&self, format: &DirectPcmFormat) -> Result<()> {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.hot_reconfigure(format),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(_) => bail!("[Direct] DSD 传输不支持热重配"),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => Ok(()),
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -449,16 +497,18 @@ impl DirectPlayback {
         if source.starts_with("http://") || source.starts_with("https://") {
             bail!("[Direct] 当前 Direct Lifecycle Gate 仅支持本地 seekable 音源");
         }
-        let (path_str, cue_start, cue_dur) =
+        let (path_str, cue_start, cue_dur, cue_stop) =
             if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
+                let dur = if cue.duration > 0.0 {
+                    cue.duration
+                } else {
+                    duration
+                };
                 (
                     cue.physical_path,
                     cue.start_time,
-                    if cue.duration > 0.0 {
-                        cue.duration
-                    } else {
-                        duration
-                    },
+                    dur,
+                    cue.start_time + dur,
                 )
             } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
                 (
@@ -469,9 +519,10 @@ impl DirectPlayback {
                     } else {
                         duration
                     },
+                    0.0,
                 )
             } else {
-                (source.to_owned(), 0.0, duration)
+                (source.to_owned(), 0.0, duration, 0.0)
             };
         let path = Path::new(&path_str);
         let extension = path
@@ -489,6 +540,7 @@ impl DirectPlayback {
                 selector,
                 path,
                 cue_start + position_secs,
+                0.0,
             )?;
             (
                 DirectTransport::Dsd(connection),
@@ -496,7 +548,12 @@ impl DirectPlayback {
             )
         } else {
             let (connection, actual_position) =
-                DirettaDirectConnection::open_local_at(selector, path, cue_start + position_secs)?;
+                DirettaDirectConnection::open_local_at(
+                    selector,
+                    path,
+                    cue_start + position_secs,
+                    cue_stop,
+                )?;
             (
                 DirectTransport::Pcm(connection),
                 (actual_position - cue_start).max(0.0),
@@ -602,7 +659,7 @@ impl DirectPlayback {
     ) -> Result<Self> {
         let (transport, seek_base) = {
             let (connection, actual_position) =
-                DirettaDirectConnection::open_reader_at(selector, reader, position_secs)?;
+                DirettaDirectConnection::open_reader_at(selector, reader, position_secs, 0.0)?;
             (
                 DirectTransport::Pcm(connection),
                 (actual_position - start_offset_secs).max(0.0),
@@ -643,16 +700,18 @@ impl DirectPlayback {
         duration: f64,
         cancel: crate::ffmpeg_audio::HttpCancelHandle,
     ) -> Result<DirectFormat> {
-        let (path_str, cue_start, cue_dur) =
+        let (path_str, cue_start, cue_dur, cue_stop) =
             if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
+                let dur = if cue.duration > 0.0 {
+                    cue.duration
+                } else {
+                    duration
+                };
                 (
                     cue.physical_path,
                     cue.start_time,
-                    if cue.duration > 0.0 {
-                        cue.duration
-                    } else {
-                        duration
-                    },
+                    dur,
+                    cue.start_time + dur,
                 )
             } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
                 (
@@ -663,9 +722,10 @@ impl DirectPlayback {
                     } else {
                         duration
                     },
+                    0.0,
                 )
             } else {
-                (source.to_owned(), 0.0, duration)
+                (source.to_owned(), 0.0, duration, 0.0)
             };
         let open_str = open_path.unwrap_or(&path_str);
         let path = Path::new(&path_str);
@@ -686,7 +746,8 @@ impl DirectPlayback {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
                 }
                 value.set_duration(cue_dur);
-                let format = value.replace_drained_local_source(open_str, cue_start, cancel)?;
+                let format =
+                    value.replace_drained_local_source(open_str, cue_start, cue_stop, cancel)?;
                 DirectFormat::Pcm(format)
             }
             DirectTransport::Dsd(value) => {
@@ -794,6 +855,19 @@ impl DirectPlayback {
     /// 恢复播放软起：清除静音/排空态（PCM 另做淡入）
     pub fn resume_soft(&self) {
         self.transport.resume_soft()
+    }
+
+    /// v11-3: 武装下一次换源的跨格式旁路（热重配实验专用，消费一次自动复位）
+    #[cfg(any(feature = "diretta", test))]
+    pub fn arm_cross_format_replace(&self) {
+        self.transport.arm_cross_format_replace();
+    }
+
+    /// v11-3: 热重配 wire（不拆连接）：stop → setSinkConfigure →
+    /// configTransferAuto → preroll → play。失败由调用方回退全量重连
+    #[cfg(any(feature = "diretta", test))]
+    pub fn hot_reconfigure(&self, format: &DirectPcmFormat) -> Result<()> {
+        self.transport.hot_reconfigure(format)
     }
 
     /// open 后启动验证：等待首块被设备真正消费。

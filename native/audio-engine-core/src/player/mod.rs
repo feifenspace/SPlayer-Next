@@ -385,6 +385,11 @@ impl InnerPlayer {
                         // 不清除则恢复后所有交付块持续静音（正确性关键）
                         if crate::direct_runtime::direct_soft_pause_enabled() {
                             playback.resume_soft();
+                            debug!(
+                                target: "diretta_handoff",
+                                phase = "soft_resume",
+                                "恢复淡入已提交"
+                            );
                         }
                         playback.play()?;
                     }
@@ -454,9 +459,17 @@ impl InnerPlayer {
                 // 锁内短阻塞 ≤150ms：pause worker 运行在隔离阻塞线程，可接受；
                 // 超时则退化为改动前的硬停（安全兜底）
                 if crate::direct_runtime::direct_soft_pause_enabled() {
-                    let _ = playback.begin_soft_pause_and_wait(std::time::Duration::from_millis(
+                    let soft_begin = std::time::Instant::now();
+                    let soft_ok = playback.begin_soft_pause_and_wait(std::time::Duration::from_millis(
                         150,
                     ));
+                    debug!(
+                        target: "diretta_handoff",
+                        phase = "soft_pause",
+                        ok = soft_ok,
+                        elapsed_ms = soft_begin.elapsed().as_millis() as u64,
+                        "软暂停等待结束（ok=true=已到零电平并交付静音块）"
+                    );
                 }
                 playback.pause()?;
             }

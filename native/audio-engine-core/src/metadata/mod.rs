@@ -141,14 +141,19 @@ pub fn extract_file_tags(path: &str, reader: &AudioReader) -> Tags {
     }
 
     // 3. 【标签兜底与文件名/目录层级推断】（借鉴 tinyLMS-old 经验）
-    if title.is_none() {
-        title = clean_title_from_filename(path);
-    }
-    if artist.is_none() {
-        artist = infer_artist_from_path(path);
-    }
-    if album.is_none() {
-        album = infer_album_from_path(path);
+    // 物化产物（memfd /proc/*/fd/N、流缓存 {md5}.{ext}）跳过目录推断：其
+    // 路径不承载任何曲目信息，推断结果只会是 "self"/"fd"、哈希名之类的
+    // 垃圾（在线源无内嵌标签时保持 None，由前端以平台元数据覆盖）
+    if !is_materialized_artifact_path(path) {
+        if title.is_none() {
+            title = clean_title_from_filename(path);
+        }
+        if artist.is_none() {
+            artist = infer_artist_from_path(path);
+        }
+        if album.is_none() {
+            album = infer_album_from_path(path);
+        }
     }
 
     Tags {
@@ -158,6 +163,20 @@ pub fn extract_file_tags(path: &str, reader: &AudioReader) -> Tags {
         track,
         comment,
     }
+}
+
+/// 物化产物路径判定：下载/物化中间产物的路径派生标签必然是垃圾，
+/// 目录推断只对真实库文件有意义
+fn is_materialized_artifact_path(path: &str) -> bool {
+    // memfd 匿名内存文件：/proc/<pid>/fd/N（含 /proc/self/fd/N）
+    if path.starts_with("/proc/") {
+        return true;
+    }
+    // 流缓存磁盘回退产物：文件名为 32 位十六进制 MD5（{md5}.{ext}）
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// 清洗和修复标签字符串（检测并丢弃 \u{FFFD} 坏字符，修复以 Latin-1 存储的 GBK/GB18030）

@@ -624,6 +624,18 @@ impl InnerPlayer {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("[Direct] handoff 前缺少 load 取消句柄"))?;
         let format = playback.handoff_drained_source(source, open_path, duration, cancel)?;
+        // 手动 handoff 新源淡入：换源提交前已交付排空静音（设备端处于零电平），
+        // 新源首采样非零时从静音一步阶跃到全幅会在 DAC 端产生咔哒声；10ms
+        // raised-cosine 淡入消除该阶跃。PCM=begin_fade_in(0→1)；DSD=clear_drain
+        // （复位排空态，无增益通道）。staged 自动切歌不经此函数（无静音间隙，
+        // 连续波形换源无需淡入），与实测"自动切歌无杂音"一致
+        playback.resume_soft();
+        debug!(
+            target: "diretta_handoff",
+            phase = "handoff_fade_in",
+            source = %source,
+            "handoff 新源淡入已提交"
+        );
         self.current_source = Some(source.to_owned());
         self.audio_duration = if duration > 0.0 {
             duration
@@ -633,14 +645,225 @@ impl InnerPlayer {
         // staged gapless boundary 同款处理：旧封面不再属于当前 source
         self.cover_raw = None;
         self.fft.reset();
-        if auto_play && self.state != PlayerState::Playing {
+        if auto_play {
+            // 曲终后引擎侧 state 仍停留在 Playing（Ended/StateChanged 只更新服务端
+            // 快照，不回写 Transition），但位置定时器线程已随 Ended break 死亡。
+            // 旧守卫 `state != Playing` 会跳过 play/定时器重启，导致：
+            // ① 服务端快照冻结在曲终值（position=上一曲 EOF、state=Stopped、
+            //    is_finished=true），UI 位置不动；
+            // ② 看门狗 still_ended 判定恒为真 → 曲终接力按队列快照逐次级联跳曲
+            //    （表现为手动切歌后曲目自己接连跳到下一曲/下下曲）。
+            // 因此 play、状态翻转与定时器重启必须无条件执行（play 对活跃
+            // session 幂等；start_position_timer 内部先 stop 旧的，幂等）。
+            let resumed_position = playback.position();
+            let resumed_finished = playback.finished();
             playback.play()?;
             self.state = PlayerState::Playing;
             self.emit(PlayerEvent::StateChanged {
                 state: PlayerState::Playing,
             });
             self.start_position_timer();
+            debug!(
+                target: "diretta_handoff",
+                phase = "handoff_commit_state",
+                position_secs = %resumed_position,
+                finished = %resumed_finished,
+                "handoff 提交后播放与位置监视已恢复"
+            );
         }
         Ok(Some(format))
+    }
+
+    /// v11-3 热重配提交：不拆 Diretta 连接，跨采样率手动切歌在既有 Sync
+    /// 会话上完成。顺序（消除新旧速率数据/wire 失配窗口）：
+    /// ① FFI 热重配 wire 到目标格式（stop → setSinkConfigure →
+    ///    configTransferAuto → preroll 静音武装 → play，DAC 重锁相由
+    ///    preroll 覆盖）；此刻 SDK 从旧（已排空）环拉静音，无失配风险
+    /// ② armed 旁路 + producer 块边界原子换新格式源
+    /// ③ 解码格式与目标格式校验（容器/CUE 等场景 metadata 可能失真）
+    /// ④ 新源淡入（与 handoff 同语义：raised-cosine 消除零电平阶跃）
+    ///
+    /// 失败语义：①失败连接保持原格式（完美回退）；②③失败可能已换源/
+    /// 重配——调用方回退全量重连本就会按新格式重开，无需回滚
+    #[cfg(any(feature = "diretta", test))]
+    pub fn commit_direct_hot_reconfigure(
+        &mut self,
+        token: u64,
+        source: &str,
+        open_path: Option<&str>,
+        duration: f64,
+        auto_play: bool,
+        wire_format_hint: &crate::direct_pcm::DirectPcmFormat,
+    ) -> Result<Option<DirectFormat>> {
+        if token != self.load_token.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let playback = self
+            .direct_playback
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("[Direct] 无活跃 Direct 连接可热重配"))?;
+        let cancel = self
+            .pending_load_handle
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("[Direct] 热重配前缺少 load 取消句柄"))?;
+        // ① 先重配 wire（bridge 内部 stop → set → cycle → preroll → play）
+        if let Err(error) = playback.hot_reconfigure(wire_format_hint) {
+            tracing::error!(
+                target: "diretta_handoff",
+                phase = "hot_reconfigure_failed",
+                error = %error,
+                "热重配失败，连接保持原格式，回退全量重连"
+            );
+            return Err(error);
+        }
+        // ② armed 旁路换源（SDK 此刻从旧环拉排空静音，块边界原子换新源）
+        playback.arm_cross_format_replace();
+        let format = playback.handoff_drained_source(source, open_path, duration, cancel)?;
+        let DirectFormat::Pcm(pcm_format) = &format else {
+            anyhow::bail!("[Direct] 热重配不支持 DSD 家族");
+        };
+        // ③ 解码格式校验：与 wire 重配目标不一致时立即停发（防止新速率数据
+        // 流入错误速率 wire），回退全量重连
+        if pcm_format.sample_rate != wire_format_hint.sample_rate
+            || pcm_format.channels != wire_format_hint.channels
+        {
+            let _ = playback.pause();
+            anyhow::bail!(
+                "[Direct] 实际解码格式（{}Hz/{}ch）与热重配目标（{}Hz/{}ch）不一致，回退全量重连",
+                pcm_format.sample_rate,
+                pcm_format.channels,
+                wire_format_hint.sample_rate,
+                wire_format_hint.channels
+            );
+        }
+        // ④ 新源淡入 + 状态簿记（与 commit_direct_handoff 完全同构）
+        playback.resume_soft();
+        tracing::info!(
+            target: "diretta_handoff",
+            phase = "hot_reconfigure_commit",
+            source = %source,
+            sample_rate = %pcm_format.sample_rate,
+            "热重配提交成功，Diretta 连接未拆除"
+        );
+        self.current_source = Some(source.to_owned());
+        self.audio_duration = if duration > 0.0 {
+            duration
+        } else {
+            playback.duration()
+        };
+        self.cover_raw = None;
+        self.fft.reset();
+        if auto_play {
+            let resumed_position = playback.position();
+            playback.play()?;
+            self.state = PlayerState::Playing;
+            self.emit(PlayerEvent::StateChanged {
+                state: PlayerState::Playing,
+            });
+            self.start_position_timer();
+            tracing::debug!(
+                target: "diretta_handoff",
+                phase = "hot_reconfigure_state",
+                position_secs = %resumed_position,
+                "热重配后播放与位置监视已恢复"
+            );
+        }
+        Ok(Some(format))
+    }
+
+    /// v11-3 热重配编排入口：仅 SPLAYER_DIRECT_HOT_RECONFIG=1 且 PCM→PCM
+    /// （同声道、采样率可不同）时尝试；其余一律 Err 回退常规路径。
+    /// 由 player.rs 在 handoff 预检失败后、全量重连前调用
+    #[cfg(any(feature = "diretta", test))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_direct_hot_reconfigure(
+        player: &Mutex<InnerPlayer>,
+        token: u64,
+        source: &str,
+        open_path: Option<&str>,
+        duration_secs: f64,
+        auto_play: bool,
+        current_format: DirectFormat,
+        metadata: &AudioMetadata,
+        is_dsd: bool,
+    ) -> Result<Option<DirectFormat>> {
+        // 实验开关默认关闭：行为与 v10 完全一致
+        let hot_enabled = std::env::var("SPLAYER_DIRECT_HOT_RECONFIG")
+            .map(|value| value != "0")
+            .unwrap_or(false);
+        anyhow::ensure!(
+            hot_enabled,
+            "[Direct] 热重配实验开关未开启（SPLAYER_DIRECT_HOT_RECONFIG）"
+        );
+        // 家族限制：PCM → PCM 且声道一致（位深已由 32-bit 容器归一化统一）；
+        // 采样率不同正是本实验目标场景
+        let DirectFormat::Pcm(cur) = current_format else {
+            anyhow::bail!("[Direct] 热重配仅支持 PCM 家族");
+        };
+        anyhow::ensure!(
+            !is_dsd,
+            "[Direct] 热重配不支持 PCM → Native DSD"
+        );
+        anyhow::ensure!(
+            metadata.channels == 0 || cur.channels == metadata.channels,
+            "[Direct] 热重配声道数不一致（{} → {}）",
+            cur.channels,
+            metadata.channels
+        );
+        tracing::info!(
+            target: "diretta_handoff",
+            phase = "hot_reconfigure_attempt",
+            old_rate = %cur.sample_rate,
+            new_rate = %metadata.original_sample_rate,
+            "尝试热重配（不拆连接跨采样率切换）"
+        );
+        // wire 重配目标：采样率必须已知（stream 模式 metadata 占位 0 时不支持，
+        // 回退全量重连）；位深恒为 32 容器（v11-1 归一化）
+        anyhow::ensure!(
+            metadata.original_sample_rate > 0,
+            "[Direct] 热重配需要已知目标采样率（stream 占位 0 不支持）"
+        );
+        let wire_format_hint = crate::direct_pcm::DirectPcmFormat {
+            sample_rate: metadata.original_sample_rate,
+            channels: if metadata.channels > 0 {
+                metadata.channels
+            } else {
+                cur.channels
+            },
+            valid_bits: 32,
+            storage_bits: 32,
+            sample_format: crate::direct_pcm::DirectPcmSampleFormat::Signed32,
+            memory_path: crate::direct_pcm::DirectPcmMemoryPath::ZeroCopyPacked,
+        };
+
+        // 1) 源级淡出 + 排空（与 try_direct_handoff 步骤 1-2 同构）
+        let drain = {
+            let mut player = player.lock();
+            let _ = player.begin_direct_fade_out();
+            player.direct_drain_handle()
+        };
+        if let Some(monitor) = &drain {
+            if !monitor.wait_fade_drained(
+                crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                std::time::Duration::from_micros(monitor.drain_target_micros())
+                    + crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
+            ) {
+                tracing::warn!(
+                    target: "diretta_handoff",
+                    phase = "hot_reconfigure_fade_drain_timeout",
+                    "热重配前排空等待超时，仍尝试提交"
+                );
+            }
+        }
+        // 2) 提交：FFI 重配 → armed 换源 → 校验 → 淡入
+        let mut player = player.lock();
+        player.commit_direct_hot_reconfigure(
+            token,
+            source,
+            open_path,
+            duration_secs,
+            auto_play,
+            &wire_format_hint,
+        )
     }
 }

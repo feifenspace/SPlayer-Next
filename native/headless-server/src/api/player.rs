@@ -15,7 +15,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::direct::{
-    direct_load_response, materialize_direct_input, online_source_mode, DirectInput,
+    direct_load_response, materialize_direct_input, materialize_local_to_ram, online_source_mode,
+    DirectInput,
 };
 use super::PlayerResponse;
 use crate::error::ApiError;
@@ -474,6 +475,14 @@ pub(crate) async fn load_handler(
     let auto_play = payload.auto_play.unwrap_or(true);
     let source = payload.source;
 
+    // 手动/遥控加载即接管播放：作废可能残留的曲终自动接力标志（上一曲 Ended
+    // 置位、当时无候选被看门狗重新武装）。否则新曲若走 handoff 提交（服务端
+    // 快照要等首个位置事件才离开曲终态），看门狗 still_ended 判定会在注册
+    // 候选出现后触发接力，按队列快照级联跳曲（表现为切歌后曲目自己连跳）
+    state
+        .auto_advance_requested
+        .store(false, std::sync::atomic::Ordering::Release);
+
     // 若为后台冷启动恢复请求（auto_play: false），且当前播放器已处于活跃播放或暂停状态，直接返回现有状态，不打断后台音频流
     if !auto_play {
         let snap = state.snapshot();
@@ -568,17 +577,40 @@ fn probe_direct_source(
     let is_http =
         source_for_direct.starts_with("http://") || source_for_direct.starts_with("https://");
     // B6.2 DoP：dsd_transport=dop 时 DSD 源整曲转 DoP WAV 进 RAM，
-    // 经 PCM Direct 播放（绕开 SDK 原生 DSD 通道）；否则 DSD 走原生直通
+    // 经 PCM Direct 播放（绕开 SDK 原生 DSD 通道）；否则 DSD 走原生直通。
+    // DoP 产物保持 RamTrackBuffer（mlock）通道，full_reconnect 经
+    // open_reader_verified 消费——DSD 家族从不 handoff，无需 memfd 路径语义
     let ram = if use_dop && !is_http {
         Some(audio_engine_core::dsd::dop_wav::convert_dsd_to_dop_ram(
             source_for_direct,
             ram_max_bytes,
         )?)
-    } else if ram_preload && !is_http && !is_dsd {
-        materialize_ram_buffer(source_for_direct, ram_max_bytes)?
     } else {
         None
     };
+    // L2 纯内存（本地 PCM preload）：整曲物化进 memfd 纯内存缓存，probe /
+    // handoff / full_reconnect 统一从 RAM 打开（此前 RamTrackBuffer 方案仅
+    // full_reconnect 消费，handoff 成功时整曲物化被浪费并双读 NAS）。CUE
+    // 管道源必须先剥离出物理母版再物化——此前把管道串直传 File::open 必然
+    // ENOENT（ram_preload 开启时 CUE 轨加载直接 500，已实测复现）；超上限
+    // /物化失败回退路径模式。设备无 swap，memfd 页面即常驻 RAM
+    let mut local_preload: Option<DirectInput> = None;
+    if ram.is_none() && !is_http && !is_dsd && ram_preload {
+        let preload_physical = audio_engine_core::cue::parse_cue_virtual_path(source_for_direct)
+            .map(|cue| cue.physical_path)
+            .unwrap_or_else(|| source_for_direct.to_owned());
+        local_preload = materialize_local_to_ram(&preload_physical, ram_max_bytes as u64, || {
+            load_token.load(std::sync::atomic::Ordering::Acquire) != token
+        })
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                source = %source_for_direct,
+                %error,
+                "本地源 memfd 物化失败，回退路径模式"
+            );
+            None
+        });
+    }
     let physical_source = if stream_mode {
         None
     } else if is_http {
@@ -590,14 +622,23 @@ fn probe_direct_source(
             download_cancel,
             abort_download,
         )?)
-    } else if ram.is_none() {
-        Some(DirectInput::Path(source_for_direct.to_owned()))
+    } else if let Some(input) = local_preload {
+        Some(input)
     } else {
         Some(DirectInput::Path(source_for_direct.to_owned()))
     };
     let metadata = match physical_source.as_ref().map(DirectInput::path) {
         Some(path) => {
-            let meta = audio_engine_core::decoder::probe_metadata(path, cover_dir, handle.clone())?;
+            // 探测路径：本地源（含 CUE/SACD 管道）一律从原始 source 探测——
+            // 轨级元数据、路径派生的艺术家/专辑标签与目录封面均依赖真实路径，
+            // 从 /proc/self/fd/N 探测会产生垃圾标签（已实测）；memfd 仅用于
+            // 播放期打开。在线源维持从物化产物探测（原行为）
+            let probe_path = if is_http {
+                path
+            } else {
+                source_for_direct
+            };
+            let meta = audio_engine_core::decoder::probe_metadata(probe_path, cover_dir, handle.clone())?;
             if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
                 anyhow::bail!(LoadSuperseded);
             }
@@ -663,6 +704,43 @@ fn try_handoff_to_new_source(
             if err.is::<LoadSuperseded>() {
                 return Err(err);
             }
+            // v11-3: 热重配实验分支——handoff 预检失败（典型为跨采样率）时，
+            // 先尝试不拆连接的热重配；失败/未开开关再回退全量重连。
+            // 排空语义与 handoff 一致（try_direct_hot_reconfigure 内部自处理）
+            match audio_engine_core::InnerPlayer::try_direct_hot_reconfigure(
+                &state.player,
+                token,
+                source_for_direct,
+                open_path,
+                metadata.duration_secs,
+                auto_play,
+                current_format,
+                metadata,
+                is_dsd,
+            ) {
+                Ok(Some(format)) => {
+                    fold_direct_format_into(metadata, format);
+                    tracing::info!(
+                        target: "diretta_handoff",
+                        phase = "load_hot_reconfigure_ok",
+                        source = %source_for_direct,
+                        "热重配提交成功，Diretta 连接已复用"
+                    );
+                    return Ok(true);
+                }
+                Ok(None) => anyhow::bail!(LoadSuperseded),
+                Err(hot_err) => {
+                    if hot_err.is::<LoadSuperseded>() {
+                        return Err(hot_err);
+                    }
+                    tracing::debug!(
+                        target: "diretta_handoff",
+                        phase = "load_hot_reconfigure_skip",
+                        error = %hot_err,
+                        "热重配不可用，回退全量重连"
+                    );
+                }
+            }
             tracing::warn!(
                 target: "diretta_handoff",
                 phase = "load_handoff_fallback",
@@ -718,7 +796,11 @@ fn full_reconnect_load(
                     );
                 }
             }
-            // 校验 + 拆连接必须同一把锁内完成，防止与更新的 load 竞态抢跑
+            // 校验 + 拆连接必须同一把锁内完成，防止与更新的 load 竞态抢跑。
+            // 【防爆音决策】此处不做 pause/sync->stop 软停止：真机 A/B 实测
+            // sync->stop 本身产生低频咚声（暂停路径同源），而直接从"静音垫
+            // 交付中"disconnect（与 stop 路径同序列）无咚——咚源在新会话
+            // 建立（setSink playback-rejection 门控），见 bridge setSink 注释
             let (threads, token) = {
                 let mut player = state.player.lock();
                 if !player.is_load_token_current(token) {
@@ -739,6 +821,8 @@ fn full_reconnect_load(
         std::thread::sleep(DIRECT_FULL_RECONNECT_STABILIZATION);
     }
 
+    let is_http_source =
+        source_for_direct.starts_with("http://") || source_for_direct.starts_with("https://");
     let playback = if stream_mode {
         let http = audio_engine_core::ffmpeg_audio::HttpAudioSource::new_with_cancel_handle(
             source_for_direct,
@@ -761,6 +845,38 @@ fn full_reconnect_load(
             selector,
             source_for_direct,
             Box::new(ram),
+            metadata.duration_secs,
+            start_offset,
+            auto_play,
+            load_token,
+            token,
+        )?
+    } else if !is_http_source
+        && matches!(
+            physical_source.as_ref(),
+            Some(DirectInput::Memfd { .. })
+        )
+    {
+        // 本地 memfd 物化：经路径重新打开（全新 fd，读位置从 0 开始；try_clone
+        // 会与物化写侧共享 file offset——写完停在 EOF，FFmpeg 首读即空报
+        // Invalid data，已实测复现）+ Reader 打开（播放期零 CIFS IO）。
+        // 不走 open_verified_local——它从路径参数解析虚拟轨信息，memfd 路径
+        // 无 CUE 管道后缀会丢失轨起点；Reader 通道显式传轨内偏移，轨级时长
+        // （probe 已按 CUE 折算）经 set_duration 驱动虚拟 EOF（与 DoP 通道
+        // 同机制）。在线 memfd 仍走 open_verified_local（无虚拟轨，原行为）
+        let fd_path = match physical_source.as_ref().expect("分支已匹配 Memfd") {
+            DirectInput::Memfd { path, .. } => path.clone(),
+            _ => unreachable!("matches! 已收窄"),
+        };
+        let file = std::fs::File::open(&fd_path)
+            .with_context(|| format!("重开 memfd 物化产物失败: {fd_path}"))?;
+        let start_offset = audio_engine_core::cue::parse_cue_virtual_path(source_for_direct)
+            .map(|cue| cue.start_time)
+            .unwrap_or(0.0);
+        audio_engine_core::direct_runtime::DirectPlayback::open_reader_verified(
+            selector,
+            source_for_direct,
+            Box::new(file),
             metadata.duration_secs,
             start_offset,
             auto_play,
@@ -845,18 +961,17 @@ async fn run_direct_load(
             token,
         )?;
 
-        // handoff 打开用物化路径：preload 物化产物（memfd/磁盘缓存）本地
-        // seekable，避免 handoff 阶段绕过缓存重开网络流（整曲双下载，且
-        // preload 的抗网络抖动语义失效）。仅 HTTP 换源传入——本地 CUE/SACD
-        // 的 source 是含虚拟轨信息的串，cue/sacd 解析必须留在引擎内基于
-        // source 进行；stream 模式无物化（None），按 URL 流式打开（原行为）
-        let handoff_open_path = if is_http {
-            physical_source
-                .as_ref()
-                .map(|input| input.path().to_owned())
-        } else {
-            None
-        };
+        // handoff 打开用物化路径：preload 物化产物（在线源 memfd/磁盘缓存、
+        // 本地源 memfd）本地 seekable，handoff 阶段直接从物化产物打开——
+        // 在线源避免绕过缓存重开网络流（整曲双下载），本地源消除换源期
+        // CIFS 重读（此前 ram_source 物化在 handoff 成功时被整个浪费）。
+        // 规则：物化产物路径 ≠ 逻辑 source 时传入；本地未物化（Path(source)）
+        // 不传——cue/sacd 解析必须留在引擎内基于 source 进行（物化路径无
+        // 虚拟轨信息）；stream 模式无物化（None），按 URL 流式打开（原行为）
+        let handoff_open_path = physical_source
+            .as_ref()
+            .filter(|input| input.path() != source_for_direct)
+            .map(|input| input.path().to_owned());
 
         if direct_active {
             let current_format =

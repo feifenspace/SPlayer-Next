@@ -40,6 +40,11 @@ struct StagedNext {
 
 static STAGED_NEXT: Mutex<Option<StagedNext>> = Mutex::new(None);
 
+/// 最近一次已完成簿记提交的边界代际。边界事件可能重复投递（引擎/回调层
+/// 竞态），小于等于该值的再次投递属于已提交代际的重复边界，直接忽略——
+/// 此前每次重复都会打"generation 不匹配"WARN，实测功能无损、纯日志噪音
+static LAST_COMMITTED_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// 使在途/已就绪的预载作废：load 提交、stop、新一轮调度前调用
 pub(crate) fn invalidate() {
     PRELOAD_TOKEN.fetch_add(1, Ordering::AcqRel);
@@ -96,6 +101,13 @@ pub(crate) fn schedule_next_preload(state: &AppState) {
 /// boundary 自治消费（看门狗线程调用）：无缝边界已发生，
 /// 提交引擎簿记 + 队列推进 + 立即为再下一曲调度预载
 pub(crate) fn consume_boundary(state: &AppState, generation: u64) {
+    // 重复边界闸门：簿记按代际单调提交，已提交代际的重复投递（引擎事件
+    // 竞态导致）直接忽略，降级 debug
+    let committed = LAST_COMMITTED_GENERATION.load(Ordering::Acquire);
+    if generation != 0 && generation <= committed {
+        debug!(generation, committed, "忽略已提交代际的重复无缝边界");
+        return;
+    }
     let staged = STAGED_NEXT.lock().take();
     let Some(staged) = staged else {
         // 孤儿 boundary 兜底：stage 已被引擎接受，worker 登记前被 invalidate
@@ -129,11 +141,22 @@ pub(crate) fn consume_boundary(state: &AppState, generation: u64) {
         return;
     };
     if staged.generation != generation {
-        // 迟到的旧 boundary（stage 已被新一轮预载取代）：忽略
+        if staged.generation > generation {
+            // 迟到的旧边界：新 stage 已取代旧 stage（预载被重新调度），被取代
+            // 舞台的边界无需簿记；队列游标由下一个真实边界的 align_by_source
+            // 自愈，功能无损 → 降级 debug（此前一律 WARN，属日志噪音）
+            debug!(
+                expected = staged.generation,
+                actual = generation,
+                "迟到的无缝边界属于已被取代的预载，忽略"
+            );
+            return;
+        }
+        // generation 超前于已登记 stage：真实异常（不应出现），保留 WARN
         warn!(
             expected = staged.generation,
             actual = generation,
-            "无缝边界 generation 不匹配，忽略（队列权威不变）"
+            "无缝边界 generation 超前于已登记 stage，簿记跳过"
         );
         return;
     }
@@ -155,6 +178,7 @@ fn commit_boundary_bookkeeping(
             return;
         }
     }
+    LAST_COMMITTED_GENERATION.store(generation, Ordering::Release);
 
     // 队列游标推进：按 staged source 对齐（队列被前端重排后自愈）
     {
@@ -412,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn shuffle_preserves_membership_and_index_alignment() {
+    fn shuffle_preserves_membership_and_current_first_alignment() {
         let q = QueueSnapshot::new(
             vec![item("/a"), item("/b"), item("/c"), item("/d")],
             2,
@@ -426,7 +450,47 @@ mod tests {
             .collect();
         sources.sort_unstable();
         assert_eq!(sources, vec!["/a", "/b", "/c", "/d"]);
-        // 当前播放条目（index=2 → "/c"）必须对齐到 pos
-        assert_eq!(q.items[q.order[q.pos]].source, "/c");
+        // 洗牌物化：当前播放条目（index=2 → "/c"）固定在 order 首位，pos=0
+        assert_eq!(q.items[q.order[0]].source, "/c");
+        assert_eq!(q.pos, 0);
+        // repeat=off：从当前曲起其余曲目全部可播到（此前排列中段截断会跳曲）
+        let mut played = vec!["/c".to_string()];
+        let mut cursor = q.clone();
+        while let Some((source, _pos)) = cursor.next().map(|(_p, it)| (it.source.clone(), _p)) {
+            played.push(source.clone());
+            cursor.align_by_source(Some(&source));
+        }
+        let mut seen = played.clone();
+        seen.sort();
+        assert_eq!(seen, vec!["/a", "/b", "/c", "/d"]);
+        // 推进顺序确定性（同输入同排列）
+        let q2 = QueueSnapshot::new(
+            vec![item("/a"), item("/b"), item("/c"), item("/d")],
+            2,
+            QueueRepeat::Off,
+            true,
+        );
+        let order2: Vec<usize> = q2.order.clone();
+        assert_eq!(order2, q.order);
+        // repeat=all：推进一整圈后回绕，周期确定性（回绕头 = order[0] 当前曲）
+        let mut qc = QueueSnapshot::new(
+            vec![item("/a"), item("/b"), item("/c"), item("/d")],
+            2,
+            QueueRepeat::All,
+            true,
+        );
+        let mut cycle: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            let (source, _pos) = qc
+                .next()
+                .map(|(_p, it)| (it.source.clone(), _p))
+                .expect("repeat=all 永有下一曲");
+            qc.align_by_source(Some(&source));
+            cycle.push(source);
+        }
+        // 一圈恰好回绕：第 5 次推进与第 1 次相同（确定性周期）
+        let wrap_head = qc.next().map(|(_p, it)| it.source.clone()).unwrap();
+        assert_eq!(wrap_head, cycle[0]);
+        assert_eq!(cycle[3], "/c"); // 圈尾即当前曲（order[0]）
     }
 }

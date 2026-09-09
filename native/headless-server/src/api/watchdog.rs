@@ -14,7 +14,7 @@ use axum::{
 use super::player::{
     load_handler, seek_handler, stop_handler, LoadMeta, LoadQuery, LoadRequest, SeekRequest,
 };
-use crate::state::{AppState, PendingNext, QueueSnapshot};
+use crate::state::{AppState, PendingNext, QueueRepeat, QueueSnapshot};
 
 /// 候选接力 load 的 meta：仅携带时长提示（秒 → 毫秒）。stream 模式在线源
 /// 无法廉价探测时长，接力加载丢失提示会让 duration 归零（进度条/曲终判定退化）
@@ -69,6 +69,20 @@ fn auto_advance_candidate(
         Some(mut snapshot) => {
             // 队列权威：注册后旧接力候选一律不参与（含队尾/repeat=one 的无候选）
             snapshot.align_by_source(current_source);
+            // repeat=one：以既有接力重播当前曲（不做无缝预载）。此前返回 None
+            // 会在浏览器离场时曲终停播（服务端自治缺口）——现在遥控器不在场
+            // 也能正确单曲循环；浏览器在场时其 seek(0)+play 兜底先到先得，
+            // 看门狗发现状态已离开曲终即自动放弃，两者不冲突
+            if snapshot.repeat == QueueRepeat::One {
+                let item = snapshot.current()?;
+                if !super::player::is_loadable_candidate_source(&item.source) {
+                    return None;
+                }
+                return Some(PendingNext {
+                    source: item.source.clone(),
+                    duration_hint: item.duration_ms.map(|ms| ms as f64 / 1000.0),
+                });
+            }
             let (_next_pos, item) = snapshot.next()?;
             if !super::player::is_loadable_candidate_source(&item.source) {
                 return None;
@@ -475,11 +489,13 @@ mod tests {
     }
 
     #[test]
-    fn repeat_one_yields_none() {
+    fn repeat_one_replays_current_track_for_server_autonomy() {
+        // repeat=one：接力候选 = 当前曲自身（浏览器离场时服务端自治重播；
+        // 在场时前端 seek(0)+play 先到先得，看门狗检测到状态离开曲终即放弃）
         let mut q = queue_of(&["/a", "/b"]);
         q.repeat = QueueRepeat::One;
         let got = auto_advance_candidate(Some(q), Some("/a"), None);
-        assert!(got.is_none());
+        assert_eq!(got.unwrap().source, "/a");
     }
 
     #[test]
