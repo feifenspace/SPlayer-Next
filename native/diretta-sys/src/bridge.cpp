@@ -76,7 +76,18 @@ class DirectSync final : public DIRETTA::Sync {
     const long long bytes = static_cast<long long>(
       (static_cast<double>(ms) / 1000.0) * bytes_per_second);
     if (bytes <= 0) return;
+    // 复审加固：在控制线程预reserve静音缓冲——上限 = 最大信息包周期
+    //（compute_cycle_time_us 钳制 10ms）的字节数 + 冗余。回调内的
+    // assign(cycle) 在容量充足时仅填充不复分配，RT 线程零堆分配
+    preroll_silence_.reserve(
+      static_cast<std::size_t>(bytes_per_second * 0.011) + 64);
     preroll_remaining_bytes_.store(bytes, std::memory_order_release);
+  }
+
+  // 复审加固：S16 wire 回退时在控制线程预留降位缓冲（入参为输入 i32 块
+  // 字节上限，输出 i16 减半），保证回调内 assign 不触发堆分配
+  void reserve_wire_convert(std::size_t input_bytes) {
+    wire_convert_buf_.reserve(input_bytes / 2 + 64);
   }
 
   void releaseSourceBlock() {
@@ -601,6 +612,9 @@ void* splayer_diretta_open_direct(
       s16_bytes_per_second));
     if (connection != nullptr) {
       connection->sync->wire_storage_bits = 16;
+      // 复审加固：预留降位缓冲（64KB 输入 ≈ 16K 样本，覆盖常规解码帧上限），
+      // 避免回调内首次/偶发大块触发堆分配
+      connection->sync->reserve_wire_convert(64 * 1024);
       std::fprintf(stderr, "[diretta-v11] PCM16 wire fallback engaged\n");
       std::fflush(stderr);
     }
@@ -812,6 +826,10 @@ bool splayer_diretta_pcm_reconfigure(
       return false;
     }
     connection->sync->stop();
+    // 复审加固：stop 可能留下未归还的 in-flight 块租约（与 shutdown 同模式
+    // 显式归还）。Rust 侧 release_in_flight 以 swap(NO_SLOT) 实现幂等安全；
+    // 随后 armed 换源的 reset_for_transition 亦会兜底清理
+    connection->sync->releaseSourceBlock();
     if (!connection->sync->setSinkConfigure(format)) {
       set_error("failed to setSinkConfigure for hot reconfigure");
       return false;
