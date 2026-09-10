@@ -662,7 +662,7 @@ async fn call_tidal(
         client_secret,
     );
 
-    match name {
+    let response = match name {
         "auth_authorize" | "authorize" => to_streaming_resp(client.auth_authorize(&params).await),
         "auth_exchange" | "exchange" => match client.auth_exchange(&params).await {
             Ok(resp) => {
@@ -755,7 +755,22 @@ async fn call_tidal(
             to_streaming_resp(client.user_get_favorites(&params).await)
         }
         other => ApiCallResponse::err(format!("Unsupported TIDAL API: {}", other)),
+    };
+
+    // 401 自动刷新产生的新 token 回写 DB：Tidal 刷新令牌会轮转，不落盘
+    // 则下次调用仍从 DB 读到过期 token，自动刷新永远白刷
+    if let Some((new_access, new_refresh)) = client.take_refreshed_tokens() {
+        let mut new_cookies = load_platform_cookies(db, "tidal");
+        new_cookies.insert("access_token".to_string(), new_access);
+        if let Some(rtok) = new_refresh {
+            new_cookies.insert("refresh_token".to_string(), rtok);
+        }
+        let conn = db.lock();
+        let _ = crate::db::save_account_cookies(&conn, "tidal", &new_cookies);
+        tracing::info!("TIDAL access_token 已自动刷新并持久化");
     }
+
+    response
 }
 
 // -------------------------------------------------------------------

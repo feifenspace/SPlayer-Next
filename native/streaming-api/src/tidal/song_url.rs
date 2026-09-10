@@ -42,6 +42,10 @@ impl TidalClient {
 
         let qualities = tidal_quality_for_level(level_str);
 
+        // 保留最后一次真实错误：全部音质失败时透传原始原因（含 subStatus，
+        // 如 5003=订阅等级不允许），取代旧的笼统 403 文案
+        let mut last_error: Option<StreamingError> = None;
+
         for &quality in qualities {
             let mut req_params = HashMap::new();
             req_params.insert("audioquality".to_string(), quality.to_string());
@@ -103,15 +107,16 @@ impl TidalClient {
                         }
                     }
                 }
-                Err(_) => {
-                    // 降级尝试下一个音质
+                Err(error) => {
+                    // 降级尝试下一个音质，保留原始错误供全部失败后透传
+                    last_error = Some(error);
                 }
             }
         }
 
-        Err(StreamingError::Api {
+        Err(last_error.unwrap_or(StreamingError::Api {
             status: 403,
-            message: "Unable to obtain stream URL from TIDAL, track may be unavailable or subscription expired".into(),
-        })
+            message: "Unable to obtain stream URL from TIDAL".into(),
+        }))
     }
 }
