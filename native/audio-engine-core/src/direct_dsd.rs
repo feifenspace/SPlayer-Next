@@ -346,11 +346,12 @@ impl DirectDsdReader {
             block_size > 0 && block_size % 4 == 0,
             "DSF block size 必须为 4 字节倍数"
         );
-        ensure!(
-            sample_count % 32 == 0,
-            "DSF sample count 无法无损对齐 Diretta DSD_SIZ_32"
-        );
-        let bytes_per_channel = sample_count / 8;
+        // Diretta DSD 以 DSD_SIZ_32（32 样本 = 4 字节/声道）为单位交付。真实 DSF
+        // 文件的 sample_count 未必是其整数倍（DSF 尾块本就按 block_size pad），
+        // 对不足一个单位的尾部（≤31 样本，DSD64 下约 11µs）向下取整截断，
+        // 不再硬拒整个文件。
+        let aligned_sample_count = sample_count - sample_count % 32;
+        let bytes_per_channel = aligned_sample_count / 8;
 
         let (data_offset, data_size) = find_dsf_data_chunk(&mut file, file_len)?;
         let blocks = bytes_per_channel
@@ -458,9 +459,11 @@ impl DirectDsdReader {
             .checked_mul(4)
             .context("DFF DSD_SIZ_32 unit 溢出")?;
         ensure!(
-            data_size > 0 && data_size % unit == 0,
-            "DFF data 无法无损对齐 Diretta DSD_SIZ_32"
+            data_size >= unit,
+            "DFF data 不足以构成一个 DSD_SIZ_32 unit"
         );
+        // 尾部不足一个 DSD_SIZ_32 unit 的字节向下取整截断，不再硬拒整个文件。
+        let data_size = data_size - data_size % unit;
         file.seek(SeekFrom::Start(u64::try_from(data_offset)?))?;
 
         let input_len = 32 * 1024 / unit * unit;
