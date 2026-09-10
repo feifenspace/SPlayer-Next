@@ -136,7 +136,29 @@ impl InnerPlayer {
         if let Some(previous) = self.pending_load_handle.replace(handle) {
             previous.cancel();
         }
+        let old_threads = self.teardown_for_async_load();
+        (old_threads, token)
+    }
 
+    /// handoff 预留后的二次回收：direct_active 路径下 reserve_direct_handoff_token
+    /// 已把本请求的 handle 注册进 pending_load_handle；probe/格式预检失败回退
+    /// 全量重连时会再次到达这里，此时 pending_load_handle 里存的正是本请求
+    /// 自己的 handle——绝不能执行 previous.cancel()（自取消会让重连阶段的
+    /// HttpAudioSource 打开立即以 "Operation cancelled by user" 失败，整个
+    /// load 报错、连接已拆、播放器停在 Stopped，用户必须再点一次播放）。
+    /// 其余语义（token 推进 + 全量拆线回收）与 take_for_async_load 完全一致
+    pub fn retake_for_async_load_after_handoff_reserve(
+        &mut self,
+        handle: HttpCancelHandle,
+    ) -> (OldThreads, u64) {
+        let token = self.load_token.fetch_add(1, Ordering::AcqRel) + 1;
+        self.pending_load_handle = Some(handle);
+        let old_threads = self.teardown_for_async_load();
+        (old_threads, token)
+    }
+
+    /// take/retake 共用的全量拆线：停信号、停播放、回收线程句柄
+    fn teardown_for_async_load(&mut self) -> OldThreads {
         // 发停止信号（原子写，纳秒级）
         if let Some(flag) = self.fade_cancel.take() {
             flag.store(true, Ordering::Relaxed);
@@ -164,7 +186,7 @@ impl InnerPlayer {
         self.equalizer.lock().reset_state();
         self.tempo.lock().reset();
 
-        let old_threads = OldThreads {
+        OldThreads {
             decoder_thread: self.decoder_thread.take(),
             position_timer: self.position_timer_handle.take(),
             fft_timer: self.fft_timer_handle.take(),
@@ -173,8 +195,7 @@ impl InnerPlayer {
             direct_playback: self.direct_playback.take(),
             #[cfg(any(feature = "diretta", test))]
             direct_close: self.direct_close_thread.take(),
-        };
-        (old_threads, token)
+        }
     }
 
     /// token 是否仍是最新值（seek 失败回退到 load 前校验，避免复活已被取代的旧源）

@@ -916,12 +916,17 @@ fn full_reconnect_load(
             // sync->stop 本身产生低频咚声（暂停路径同源），而直接从"静音垫
             // 交付中"disconnect（与 stop 路径同序列）无咚——咚源在新会话
             // 建立（setSink playback-rejection 门控），见 bridge setSink 注释
+            // direct_initial_take=None 意味着本请求在 reserve 阶段已通过
+            // reserve_direct_handoff_token 注册过 handle（handoff 失败回退）。
+            // 必须用 retake 变体：take_for_async_load 会把 pending_load_handle
+            // 里的本请求 handle 当作"上一请求"取消掉（自取消 bug，切歌报错
+            // "Operation cancelled by user" 且播放器停在 Stopped）
             let (threads, token) = {
                 let mut player = state.player.lock();
                 if !player.is_load_token_current(token) {
                     anyhow::bail!(LoadSuperseded);
                 }
-                player.take_for_async_load(handle.clone())
+                player.retake_for_async_load_after_handoff_reserve(handle.clone())
             };
             task_final_token.store(token, std::sync::atomic::Ordering::Release);
             (threads, token)
