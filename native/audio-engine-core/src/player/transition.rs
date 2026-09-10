@@ -877,8 +877,7 @@ impl InnerPlayer {
             hot_enabled,
             "[Direct] 热重配实验开关未开启（SPLAYER_DIRECT_HOT_RECONFIG）"
         );
-        // 家族限制：PCM → PCM 且声道一致（位深已由 32-bit 容器归一化统一）；
-        // 采样率不同正是本实验目标场景
+        // 家族限制：PCM → PCM 且声道一致（位深已由 32-bit 容器归一化统一）
         let DirectFormat::Pcm(cur) = current_format else {
             anyhow::bail!("[Direct] 热重配仅支持 PCM 家族");
         };
@@ -891,6 +890,19 @@ impl InnerPlayer {
             "[Direct] 热重配声道数不一致（{} → {}）",
             cur.channels,
             metadata.channels
+        );
+        // v12-2: 收紧热重配——对齐 tinyLMS SetFormat 的实测结论（其源码注释）：
+        // Diretta SDK 缺少向 Target 外发 SinkConfigure 的支持，在线 setSinkConfigure
+        // 无法让 Target 侧 DAC 时钟跟随，跨采样率重配必然错乱失真（真机 59 实测
+        // 44.1/192 → 176.4k 走速 0.42x、听感失真，残留状态还污染下一曲排空）。
+        // tinyLMS 因此只允许"采样率+声道完全相同"的 Quick Resume，跨采样率一律
+        // Hard Reset。这里同样收紧：采样率不同即回退全量重连（v12 手动切歌已有
+        // 并行开源 + 动态排空垫，全量重连间隔 ~272ms，可接受）。
+        anyhow::ensure!(
+            metadata.original_sample_rate == cur.sample_rate,
+            "[Direct] 热重配仅限同采样率（SDK 无法让 Target 时钟跟随，跨采样率会失真）：{} → {}，回退全量重连",
+            cur.sample_rate,
+            metadata.original_sample_rate
         );
         tracing::info!(
             target: "diretta_handoff",
