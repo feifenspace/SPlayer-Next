@@ -565,6 +565,74 @@ fn fold_direct_format_into(
     }
 }
 
+/// stream 模式元数据轻嗅探：Range 拉取在线源首 64KB，按容器/编码魔数判定
+/// 编码格式（仅用于前端展示；播放线格式以 Diretta 连接建立后的实测为准）。
+/// 任何失败返回 None（调用方回退 "stream" 占位），绝不阻塞起播主路径
+fn sniff_http_codec(url: &str) -> Option<String> {
+    const SNIFF_BYTES: usize = 64 * 1024;
+    use std::io::Read as _;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let response = client
+        .get(url)
+        .header("Range", format!("bytes=0-{}", SNIFF_BYTES - 1))
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .header("Accept", "*/*")
+        .header("Accept-Encoding", "identity")
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(SNIFF_BYTES);
+    response.take(SNIFF_BYTES as u64).read_to_end(&mut buf).ok()?;
+    Some(sniff_codec_magic(&buf).to_string())
+}
+
+/// 按魔数判定编码格式。未知内容返回 "stream"（与旧行为一致）
+fn sniff_codec_magic(buf: &[u8]) -> &'static str {
+    if buf.starts_with(b"fLaC") {
+        return "flac";
+    }
+    // ID3v2 头或 MPEG 帧同步（0xFFEx，11 位同步）
+    if buf.starts_with(b"ID3") || (buf.len() >= 2 && buf[0] == 0xFF && (buf[1] & 0xE0) == 0xE0) {
+        return "mp3";
+    }
+    if buf.starts_with(b"OggS") {
+        return "ogg";
+    }
+    if buf.starts_with(b"FRM8") {
+        return "dff";
+    }
+    if buf.starts_with(b"DSD ") {
+        return "dsf";
+    }
+    // MP4/M4A 容器：在 moov 范围内找 stsd 编解码四字符标识
+    if buf.len() >= 12 && &buf[4..8] == b"ftyp" {
+        for (needle, codec) in [
+            (&b"alac"[..], "alac"),
+            (&b"fLaC"[..], "flac"),
+            (&b"mp4a"[..], "aac"),
+            (&b"opus"[..], "opus"),
+        ] {
+            if buf.windows(needle.len()).any(|w| w == needle) {
+                return codec;
+            }
+        }
+        return "m4a";
+    }
+    if buf.len() >= 12 && buf.starts_with(b"RIFF") && &buf[8..12] == b"WAVE" {
+        return "wav";
+    }
+    "stream"
+}
+
 /// 阶段 1：探测新源元数据（handoff 粗检需要 sample_rate/channels）。
 /// stream 模式无法廉价探测：占位元数据 + 换源时的权威校验兜底
 #[allow(clippy::type_complexity)]
@@ -673,7 +741,12 @@ fn probe_direct_source(
         }
         None => audio_engine_core::AudioMetadata {
             duration_secs: meta_duration_secs.unwrap_or(0.0),
-            codec: "stream".to_string(),
+            // stream 模式不做完整探测（在线流探测代价高），但前端"音质详情"
+            // 不能显示占位符：Range 拉首 64KB 魔数轻嗅真实容器/编码，失败
+            // 才回退 "stream"。采样率/位深/声道仍由连接建立后的
+            // fold_direct_format_into 用 Diretta 实际线格式折算
+            codec: sniff_http_codec(source_for_direct)
+                .unwrap_or_else(|| "stream".to_string()),
             ..Default::default()
         },
     };
