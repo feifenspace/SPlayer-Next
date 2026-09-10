@@ -7,7 +7,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Instant, SystemTime};
 
 use ffmpeg_audio::AudioReader;
@@ -321,6 +323,57 @@ pub fn file_stat(path: &Path) -> Option<(u64, u64, u64)> {
 /// - `incremental_data`: 可选的已有文件记录，用于增量跳过
 /// - `cancel`: 取消标志，外部设置为 true 后扫描会尽快停止
 /// - `callback`: 回调函数，接收 ScanEvent
+/// 并行探测的单文件结果
+enum ProbeOutcome {
+    /// 增量命中跳过 / FFmpeg 无法解析（同旧实现静默跳过）
+    Skipped,
+    /// stat 失败（文件消失/NAS 抖动）：所属目录本轮不得报告删除项
+    StatFailed,
+    Track(ScannedTrack),
+}
+
+/// 单文件处理：stat → 增量跳过判定 → FFmpeg 探测。
+/// 线程安全：FFmpeg 上下文/标签/封面缓存全部文件级独立，无共享可变状态
+fn probe_or_skip(
+    path_str: &str,
+    directory_cover: Option<&Path>,
+    cover_cache_dir: Option<&str>,
+    existing: &HashMap<&str, (u64, u64, Option<&str>)>,
+) -> ProbeOutcome {
+    let path = Path::new(path_str);
+    let Some((mtime, ctime, size)) = file_stat(path) else {
+        return ProbeOutcome::StatFailed;
+    };
+    // 增量比对：mtime 和 size 都未变化且封面有效则跳过
+    if let Some(&(old_mtime, old_size, cover_path)) = existing.get(path_str) {
+        let cover_is_current = cover_cache_dir.is_none_or(|cache_dir| {
+            !metadata::cover_cache_needs_refresh(cover_path, cache_dir, directory_cover)
+        });
+        if old_mtime == mtime && old_size == size && cover_is_current {
+            return ProbeOutcome::Skipped;
+        }
+    }
+    match probe_fast_with_directory_cover(path_str, cover_cache_dir, directory_cover) {
+        Some(mut track) => {
+            track.file_size = size;
+            track.mtime = mtime;
+            track.ctime = ctime;
+            ProbeOutcome::Track(track)
+        }
+        None => {
+            debug!("跳过文件 {path_str}: FFmpeg 无法解析");
+            ProbeOutcome::Skipped
+        }
+    }
+}
+
+/// 探测 worker 的 mini 批次（channel 单线程汇聚前的本地攒批）
+struct WorkerBatch {
+    skipped: u32,
+    stat_failed: Vec<String>,
+    tracks: Vec<ScannedTrack>,
+}
+
 pub fn scan_directories(
     dirs: &[String],
     cover_cache_dir: Option<&str>,
@@ -341,9 +394,10 @@ pub fn scan_directories(
         })
         .unwrap_or_default();
 
-    // 第一遍：收集所有音频文件路径
+    // 第一遍：收集所有音频文件路径（只 readdir，不做逐文件 stat——
+    // 2 万+ 曲库在 CIFS/NFS 上逐文件 stat 是纯串行网络往返，挪到并行探测阶段做）
     let walk_start = Instant::now();
-    let mut audio_files: Vec<(String, u64, u64, u64, Option<PathBuf>)> = Vec::new();
+    let mut audio_items: Vec<(String, Option<PathBuf>)> = Vec::new();
     let mut scanned_paths: Vec<String> = Vec::new();
     let mut cue_files: Vec<String> = Vec::new();
     let mut iso_files: Vec<String> = Vec::new();
@@ -389,90 +443,139 @@ pub fn scan_directories(
                 continue;
             }
             let path_str = path.to_string_lossy().into_owned();
-            let Some((mtime, ctime, size)) = file_stat(path) else {
-                had_traversal_error = true;
-                warn!(path = %path.display(), "无法读取文件状态，本轮不计算所属目录下的删除项");
-                continue;
-            };
             scanned_paths.push(path_str.clone());
             let directory_cover = cover_cache_dir
                 .and_then(|_| cached_directory_cover(&mut directory_cover_cache, path));
-            // 增量比对：mtime 和 size 都未变化且封面有效则跳过
-            if let Some(&(old_mtime, old_size, cover_path)) = existing.get(path_str.as_str()) {
-                let cover_is_current = cover_cache_dir.is_none_or(|cache_dir| {
-                    !metadata::cover_cache_needs_refresh(
-                        cover_path,
-                        cache_dir,
-                        directory_cover.as_deref(),
-                    )
-                });
-                if old_mtime == mtime && old_size == size && cover_is_current {
-                    continue;
-                }
-            }
-            audio_files.push((path_str, mtime, ctime, size, directory_cover));
+            audio_items.push((path_str, directory_cover));
         }
         if had_traversal_error {
             unavailable_dirs.push(dir.clone());
         }
     }
 
-    let total = audio_files.len() as u32;
+    let total = audio_items.len() as u32;
     let walk_elapsed = walk_start.elapsed();
     info!(
-        "目录遍历完成: 发现 {} 个音频文件，其中 {} 个需要处理，耗时 {:.2?}",
+        "目录遍历完成: 发现 {} 个音频文件，耗时 {:.2?}",
         scanned_paths.len(),
-        total,
         walk_elapsed,
     );
 
-    // 第二遍：逐文件提取元数据，分批回调
+    // 第二遍：并行提取元数据（探测为 CIFS/NFS I/O 密集 + 文件级独立状态），
+    // worker 产出经 channel 单线程汇聚——DB 回调/进度语义保持串行收口。
+    // total 语义变更：现在是发现的全部音频文件数（增量跳过也计数推进进度条）
     let parse_start = Instant::now();
+    let worker_count = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 6);
+    info!("并行探测: {total} 个文件，{worker_count} workers");
+
+    let (tx, rx) = mpsc::channel::<WorkerBatch>();
+    let next_index = AtomicUsize::new(0);
+    {
+        let next_index = &next_index;
+        let audio_items = &audio_items;
+        let existing = &existing;
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let mut tracks: Vec<ScannedTrack> = Vec::new();
+                    let mut skipped = 0u32;
+                    let mut stat_failed: Vec<String> = Vec::new();
+                    loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let i = next_index.fetch_add(1, Ordering::Relaxed);
+                        if i >= audio_items.len() {
+                            break;
+                        }
+                        let (path_str, directory_cover) = &audio_items[i];
+                        match probe_or_skip(
+                            path_str,
+                            directory_cover.as_deref(),
+                            cover_cache_dir,
+                            existing,
+                        ) {
+                            ProbeOutcome::Skipped => skipped += 1,
+                            ProbeOutcome::StatFailed => stat_failed.push(path_str.clone()),
+                            ProbeOutcome::Track(track) => tracks.push(track),
+                        }
+                        if tracks.len() >= 8 || stat_failed.len() >= 16 || skipped >= 64 {
+                            let _ = tx.send(WorkerBatch {
+                                skipped: std::mem::take(&mut skipped),
+                                stat_failed: std::mem::take(&mut stat_failed),
+                                tracks: std::mem::take(&mut tracks),
+                            });
+                        }
+                    }
+                    if !tracks.is_empty() || !stat_failed.is_empty() || skipped > 0 {
+                        let _ = tx.send(WorkerBatch {
+                            skipped,
+                            stat_failed,
+                            tracks,
+                        });
+                    }
+                });
+            }
+        });
+    }
+    drop(tx);
+
     let mut scanned: u32 = 0;
     let mut batch: Vec<ScannedTrack> = Vec::with_capacity(BATCH_SIZE);
-
-    for (path_str, mtime, ctime, size, directory_cover) in &audio_files {
-        if cancel.load(Ordering::Relaxed) {
-            info!("扫描已取消（元数据提取阶段，已处理 {scanned}/{total}）");
-            callback(ScanEvent::Done {
-                scanned,
-                total,
-                removed_paths: Vec::new(),
-                cue_files: std::mem::take(&mut cue_files),
-                iso_files: std::mem::take(&mut iso_files),
-                unavailable_dirs,
-            });
-            return;
-        }
-
-        let current_name = Path::new(path_str)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
-
-        match probe_fast_with_directory_cover(path_str, cover_cache_dir, directory_cover.as_deref())
-        {
-            Some(mut track) => {
-                track.file_size = *size;
-                track.mtime = *mtime;
-                track.ctime = *ctime;
-                batch.push(track);
-            }
-            None => {
-                debug!("跳过文件 {path_str}: FFmpeg 无法解析");
+    let mut stat_failed_dirs: HashSet<String> = HashSet::new();
+    for worker_batch in rx {
+        let WorkerBatch {
+            skipped,
+            stat_failed,
+            tracks,
+        } = worker_batch;
+        scanned += skipped + stat_failed.len() as u32 + tracks.len() as u32;
+        // stat 失败（文件消失/NAS 抖动）：所属目录本轮不得报告删除项
+        for failed in &stat_failed {
+            if let Some(parent) = Path::new(failed).parent() {
+                stat_failed_dirs.insert(parent.to_string_lossy().into_owned());
             }
         }
-
-        scanned += 1;
-
-        // 达到批次大小或最后一个文件，推送进度
-        if batch.len() >= BATCH_SIZE || scanned == total {
+        let current = tracks.last().and_then(|t| {
+            Path::new(&t.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        });
+        batch.extend(tracks);
+        if batch.len() >= BATCH_SIZE {
             callback(ScanEvent::Progress {
                 scanned,
                 total,
-                current: current_name,
+                current,
                 tracks: std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
             });
         }
+    }
+    if !batch.is_empty() {
+        callback(ScanEvent::Progress {
+            scanned,
+            total,
+            current: None,
+            tracks: std::mem::take(&mut batch),
+        });
+    }
+    unavailable_dirs.extend(stat_failed_dirs);
+
+    if cancel.load(Ordering::Relaxed) {
+        info!("扫描已取消（并行探测阶段，已处理 {scanned}/{total}）");
+        callback(ScanEvent::Done {
+            scanned,
+            total,
+            removed_paths: Vec::new(),
+            cue_files: std::mem::take(&mut cue_files),
+            iso_files: std::mem::take(&mut iso_files),
+            unavailable_dirs,
+        });
+        return;
     }
 
     // 计算已删除的文件（在 existing 中但不在 scanned_paths 中）
@@ -486,12 +589,12 @@ pub fn scan_directories(
     let parse_elapsed = parse_start.elapsed();
     let total_elapsed = scan_start.elapsed();
     let throughput = if parse_elapsed.as_secs_f64() > 0.0 {
-        scanned as f64 / parse_elapsed.as_secs_f64()
+        total as f64 / parse_elapsed.as_secs_f64()
     } else {
         0.0
     };
     info!(
-        "扫描完成: 处理 {}/{} 个文件，目录遍历 {:.2?}，元数据解析 {:.2?}，总计 {:.2?}（{:.0} 文件/秒）",
+        "扫描完成: 处理 {}/{} 个文件，目录遍历 {:.2?}，元数据解析 {:.2?}，总计 {:.2?}（{:.0} 文件/秒，{worker_count} workers）",
         scanned,
         scanned_paths.len(),
         walk_elapsed,
