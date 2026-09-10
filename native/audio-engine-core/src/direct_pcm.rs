@@ -1929,6 +1929,9 @@ struct DirectPcmRing {
     /// pre-mute 静音窗口截止（monotonic 毫秒，0 = 未触发）：换源/seek 复位前触发，
     /// 窗口内 SDK 拉取遇供数空窗时交付静音块，消除 Target 欠载杂音
     pre_mute_until_ms: AtomicU64,
+    /// tinyLMS Hard Reset 预静音倒计时（周期数）：拆连接前 SDK 回调层连续交付
+    /// n 个周期数字静音后再 stop/disconnect，对齐 tinyLMS TriggerPreMute(8)
+    forced_mute_cycles: AtomicU32,
     /// pre-mute 静音缓冲（全零）：仅 SDK 回调线程（consumer）读写，producer 不触碰
     pre_mute_buf: Mutex<Vec<u8>>,
     /// 单一状态信号：producer 与控制线程共享的条件等待通道（避免任何忙等/轮询）
@@ -1981,6 +1984,7 @@ impl DirectPcmRing {
             last_block_bytes: AtomicUsize::new(0),
             last_block_frames: AtomicUsize::new(0),
             pre_mute_until_ms: AtomicU64::new(0),
+            forced_mute_cycles: AtomicU32::new(0),
             pre_mute_buf: Mutex::new(Vec::new()),
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
@@ -2113,6 +2117,19 @@ impl DirectPcmRing {
     fn next_block(&self) -> Option<DirectPcmBlock> {
         self.release_in_flight();
         if self.failed.load(Ordering::Acquire) {
+            return None;
+        }
+
+        // tinyLMS Hard Reset 预静音倒计时：拆连接前回调层连续交付 n 个周期
+        // 数字静音（对齐 tinyLMS getNewStream 预静音路径），确保 DAC 在途
+        // 数据之后紧跟零电平再 stop/disconnect，消除拆线咔哒。
+        // 每次回调递减 1；不消费真实数据、不推进 consumed/boundary 会计
+        if self.forced_mute_cycles.load(Ordering::Acquire) > 0 {
+            self.forced_mute_cycles.fetch_sub(1, Ordering::AcqRel);
+            if let Some(block) = self.pre_mute_block() {
+                return Some(block);
+            }
+            // 无块几何（从未交付过音频块）＝本就没有在播音频，无需静音垫
             return None;
         }
 
@@ -3653,6 +3670,42 @@ impl DirectPcmSource {
             "DirectPcmSource::replace_with_staged received format"
         );
         Ok(format)
+    }
+
+    /// tinyLMS Hard Reset 预静音：SDK 回调层连续交付 n 个周期数字静音后再
+    /// 拆连接（对齐 tinyLMS TriggerPreMute(8) + WaitPreMuteDone）。倒计时由
+    /// 回调线程在 next_block 递减；未在播（无块几何）时视为即时完成
+    pub fn trigger_forced_mute_cycles(&self, cycles: u32) {
+        self.ring
+            .forced_mute_cycles
+            .store(cycles, Ordering::Release);
+    }
+
+    /// 预静音倒计时是否尚未消耗完
+    pub fn forced_mute_pending(&self) -> bool {
+        self.ring.forced_mute_cycles.load(Ordering::Acquire) > 0
+    }
+
+    /// 等待预静音倒计时消耗完成（对齐 tinyLMS WaitPreMuteDone：短周期轮询
+    /// + 超时兜底——连接不在拉流时倒计时不走，超时后照常拆线）
+    pub fn wait_forced_mute_done(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.forced_mute_pending() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// tinyLMS Quick Resume：清除静音/淡出状态但不做淡入渐变——新源与旧源
+    /// 缓冲尾巴数据级硬拼接（无静音间隙），淡入反而制造"静音跳回音频"阶跃
+    pub fn clear_fade_state(&self) {
+        self.ring.fade.reset();
+        self.ring.notify_state();
     }
 }
 

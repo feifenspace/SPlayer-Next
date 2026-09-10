@@ -530,6 +530,23 @@ mod imp {
         pub fn resume_soft(&self) {
             self.source.begin_fade_in();
         }
+
+        /// tinyLMS Quick Resume：清除静音/淡出态但不做淡入渐变（数据级
+        /// 硬拼接）。不清除则残留 silent 态会永久静音（正确性关键）
+        pub fn clear_fade_state(&self) {
+            self.source.clear_fade_state();
+        }
+
+        /// tinyLMS Hard Reset 预静音：武装 n 周期回调层静音倒计时
+        /// （详见 DirectPcmSource::trigger_forced_mute_cycles）
+        pub fn trigger_pre_mute_cycles(&self, cycles: u32) {
+            self.source.trigger_forced_mute_cycles(cycles);
+        }
+
+        /// 预静音倒计时是否尚未消耗完
+        pub fn forced_mute_pending(&self) -> bool {
+            self.source.forced_mute_pending()
+        }
     }
 
     impl Drop for DirettaDirectConnection {

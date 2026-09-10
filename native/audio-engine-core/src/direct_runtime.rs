@@ -31,6 +31,18 @@ pub struct LoadSuperseded;
 /// Direct handoff/拆连接前排空：要求至少交付这么多块数字静音（顶掉设备端缓冲中的旧音频）
 pub const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
 
+/// v12-4 tinyLMS 切歌模式开关（默认启用）：手动切歌对齐 tinyLMS 久经验证的
+/// 处理方式——同格式 Quick Resume（无 fade/无排空垫，块边界数据级硬拼接，
+/// 与自动无缝切歌同路径）；跨格式 Hard Reset（SDK 回调层预静音 8 周期 PCM /
+/// 0x69 垫 DSD 后再拆连接重连）。SPLAYER_DIRECT_TINYLMS_SWITCH=0/false/off
+/// 回退 v12-3 行为（fade-out + 动态排空垫 + fade-in）
+pub fn tiny_lms_switch_enabled() -> bool {
+    match std::env::var("SPLAYER_DIRECT_TINYLMS_SWITCH") {
+        Ok(value) => !matches!(value.as_str(), "0" | "false" | "off" | "OFF"),
+        Err(_) => true,
+    }
+}
+
 /// Direct 排空的静音垫时长时间下限（微秒）：块尺寸随 codec/采样率波动
 /// （MP3 ~26ms / FLAC@192k ~21ms/块，固定 4 块的垫时长不可控），
 /// 达到该时长即视为设备端缓冲已置换完成，块数谓词保留为兜底
@@ -412,6 +424,59 @@ impl DirectTransport {
             Self::Dsd(value) => value.resume_soft(),
             #[cfg(all(test, not(feature = "diretta")))]
             Self::Fake(_) => {}
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// tinyLMS Quick Resume：清除静音/排空态但不做淡入渐变——新源与旧源
+    /// 缓冲尾巴数据级硬拼接（无静音间隙），对齐 tinyLMS SwapToNext；
+    /// 淡入反而制造"静音跳回音频"阶跃（可闻咔哒）
+    fn resume_handoff_no_fade(&self) {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.clear_fade_state(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => value.resume_soft(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => {}
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// tinyLMS Hard Reset 预静音触发：PCM 武装 8 周期回调层静音倒计时
+    /// （对齐 tinyLMS TriggerPreMute(8)）；DSD 置 0x69 静音垫并同步短等
+    /// （DSD 无回调倒计数通道，直接等排空垫就绪）。返回是否为 PCM
+    /// 倒计时模式（true 时调用方需轮询 tinylms_pre_mute_pending 等消耗）
+    fn trigger_tinylms_pre_mute(&self) -> bool {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => {
+                value.trigger_pre_mute_cycles(8);
+                true
+            }
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => {
+                value.begin_soft_pause_and_wait(std::time::Duration::from_millis(80));
+                false
+            }
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => false,
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// 预静音倒计时是否尚未消耗完（仅 PCM 倒计时模式有意义）
+    fn tinylms_pre_mute_pending(&self) -> bool {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.forced_mute_pending(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(_) => false,
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => false,
             #[cfg(not(any(feature = "diretta", test)))]
             _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
@@ -934,6 +999,23 @@ impl DirectPlayback {
     /// 恢复播放软起：清除静音/排空态（PCM 另做淡入）
     pub fn resume_soft(&self) {
         self.transport.resume_soft()
+    }
+
+    /// tinyLMS Quick Resume：清除静音/排空态但不做淡入渐变（PCM 数据级
+    /// 硬拼接，对齐 tinyLMS SwapToNext；DSD 无增益通道，clear_drain 即可）
+    pub fn resume_handoff_no_fade(&self) {
+        self.transport.resume_handoff_no_fade()
+    }
+
+    /// tinyLMS Hard Reset 预静音触发（PCM 武装 8 周期回调静音倒计时；
+    /// DSD 置 0x69 垫并同步短等）。返回是否为 PCM 倒计时模式
+    pub fn trigger_tinylms_pre_mute(&self) -> bool {
+        self.transport.trigger_tinylms_pre_mute()
+    }
+
+    /// 预静音倒计时是否尚未消耗完（仅 PCM 倒计时模式为真）
+    pub fn tinylms_pre_mute_pending(&self) -> bool {
+        self.transport.tinylms_pre_mute_pending()
     }
 
     /// v11-3: 武装下一次换源的跨格式旁路（热重配实验专用，消费一次自动复位）

@@ -550,6 +550,26 @@ impl InnerPlayer {
         Some(playback.monitor())
     }
 
+    /// v12-4 tinyLMS Hard Reset 预静音触发：SDK 回调层连续交付静音周期
+    /// （PCM 8 周期 / DSD 0x69 垫）。仅触发不等待，调用方在锁外轮询
+    /// direct_pre_mute_pending 等消耗完成。无连接返回 false
+    #[cfg(any(feature = "diretta", test))]
+    pub fn begin_direct_pre_mute(&self) -> bool {
+        match self.direct_playback.as_ref() {
+            Some(playback) => playback.trigger_tinylms_pre_mute(),
+            None => false,
+        }
+    }
+
+    /// 预静音倒计时是否尚未消耗完（无连接视为已完成）
+    #[cfg(any(feature = "diretta", test))]
+    pub fn direct_pre_mute_pending(&self) -> bool {
+        match self.direct_playback.as_ref() {
+            Some(playback) => playback.tinylms_pre_mute_pending(),
+            None => false,
+        }
+    }
+
     /// v12-A: 手动 handoff 并行开源武装——格式预检通过后、淡出排空前调用，
     /// 用排空窗口并行完成候选源的后台预打开（消除原先串行在排空之后的
     /// 开源耗时）。返回 generation 凭据供 commit_direct_handoff 走
@@ -658,27 +678,32 @@ impl InnerPlayer {
             None
         };
 
-        // 1) 源级淡出（暂停态为无害 no-op）；短锁取排空句柄
-        let drain = {
-            let mut player = player.lock();
-            let _ = player.begin_direct_fade_out();
-            player.direct_drain_handle()
-        };
-        // 2) 锁外事件驱动排空：渐零完成 + 交付足量数字静音块（顶掉设备端
-        //    缓冲里的旧音频尾巴）；暂停态/无连接时句柄为 None 瞬时通过
-        if let Some(monitor) = &drain {
-            // 超时与动态排空目标联动：drain_target + EXTRA，ring 未注入时
-            // drain_target 退回旧常量 200ms（行为等价改动前）
-            if !monitor.wait_fade_drained(
-                crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_BLOCKS,
-                std::time::Duration::from_micros(monitor.drain_target_micros())
-                    + crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
-            ) {
-                debug!(
-                    target: "diretta_handoff",
-                    phase = "handoff_fade_drain_timeout",
-                    "淡出排空等待超时，仍尝试 commit（块边界校验兜底）"
-                );
+        // 1) tinyLMS Quick Resume（默认）：跳过淡出与排空垫——同格式手动切歌
+        //    数据级硬拼接（对齐 tinyLMS SwapToNext / splayer 自动无缝切歌，
+        //    后者实测无杂音）；旧曲缓冲尾巴自然播完后接新曲，无静音间隙。
+        //    legacy 模式：源级淡出（暂停态为无害 no-op）；短锁取排空句柄
+        if !crate::direct_runtime::tiny_lms_switch_enabled() {
+            let handle = {
+                let mut player = player.lock();
+                let _ = player.begin_direct_fade_out();
+                player.direct_drain_handle()
+            };
+            // 2) 锁外事件驱动排空：渐零完成 + 交付足量数字静音块（顶掉设备端
+            //    缓冲里的旧音频尾巴）；暂停态/无连接时句柄为 None 瞬时通过
+            if let Some(monitor) = &handle {
+                // 超时与动态排空目标联动：drain_target + EXTRA，ring 未注入时
+                // drain_target 退回旧常量 200ms（行为等价改动前）
+                if !monitor.wait_fade_drained(
+                    crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                    std::time::Duration::from_micros(monitor.drain_target_micros())
+                        + crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
+                ) {
+                    debug!(
+                        target: "diretta_handoff",
+                        phase = "handoff_fade_drain_timeout",
+                        "淡出排空等待超时，仍尝试 commit（块边界校验兜底）"
+                    );
+                }
             }
         }
         // 3) 块边界原子换源（格式不一致时 Err，旧连接保持静音原状）
@@ -731,17 +756,26 @@ impl InnerPlayer {
             cancel,
             staged_generation,
         )?;
-        // 手动 handoff 新源淡入：换源提交前已交付排空静音（设备端处于零电平），
-        // 新源首采样非零时从静音一步阶跃到全幅会在 DAC 端产生咔哒声；10ms
-        // raised-cosine 淡入消除该阶跃。PCM=begin_fade_in(0→1)；DSD=clear_drain
-        // （复位排空态，无增益通道）。staged 自动切歌不经此函数（无静音间隙，
-        // 连续波形换源无需淡入），与实测"自动切歌无杂音"一致
-        playback.resume_soft();
+        // 手动 handoff 新源起播：
+        // - tinyLMS Quick Resume（默认）：无排空垫、无静音间隙，新源与旧曲
+        //   缓冲尾巴数据级硬拼接——只清除静音/淡出残留态，不做淡入渐变
+        //   （fade-in 会制造"静音跳回音频"阶跃，恰是要消除的咔哒来源）
+        // - legacy：换源提交前已交付排空静音（设备端处于零电平），新源首
+        //   采样非零时从静音一步阶跃到全幅会在 DAC 端产生咔哒声；10ms
+        //   raised-cosine 淡入消除该阶跃。PCM=begin_fade_in(0→1)；
+        //   DSD=clear_drain（复位排空态，无增益通道）。staged 自动切歌
+        //   不经此函数（无静音间隙，连续波形换源无需淡入），与实测
+        //   "自动切歌无杂音"一致
+        if crate::direct_runtime::tiny_lms_switch_enabled() {
+            playback.resume_handoff_no_fade();
+        } else {
+            playback.resume_soft();
+        }
         debug!(
             target: "diretta_handoff",
-            phase = "handoff_fade_in",
+            phase = "handoff_resume",
             source = %source,
-            "handoff 新源淡入已提交"
+            "handoff 新源起播已提交"
         );
         self.current_source = Some(source.to_owned());
         self.audio_duration = if duration > 0.0 {
