@@ -15,7 +15,7 @@ use crate::tempo::StretchProcessor;
 use anyhow::Result;
 use ffmpeg_audio::HttpCancelHandle;
 use parking_lot::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{InnerPlayer, PlayerEvent, PlayerState};
 
@@ -26,6 +26,26 @@ fn direct_parallel_open_enabled() -> bool {
         Ok(value) => !matches!(value.as_str(), "0" | "false" | "off" | "OFF"),
         Err(_) => true,
     }
+}
+
+// v12-3 点播命中预载缓存：单槽一次性直通代数。手动 load 命中预载曲时由
+// server 层注册（Some），本次 load 的 try_direct_handoff 无条件消费——
+// 排空窗口内不再重新开源，直接 ReplaceStaged 预载好的候选（~省 170ms）。
+// 未命中 load 注册 None 重置，防上次残留串台；ReplaceStaged 的
+// expected_generation 校验仍兜底（槽过期时回退同步开源，行为安全）
+static PRESTAGED_HANDOFF_GENERATION: std::sync::Mutex<Option<u64>> =
+    std::sync::Mutex::new(None);
+
+/// 注册/重置本次 load 的预载直通代数（load 入口调用，None=重置）
+pub fn register_prestaged_handoff(generation: Option<u64>) {
+    *PRESTAGED_HANDOFF_GENERATION.lock().unwrap_or_else(|p| p.into_inner()) = generation;
+}
+
+fn take_prestaged_handoff() -> Option<u64> {
+    PRESTAGED_HANDOFF_GENERATION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
 }
 
 /// 切换/seek 时要 join 的旧线程集合，全部挪到 spawn_blocking 工作线程 join，
@@ -624,7 +644,15 @@ impl InnerPlayer {
         //    消除原先串行在排空之后的开源耗时。默认启用；
         //    SPLAYER_DIRECT_PARALLEL_OPEN=0/false/off 关闭（回退同步开源）。
         //    凭据为 None 时 commit 走原 ReplaceLocal 路径，行为等价改动前
-        let staged_generation = if direct_parallel_open_enabled() {
+        let staged_generation = if let Some(g) = take_prestaged_handoff() {
+            info!(
+                target: "diretta_handoff",
+                phase = "handoff_prestaged_hit",
+                generation = %g,
+                "点播命中预载缓存，跳过并行开源直接接力"
+            );
+            Some(g)
+        } else if direct_parallel_open_enabled() {
             player.lock().arm_direct_handoff_stage(source, open_path, duration_secs)
         } else {
             None

@@ -27,6 +27,7 @@ mod transition;
 use events::playback_completion_event;
 pub use events::{EventEmitter, PlayerEvent, PlayerState};
 pub use transition::{LoadedPlayback, OldThreads, SeekTake};
+pub use transition::register_prestaged_handoff;
 
 /// 内部播放器，管理音频输出、解码和状态
 pub struct InnerPlayer {

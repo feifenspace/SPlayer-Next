@@ -51,6 +51,37 @@ pub(crate) fn invalidate() {
     *STAGED_NEXT.lock() = None;
 }
 
+/// v12-3 点播命中预载缓存：source 精确匹配则消费 STAGED_NEXT 并推进边界
+/// 簿记（孤儿边界防重），返回 staged generation 供 handoff 直通装填。
+/// 必须在 reserve_player_for_load 的 stage cancel 之前调用（否则缓存被清）。
+/// 命中后预载槽已空：曲终接力不再重复装填该候选
+pub(crate) fn take_staged_for_source(state: &AppState, source: &str) -> Option<u64> {
+    let hit = {
+        let mut slot = STAGED_NEXT.lock();
+        let staged = slot.take()?;
+        if staged.source == source {
+            staged
+        } else {
+            *slot = Some(staged);
+            return None;
+        }
+    };
+    LAST_COMMITTED_GENERATION.fetch_max(hit.generation, Ordering::Release);
+    // relay 候选与预载同源，一并消费，避免看门狗按旧候选接力
+    {
+        let mut pending = state.pending_next.lock();
+        if pending.as_ref().map(|p| p.source.as_str()) == Some(hit.source.as_str()) {
+            *pending = None;
+        }
+    }
+    info!(
+        source = %hit.source,
+        generation = hit.generation,
+        "手动点播命中预载缓存"
+    );
+    Some(hit.generation)
+}
+
 /// 下一曲无缝预载调度（fire-and-forget，非阻塞）：
 /// 队列对齐 → 下一曲选取 → 专用线程上解析/物化/stage。
 /// 在 Direct load 提交成功与 boundary 自治提交后调用

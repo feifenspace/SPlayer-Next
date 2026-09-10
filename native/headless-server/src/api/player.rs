@@ -385,6 +385,7 @@ fn reserve_player_for_load(
     state: &AppState,
     handle: audio_engine_core::HttpCancelHandle,
     source: &str,
+    keep_engine_staged: bool,
 ) -> Result<LoadReservation, ApiError> {
     let mut player = state.player.lock();
     let mut device_name = player.selected_device().map(String::from);
@@ -423,9 +424,12 @@ fn reserve_player_for_load(
         // 手动切歌意图已明确：立即作废无缝预载缓存（含在途 prepare，epoch 推进）。
         // 否则 probe/淡出窗口（数百 ms）内当前曲 EOF 会装填缓存曲目"抢播"，
         // 用户先听到错曲片段再进入目标曲——这是切歌"杂音/错乱感"的来源之一。
-        // 预载在 load 提交后会按新当前曲重新调度，此处作废无副作用
-        if let Some(handle) = player.direct_stage_handle() {
-            handle.cancel();
+        // 预载在 load 提交后会按新当前曲重新调度，此处作废无副作用。
+        // v12-3：点播命中预载缓存时保留 staged（直通接力装填使用）
+        if !keep_engine_staged {
+            if let Some(handle) = player.direct_stage_handle() {
+                handle.cancel();
+            }
         }
     }
     let direct_active = direct_selector.is_some() && player.direct_active();
@@ -500,7 +504,18 @@ pub(crate) async fn load_handler(
 
     let handle = audio_engine_core::HttpCancelHandle::new();
     let source_for_decoder = resolve_cue_source(&state, &source, payload.meta.as_ref())?;
-    let reservation = reserve_player_for_load(&state, handle, &source_for_decoder)?;
+    // v12-3 点播命中预载缓存：必须在 reserve 作废 stage 之前查询命中；
+    // 命中则注册直通代数并保留引擎 staged（reserve 跳过 cancel），
+    // handoff 排空窗口内直接接力预载候选，跳过并行开源
+    let prestaged_generation =
+        super::direct_preloader::take_staged_for_source(&state, &source);
+    audio_engine_core::player::register_prestaged_handoff(prestaged_generation);
+    let reservation = reserve_player_for_load(
+        &state,
+        handle,
+        &source_for_decoder,
+        prestaged_generation.is_some(),
+    )?;
     let meta_duration_secs = payload
         .meta
         .as_ref()
