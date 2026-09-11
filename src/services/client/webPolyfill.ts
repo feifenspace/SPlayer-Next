@@ -1,4 +1,5 @@
 import { getHttpPlayerClient } from "./httpClientInstance";
+import { webConfigFiles } from "./webConfigFiles";
 import { useStatusStore } from "@/stores/status";
 import { createWebStreamingApi } from "@/services/streaming/web/service";
 import { generateUUID } from "@/utils/uuid";
@@ -163,40 +164,7 @@ export const installWebPolyfill = (): void => {
       replaceAll: async (settings: any) => {
         await playerClient.setAllConfig(settings);
       },
-      exportToFile: async (payload: any) => {
-        const json = JSON.stringify(payload, null, 2);
-        const blob = new Blob([json], { type: "application/json" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `splayer-config-${Date.now()}.json`;
-        a.click();
-        URL.revokeObjectURL(url);
-        return { success: true };
-      },
-      importFromFile: async () => {
-        return new Promise((resolve) => {
-          const input = document.createElement("input");
-          input.type = "file";
-          input.accept = ".json";
-          input.onchange = () => {
-            const file = input.files?.[0];
-            if (!file) return resolve({ success: false });
-            const reader = new FileReader();
-            reader.onload = () => {
-              try {
-                const data = JSON.parse(reader.result as string);
-                resolve({ success: true, data: { main: data } });
-              } catch {
-                resolve({ success: false, error: "Invalid JSON" });
-              }
-            };
-            reader.readAsText(file);
-          };
-          input.oncancel = () => resolve({ success: false });
-          input.click();
-        });
-      },
+      ...webConfigFiles,
       hasPendingRestartKeys: () => false,
       restartToApplySettings: async () => {
         window.location.reload();
