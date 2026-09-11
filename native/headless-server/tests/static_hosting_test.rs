@@ -52,13 +52,17 @@ impl Drop for TempWebRoot {
     }
 }
 
-fn create_app_with_web_root(web_root: std::path::PathBuf) -> (axum::Router, AppState) {
+fn create_app_with_web_root(
+    web_root: std::path::PathBuf,
+) -> (axum::Router, AppState, tempfile::TempDir) {
+    // 每个测试独占数据库，避免并行建表争锁和触及默认运行数据。
+    let data_dir = tempfile::tempdir().expect("Failed to create isolated data dir");
     let config = Config {
         listen_addr: "127.0.0.1:14558".to_string(),
         cors_origins: Some("*".to_string()),
         api_token: None,
         cover_cache_dir: None,
-        database_path: None,
+        database_path: Some(data_dir.path().join("library.db")),
         web_root: Some(web_root),
         diretta_target: None,
         proxy: None,
@@ -66,13 +70,13 @@ fn create_app_with_web_root(web_root: std::path::PathBuf) -> (axum::Router, AppS
     };
     let state = AppState::new(&config).expect("Failed to create AppState");
     let router = build_router(state.clone());
-    (router, state)
+    (router, state, data_dir)
 }
 
 #[tokio::test]
 async fn test_serve_index_html_at_root() {
     let temp = TempWebRoot::new();
-    let (app, _state) = create_app_with_web_root(temp.path.clone());
+    let (app, _state, _data_dir) = create_app_with_web_root(temp.path.clone());
 
     let req = Request::builder()
         .uri("/")
@@ -100,7 +104,7 @@ async fn test_serve_index_html_at_root() {
 #[tokio::test]
 async fn test_serve_static_asset() {
     let temp = TempWebRoot::new();
-    let (app, _state) = create_app_with_web_root(temp.path.clone());
+    let (app, _state, _data_dir) = create_app_with_web_root(temp.path.clone());
 
     let req = Request::builder()
         .uri("/assets/style.css")
@@ -128,7 +132,7 @@ async fn test_serve_static_asset() {
 #[tokio::test]
 async fn test_spa_history_fallback() {
     let temp = TempWebRoot::new();
-    let (app, _state) = create_app_with_web_root(temp.path.clone());
+    let (app, _state, _data_dir) = create_app_with_web_root(temp.path.clone());
 
     // 请求一个不存在的前端虚拟路由（如 /playlist/favorites/123）
     let req = Request::builder()
@@ -151,7 +155,7 @@ async fn test_spa_history_fallback() {
 #[tokio::test]
 async fn test_api_precedence_over_static_files() {
     let temp = TempWebRoot::new();
-    let (app, _state) = create_app_with_web_root(temp.path.clone());
+    let (app, _state, _data_dir) = create_app_with_web_root(temp.path.clone());
 
     // 请求 API 路由，确保优先命中 API 而不是走 fallback
     let req = Request::builder()

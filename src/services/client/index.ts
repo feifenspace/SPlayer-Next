@@ -1,5 +1,5 @@
 import { ElectronPlayerClient } from "./electronClient";
-import { HttpPlayerClient } from "./httpClient";
+import { getHttpPlayerClient } from "./httpClientInstance";
 import type { IAppClient, IPlayerClient, ClientMode } from "./types";
 
 export * from "./types";
@@ -31,9 +31,7 @@ export const getClient = (): IAppClient => {
 
   const electron = isElectron();
   const mode: ClientMode = electron ? "electron" : "http";
-  const player: IPlayerClient = electron
-    ? new ElectronPlayerClient()
-    : new HttpPlayerClient();
+  const player: IPlayerClient = electron ? new ElectronPlayerClient() : getHttpPlayerClient();
 
   clientInstance = {
     mode,

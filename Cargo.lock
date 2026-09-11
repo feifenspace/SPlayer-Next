@@ -2681,6 +2681,7 @@ dependencies = [
 [[package]]
 name = "ncm-api-rs"
 version = "0.1.0"
+source = "git+https://github.com/SPlayer-Dev/ncm-api-rs?rev=133b65bfe482e41ebccf018870d3fce07bf58eb3#133b65bfe482e41ebccf018870d3fce07bf58eb3"
 dependencies = [
  "aes",
  "axum",

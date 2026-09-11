@@ -122,9 +122,10 @@ export default defineConfig({
       vue(),
       UnoCSS(),
       AutoImport({
+        dts: process.env.SPLAYER_WEB_BUILD === "1" ? false : undefined,
         imports: ["vue", "pinia", "vue-router", "@vueuse/core", "vue-i18n"],
         eslintrc: {
-          enabled: true,
+          enabled: process.env.SPLAYER_WEB_BUILD !== "1",
           filepath: "./auto-eslint.mjs",
         },
       }),
@@ -136,6 +137,7 @@ export default defineConfig({
         },
       }),
       Components({
+        dts: process.env.SPLAYER_WEB_BUILD === "1" ? false : undefined,
         dirs: ["src/components"],
         resolvers: [RekaResolver(), IconsResolver({ prefix: "icon", customCollections: ["sp"] })],
       }),

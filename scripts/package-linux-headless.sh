@@ -12,7 +12,7 @@ set -Eeuo pipefail
 #
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OUTPUT_BASE_DIR="/home/songlian"
+OUTPUT_BASE_DIR="$PROJECT_ROOT/dist"
 SDK_DIR="${DIRETTA_SDK_DIR:-}"
 SDK_VERSION="150"
 TARGET_CPU_ARCH=""
@@ -43,7 +43,7 @@ usage() {
     echo "  --arch <variant>       CPU 微架构: v2, v3, v4, zen4, auto, all (默认交互选择或 v2)"
     echo "  --sdk-dir <path>       指定 DirettaHostSDK 路径"
     echo "  --sdk-version <ver>    指定 Diretta SDK 版本（如 150/149/148）"
-    echo "  --output-dir <path>    发布包输出根目录（默认 /home/songlian）"
+    echo "  --output-dir <path>    发布包输出根目录（默认 项目/dist）"
     echo "  --date <YYYYMMDD>      指定打包日期标识（默认今天：${BUILD_DATE}）"
     echo "  --force, -f            强制全量重新构建（跳过前端与 Rust 增量缓存）"
     echo "  --skip-build           跳过 Rust 编译，直接使用现有构建产物"
@@ -223,10 +223,8 @@ TARGET_CPU_ARCH="${TARGET_CPU_ARCH:-v2}"
 # 自动推导 SDK 目录
 if [[ -z "$SDK_DIR" ]]; then
     for candidate in \
-        "/home/songlian/DirettaHostSDK_${SDK_VERSION}" \
         "$HOME/DirettaHostSDK_${SDK_VERSION}" \
         "/opt/DirettaHostSDK_${SDK_VERSION}" \
-        /home/songlian/DirettaHostSDK_* \
         "$HOME"/DirettaHostSDK_*; do
         if [[ -d "$candidate" ]]; then
             SDK_DIR="$candidate"
@@ -252,7 +250,7 @@ check_web_needs_build() {
     fi
     # 查找是否有比现有构建产物更新的前端源码文件
     local newer_src
-    newer_src=$(find "$PROJECT_ROOT/src" "$PROJECT_ROOT/shared" "$PROJECT_ROOT/package.json" "$PROJECT_ROOT/electron.vite.config.ts" "$PROJECT_ROOT/index.html" -type f -newer "$WEB_DIST/index.html" 2>/dev/null | head -n 1 || true)
+    newer_src=$(find "$PROJECT_ROOT/src" "$PROJECT_ROOT/shared" "$PROJECT_ROOT/public" "$PROJECT_ROOT/package.json" "$PROJECT_ROOT/pnpm-lock.yaml" "$PROJECT_ROOT/vite.web.config.ts" "$PROJECT_ROOT/electron.vite.config.ts" "$PROJECT_ROOT/index.html" -type f -newer "$WEB_DIST/index.html" 2>/dev/null | head -n 1 || true)
     if [[ -n "$newer_src" ]]; then
         return 0
     fi
@@ -348,7 +346,7 @@ package_single_arch() {
             export DIRETTA_ARCH="${arch_var}"
             export CARGO_INCREMENTAL=1
 
-            cargo build --release --package headless-server
+            cargo build --locked --release --package headless-server
 
             mkdir -p "$PROJECT_ROOT/target/release"
             cp -f "$PROJECT_ROOT/target/release/headless-server" "$cached_bin"
@@ -629,7 +627,7 @@ if [[ $SKIP_BUILD -eq 0 && $SKIP_WEB -eq 0 ]]; then
     if check_web_needs_build; then
         log "构建 Web 控制台前端静态资源..."
         cd "$PROJECT_ROOT"
-        pnpm exec electron-vite build
+        pnpm build:web
     else
         log "⚡ 检测到前端 Web UI 产物已是最新，跳过 Vite 构建 (耗时 0s)"
     fi

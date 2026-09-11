@@ -1,0 +1,43 @@
+name: Headless
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-headless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: headless
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libasound2-dev libssl-dev pkg-config clang cmake
+      - name: Install Web dependencies without desktop install hooks
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Check and build Web
+        run: |
+          pnpm typecheck:web
+          pnpm exec tsc --noEmit --module esnext --moduleResolution bundler --target esnext --esModuleInterop --skipLibCheck --resolveJsonModule vite.web.config.ts
+          pnpm test:web
+          pnpm build:web
+      - name: Check Headless without proprietary SDK
+        run: cargo check --locked -p headless-server
+      - name: Test Headless contracts
+        run: cargo test --locked -p headless-server --lib --test library_db_test --test playlist_config_test --test static_hosting_test
