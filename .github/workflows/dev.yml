@@ -21,6 +21,10 @@ on:
       - ".github/workflows/dev.yml"
   workflow_dispatch:
 
+concurrency:
+  group: dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NODE_VERSION: 22.x
 
@@ -67,6 +71,7 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -74,7 +79,14 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: "native/audio-engine -> target\nnative/audio-capture -> target\nnative/media-ctrl -> target"
+          workspaces: |
+            . -> target
+            native/audio-engine -> target
+            native/audio-capture -> target
+            native/media-ctrl -> target
+            native/taskbar-lyric -> target
+            native/taskbar-thumbnail -> target
+            native/opencc -> target
 
       # Linux: 安装系统构建/打包依赖
       - name: 安装系统依赖 (Linux)
@@ -86,14 +98,8 @@ jobs:
             rpm libarchive-tools
 
       # 清理旧构建产物
-      - name: Clean workspace on Windows
-        if: runner.os == 'Windows'
-        run: |
-          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
-          if (Test-Path out) { Remove-Item -Recurse -Force out }
-
-      - name: Clean workspace on macOS & Linux
-        if: runner.os != 'Windows'
+      - name: Clean workspace
+        shell: bash
         run: rm -rf dist out
 
       # CI 不需要国内镜像

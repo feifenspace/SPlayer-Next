@@ -194,7 +194,7 @@ async fn process_metadata(
 
     let mut mb = Metadata::builder()
         .title(payload.title)
-        .artist([payload.artist])
+        .artist(payload.artists)
         .album(payload.album);
 
     let track_id = SystemTime::now()

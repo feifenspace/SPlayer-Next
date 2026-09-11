@@ -1,7 +1,7 @@
 <script setup lang="ts">
 defineOptions({ name: "SearchPage" });
 
-import type { Track } from "@shared/types/player";
+import type { PlaybackContext, Track } from "@shared/types/player";
 import {
   ALL_SEARCH_PLATFORMS,
   SEARCH_PLATFORM_SHORT_NAME,
@@ -228,6 +228,14 @@ const onLoginDialogClose = (open: boolean): void => {
     onRetry();
   }
 };
+
+/** 搜索页播放来源上下文 */
+const playbackContext = computed<PlaybackContext>(() => ({
+  provider: status.searchPlatform,
+  originId: `search:${status.searchPlatform}:${keyword.value}`,
+  originType: "page",
+  originName: keyword.value ? `${t("search.title")}: ${keyword.value}` : t("search.title"),
+}));
 </script>
 
 
@@ -337,6 +345,7 @@ const onLoginDialogClose = (open: boolean): void => {
         v-if="activeTab === 'songs'"
         :items="states.songs.items"
         :source="status.searchPlatform"
+        :playback-context="playbackContext"
         :show-size="false"
         :has-more="states.songs.hasMore"
         :loading-more="states.songs.loadingMore"
