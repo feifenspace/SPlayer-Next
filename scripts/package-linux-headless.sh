@@ -22,6 +22,11 @@ SKIP_WEB=0
 CREATE_TAR=1
 FORCE_REBUILD=0
 
+# 非交互 SSH / systemd 环境可能未加载 ~/.cargo/env；优先复用当前用户已安装的工具链。
+if ! command -v cargo >/dev/null 2>&1 && [[ -x "$HOME/.cargo/bin/cargo" ]]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
