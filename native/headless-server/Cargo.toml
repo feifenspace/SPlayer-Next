@@ -42,7 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # 在线音源与网络
-ncm-api-rs = { path = "/home/songlian/ncm-api-rs", features = ["server"] }
+ncm-api-rs = { git = "https://github.com/SPlayer-Dev/ncm-api-rs", rev = "133b65bfe482e41ebccf018870d3fce07bf58eb3", features = ["server"] }
 qqkg-api = { path = "../qqkg-api" }
 streaming-api = { path = "../streaming-api" }
 reqwest = { version = "0.12", features = ["json", "stream", "blocking", "gzip", "deflate"] }

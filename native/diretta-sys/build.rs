@@ -13,25 +13,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DIRETTA_SDK_ROOT");
     println!("cargo:rerun-if-env-changed=DIRETTA_USE_SDK_LOG");
 
-    // 定位 SDK 根目录（优先环境变量，其次 150/149/148）
+    // 显式指定 SDK，避免构建结果随机器目录发生变化。
     let sdk_dir_opt = env::var("DIRETTA_SDK_DIR")
         .or_else(|_| env::var("DIRETTA_SDK_ROOT"))
         .map(PathBuf::from)
-        .ok()
-        .or_else(|| {
-            let p150 = PathBuf::from("/home/songlian/DirettaHostSDK_150");
-            let p149 = PathBuf::from("/home/songlian/DirettaHostSDK_149");
-            let p148 = PathBuf::from("/home/songlian/DirettaHostSDK_148");
-            if p150.exists() {
-                Some(p150)
-            } else if p149.exists() {
-                Some(p149)
-            } else if p148.exists() {
-                Some(p148)
-            } else {
-                None
-            }
-        });
+        .ok();
 
     let Some(sdk_dir) = sdk_dir_opt else {
         println!("cargo:warning=[diretta-sys] DirettaHostSDK not found, building stub mode.");
@@ -42,11 +28,10 @@ fn main() {
     let sdk_lib = sdk_dir.join("lib");
 
     if !sdk_include.is_dir() || !sdk_lib.is_dir() {
-        println!(
-            "cargo:warning=[diretta-sys] DirettaHostSDK Host/ or lib/ missing at {}, skipping native link",
+        panic!(
+            "DirettaHostSDK Host/ or lib/ missing at {}",
             sdk_dir.display()
         );
-        return;
     }
 
     // 微架构判定
@@ -59,6 +44,18 @@ fn main() {
     println!(
         "cargo:warning=[diretta-sys] Building for arch: target_arch={}, resolved_arch={}, suffix={}, march={}, sdk_log={}",
         target_arch, diretta_arch, suffix, march, if use_sdk_log { "on" } else { "off" }
+    );
+
+    // 先验证库文件，禁止显式请求 SDK 时静默退化为占位实现。
+    let host_lib_name = format!("libDirettaHost_{}.a", suffix);
+    let acqua_lib_name = format!("libACQUA_{}.a", suffix);
+    let host_lib_path = sdk_lib.join(&host_lib_name);
+    let acqua_lib_path = sdk_lib.join(&acqua_lib_name);
+    assert!(
+        host_lib_path.is_file() && acqua_lib_path.is_file(),
+        "Diretta static libraries missing: {} or {}",
+        host_lib_path.display(),
+        acqua_lib_path.display()
     );
 
     // 编译 C++ 桥接
@@ -80,25 +77,14 @@ fn main() {
     build.compile("splayer_diretta_bridge");
 
     // 静态链接 SDK 库
-    let host_lib_name = format!("libDirettaHost_{}.a", suffix);
-    let acqua_lib_name = format!("libACQUA_{}.a", suffix);
-
-    let host_lib_path = sdk_lib.join(&host_lib_name);
-    let acqua_lib_path = sdk_lib.join(&acqua_lib_name);
-
-    if !host_lib_path.exists() || !acqua_lib_path.exists() {
-        println!(
-            "cargo:warning=[diretta-sys] Static libs not found: {} or {}",
-            host_lib_path.display(),
-            acqua_lib_path.display()
-        );
-        return;
-    }
-
     println!("cargo:rustc-link-search=native={}", sdk_lib.display());
 
-    let host_link_name = host_lib_name.trim_start_matches("lib").trim_end_matches(".a");
-    let acqua_link_name = acqua_lib_name.trim_start_matches("lib").trim_end_matches(".a");
+    let host_link_name = host_lib_name
+        .trim_start_matches("lib")
+        .trim_end_matches(".a");
+    let acqua_link_name = acqua_lib_name
+        .trim_start_matches("lib")
+        .trim_end_matches(".a");
 
     println!("cargo:rustc-link-lib=static={}", host_link_name);
     println!("cargo:rustc-link-lib=static={}", acqua_link_name);
@@ -126,22 +112,46 @@ fn resolve_arch(target_arch: &str, requested_arch: &str, use_sdk_log: bool) -> (
     }
 
     match requested_arch {
-        "v4" => (format!("x64-linux-15v4{}", log_suffix), "x86-64-v4".to_string()),
-        "v3" => (format!("x64-linux-15v3{}", log_suffix), "x86-64-v3".to_string()),
-        "zen4" => (format!("x64-linux-15zen4{}", log_suffix), "znver4".to_string()),
-        "v2" => (format!("x64-linux-15v2{}", log_suffix), "x86-64-v2".to_string()),
+        "v4" => (
+            format!("x64-linux-15v4{}", log_suffix),
+            "x86-64-v4".to_string(),
+        ),
+        "v3" => (
+            format!("x64-linux-15v3{}", log_suffix),
+            "x86-64-v3".to_string(),
+        ),
+        "zen4" => (
+            format!("x64-linux-15zen4{}", log_suffix),
+            "znver4".to_string(),
+        ),
+        "v2" => (
+            format!("x64-linux-15v2{}", log_suffix),
+            "x86-64-v2".to_string(),
+        ),
         _ => {
             // 自动检测主机 CPU
             if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
                 if cpuinfo.contains("avx512") || cpuinfo.contains("avx512f") {
-                    (format!("x64-linux-15v4{}", log_suffix), "x86-64-v4".to_string())
+                    (
+                        format!("x64-linux-15v4{}", log_suffix),
+                        "x86-64-v4".to_string(),
+                    )
                 } else if cpuinfo.contains("avx2") {
-                    (format!("x64-linux-15v3{}", log_suffix), "x86-64-v3".to_string())
+                    (
+                        format!("x64-linux-15v3{}", log_suffix),
+                        "x86-64-v3".to_string(),
+                    )
                 } else {
-                    (format!("x64-linux-15v2{}", log_suffix), "x86-64-v2".to_string())
+                    (
+                        format!("x64-linux-15v2{}", log_suffix),
+                        "x86-64-v2".to_string(),
+                    )
                 }
             } else {
-                (format!("x64-linux-15v2{}", log_suffix), "x86-64-v2".to_string())
+                (
+                    format!("x64-linux-15v2{}", log_suffix),
+                    "x86-64-v2".to_string(),
+                )
             }
         }
     }

@@ -1,5 +1,7 @@
 # Headless 维护基线与实施记录
 
+后续构建整理见 [Web / Headless 构建](headless-build.md)：网易云依赖已改为固定 Git 提交，增加 Web 专用构建与 Headless CI。本文件以下保留第一批快照时的历史记录。
+
 ## 产品范围
 
 交付 Web + Linux Headless，保留现有新增功能。Electron 源码暂作上游对照及兼容参考；不以桌面发布为本产品验收目标。

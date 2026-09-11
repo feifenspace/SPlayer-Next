@@ -40,6 +40,7 @@
     "test:web:watch": "vitest --config vitest.config.ts",
     "test:native": "cargo test --workspace",
     "test:all": "pnpm test && pnpm test:native",
+    "build:web": "vite build --config vite.web.config.ts",
     "build:native": "tsx scripts/build-native.ts",
     "start": "electron-vite preview",
     "dev": "pnpm build:native --dev && tsx scripts/dev.ts",
