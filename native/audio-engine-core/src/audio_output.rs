@@ -63,6 +63,16 @@ impl AudioOutput {
         generation: u64,
         on_failure: OutputFailureCallback,
     ) -> Result<Self> {
+        // 全局超采样率守卫：DSD 解码 PCM 最低 DSD64 = 2.8224 MHz，正常 PCM <= 768 kHz。
+        // 超高采样率请求喂给 USB 声卡会拖垮 snd-usb-audio/xHCI 导致整机死机
+        // （2026-09-11 播 DSD 经本地声卡输出整机 hang），统一在入口拒绝。
+        if let Some(rate) = requested_sample_rate {
+            anyhow::ensure!(
+                rate <= crate::alsa_mmap_sink::MAX_SAFE_SAMPLE_RATE,
+                "采样率 {rate} Hz 超出本地声卡直出安全上限（{} Hz）。DSD 源请使用 Diretta 输出（支持 native DSD/DoP）",
+                crate::alsa_mmap_sink::MAX_SAFE_SAMPLE_RATE
+            );
+        }
         // 设备协议：alsammap:<alsa 设备名>（空 = "default"）走 ALSA MMAP 直出，
         // 其余（None / cpal 设备 ID）走 cpal（B1.1）
         if let Some(selector) = device_id.filter(|d| d.starts_with("alsammap:")) {

@@ -44,7 +44,7 @@ const FORMAT_PRIORITY: [Format; 3] = [Format::s32(), Format::s24(), Format::s16(
 /// DSD64 = 2.8224 MHz。高于 1 MHz 的请求只可能来自 DSD 源解码——直接拒绝，
 /// 防止 USB isoc 超高带宽请求拖垮 snd-usb-audio/xHCI 导致整机死机
 /// （2026-09-11 播 DSD 经 ALSA MMAP 整机 hang 的防护）。
-const MAX_SAFE_SAMPLE_RATE: u32 = 1_000_000;
+pub(crate) const MAX_SAFE_SAMPLE_RATE: u32 = 1_000_000;
 
 /// 协商 hw 参数：采样率必须精确命中，声道固定 2。
 /// 格式按 [`FORMAT_PRIORITY`] 逐个探测。返回（格式，采样率，声道数）
