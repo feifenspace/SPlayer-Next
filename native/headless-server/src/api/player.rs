@@ -1352,6 +1352,7 @@ async fn run_alsa_dsd_load(
     use audio_engine_core::direct_dsd::DirectDsdReader;
 
     let LoadReservation {
+        direct_initial_take,
         token,
         cover_dir,
         device_name,
@@ -1361,6 +1362,10 @@ async fn run_alsa_dsd_load(
 
     let source_owned = source_for_decoder.clone();
     let result = spawn_isolated_blocking("alsa-dsd-load-worker", move || {
+        // old_threads 必须在普通线程 drop：HTTP 流源的 drop 链含 ffmpeg_audio/
+        // reqwest 内部 tokio runtime，在 async 上下文（主 worker）drop 会触发
+        // "Cannot drop a runtime" panic → 整进程 abort（2026-09-11 16:41 事故）
+        drop(direct_initial_take);
         // 元数据：封面/标签走 ffmpeg 探测（DSF/DFF 均支持），失败不阻断播放
         let cancel = audio_engine_core::HttpCancelHandle::new();
         let meta = audio_engine_core::decoder::probe_metadata(&source_owned, None, cancel)
