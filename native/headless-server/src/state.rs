@@ -238,6 +238,8 @@ pub struct AppState {
     /// 下一次 load/stop 时 cancel 上一请求仍在途的全量下载——下载不受
     /// load token 校验中断，无此机制会占满线程与带宽直到自身超时
     pub load_download_cancel: Arc<Mutex<Option<audio_engine_core::HttpCancelHandle>>>,
+    /// v10：ALSA 原生 DSD 直出流（alsammap + DSD 源时挂载；load/stop 轮换）
+    pub alsa_dsd_stream: Arc<Mutex<Option<Arc<crate::api::AlsaDsdHandle>>>>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
     snapshot: Arc<RwLock<Option<PlayerSnapshot>>>,
 }
@@ -518,6 +520,7 @@ impl AppState {
             queue,
             direct_boundary_event,
             load_download_cancel,
+            alsa_dsd_stream: Arc::new(Mutex::new(None)),
             snapshot,
         })
     }

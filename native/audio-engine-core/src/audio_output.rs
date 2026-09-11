@@ -139,6 +139,32 @@ impl AudioOutput {
 
     /// 按本配置创建一次播放的输出流，实时回调从 `source` 拉取样本。
     /// 调用方持有返回的 `PlaybackStream`，直到本次播放结束。
+    /// v10: alsammap 设备上打开原生 DSD 直出流（DSD_U32_BE）。
+    /// DSD 走专用 altset，不经过 PCM 通道，MAX_SAFE_SAMPLE_RATE 守卫不适用
+    #[cfg(target_os = "linux")]
+    pub fn build_dsd_stream(
+        &self,
+        reader: crate::direct_dsd::DirectDsdReader,
+        on_eof: Box<dyn FnOnce() + Send>,
+    ) -> Result<crate::playback::PlaybackStream> {
+        let device = match &self.backend {
+            OutputBackend::AlsaMmap { device, .. } => device.clone(),
+            _ => anyhow::bail!("build_dsd_stream 仅支持 alsammap 后端"),
+        };
+        let stream = crate::alsa_mmap_sink::AlsaDsdStream::open(
+            &device,
+            reader,
+            on_eof,
+            Arc::clone(&self.on_failure),
+        )?;
+        Ok(crate::playback::PlaybackStream::AlsaDsd(stream))
+    }
+
+    /// 当前后端是否为 alsammap（供 headless 路由 DSD）
+    pub fn is_alsammap(&self) -> bool {
+        matches!(self.backend, OutputBackend::AlsaMmap { .. })
+    }
+
     pub(crate) fn build_stream(
         &self,
         source: DecoderSource,

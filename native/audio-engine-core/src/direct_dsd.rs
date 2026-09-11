@@ -600,7 +600,7 @@ fn repack_dff_l4r4(input: &[u8], output: &mut [u8], channels: usize) -> Result<(
     Ok(())
 }
 
-fn adapt_dsd_bit_order(
+pub(crate) fn adapt_dsd_bit_order(
     payload: &mut [u8],
     source_bit_order: DirectDsdBitOrder,
     wire_bit_order: DirectDsdBitOrder,

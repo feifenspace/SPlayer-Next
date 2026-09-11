@@ -14,6 +14,8 @@ pub enum PlaybackStream {
     Cpal(cpal::Stream),
     #[cfg(target_os = "linux")]
     Alsa(crate::alsa_mmap_sink::AlsaMmapStream),
+    #[cfg(target_os = "linux")]
+    AlsaDsd(crate::alsa_mmap_sink::AlsaDsdStream),
 }
 
 impl PlaybackStream {
@@ -25,6 +27,11 @@ impl PlaybackStream {
                 stream.play();
                 Ok(())
             }
+            #[cfg(target_os = "linux")]
+            PlaybackStream::AlsaDsd(stream) => {
+                stream.play();
+                Ok(())
+            }
         }
     }
 
@@ -33,6 +40,11 @@ impl PlaybackStream {
             PlaybackStream::Cpal(stream) => stream.pause().map_err(Into::into),
             #[cfg(target_os = "linux")]
             PlaybackStream::Alsa(stream) => {
+                stream.pause();
+                Ok(())
+            }
+            #[cfg(target_os = "linux")]
+            PlaybackStream::AlsaDsd(stream) => {
                 stream.pause();
                 Ok(())
             }
