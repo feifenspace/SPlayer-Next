@@ -1,5 +1,6 @@
 import { getHttpPlayerClient } from "./httpClientInstance";
 import { webConfigFiles } from "./webConfigFiles";
+import { createWebPlaylistApi } from "./webPlaylistApi";
 import { useStatusStore } from "@/stores/status";
 import { createWebStreamingApi } from "@/services/streaming/web/service";
 import { generateUUID } from "@/utils/uuid";
@@ -249,46 +250,7 @@ export const installWebPolyfill = (): void => {
       onScanProgress: (callback: (event: any) => void) => playerClient.onScanProgress(callback),
       deleteTracks: async () => ({ success: true, data: { deleted: 0, failed: 0 } }),
     }),
-    playlist: createSafeProxy("playlist", {
-      list: async () => {
-        const res = await playerClient.getPlaylists();
-        return res.success ? (res as any).data : [];
-      },
-      getAll: async () => {
-        const res = await playerClient.getPlaylists();
-        return res.success
-          ? { success: true, data: (res as any).data }
-          : { success: false, data: [] };
-      },
-      get: async (id: string) => {
-        const res = await playerClient.getPlaylist(id);
-        return res.success ? (res as any).data : null;
-      },
-      create: async (input: any) => {
-        const res = await playerClient.createPlaylist(input);
-        return res.success
-          ? (res as any).data
-          : { id: `pl-${Date.now()}`, type: "local", tracks: [], ...input };
-      },
-      update: async (id: string, input: any) => {
-        const res = await playerClient.updatePlaylist(id, input);
-        return res.success ? (res as any).data : { id, type: "local", tracks: [], ...input };
-      },
-      remove: async (id: string) => {
-        const res = await playerClient.removePlaylist(id);
-        return res.success;
-      },
-      addTracks: async (id: string, tracks: any[]) => {
-        const res = await playerClient.addPlaylistTracks(id, tracks);
-        return res.success;
-      },
-      removeTracks: async (id: string, tracks: any[]) => {
-        const res = await playerClient.removePlaylistTracks(id, tracks);
-        return res.success;
-      },
-      importLegacy: async () => true,
-      clear: async () => true,
-    }),
+    playlist: createWebPlaylistApi(playerClient),
     plugins: createSafeProxy("plugins", {
       list: async () => [],
       onStatus: () => () => {},
