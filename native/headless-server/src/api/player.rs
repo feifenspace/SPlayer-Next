@@ -1354,7 +1354,7 @@ async fn run_alsa_dsd_load(
     let LoadReservation {
         direct_initial_take,
         token,
-        cover_dir,
+        cover_dir: _,
         device_name,
         ..
     } = reservation;

@@ -69,6 +69,14 @@ pub(crate) async fn ws_run(mut socket: WebSocket, state: AppState) {
     // 本连接是否订阅 FFT 频谱（默认关闭；订阅计数归零时关闭引擎 FFT 定时器）
     let mut fft_subscribed = false;
 
+    // 建连后先发送快照：interval 与 heartbeat 的首次 tick 都是就绪状态，
+    // 不能让客户端先收到 Ping 而没有可渲染的播放器状态。
+    let snapshot = state.snapshot();
+    let payload = serde_json::json!({ "type": "snapshot", "data": snapshot }).to_string();
+    if !send_msg(&mut socket, Message::Text(payload.into())).await {
+        return;
+    }
+
     loop {
         tokio::select! {
             _ = interval.tick() => {

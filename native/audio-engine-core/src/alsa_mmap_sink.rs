@@ -235,7 +235,7 @@ fn write_loop(
         let (buf, per) = pcm.get_params()?;
         let start_th = pcm
             .sw_params_current()
-            .and_then(|mut sw| {
+            .and_then(|sw| {
                 use alsa::pcm::SwParams;
                 SwParams::get_start_threshold(&sw)
             })
