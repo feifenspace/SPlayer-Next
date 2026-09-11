@@ -933,7 +933,10 @@ fn full_reconnect_load(
                 let premute = state.player.lock().begin_direct_pre_mute();
                 if premute {
                     // 锁外事件驱动等待倒计时消耗完（连接暂停/无拉流时由超时兜底）
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
+                    // 预静音必须覆盖 Target 的实际播放延迟和缓冲；测试机约为
+                    // 110ms latency + 100ms buffer，120ms 余量不足，容易在
+                    // disconnect/reconnect 边界留下旧格式数据。
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(320);
                     while state.player.lock().direct_pre_mute_pending()
                         && std::time::Instant::now() < deadline
                     {

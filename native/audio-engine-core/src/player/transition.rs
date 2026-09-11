@@ -777,21 +777,10 @@ impl InnerPlayer {
             cancel,
             staged_generation,
         )?;
-        // 手动 handoff 新源起播：
-        // - tinyLMS Quick Resume（默认）：无排空垫、无静音间隙，新源与旧曲
-        //   缓冲尾巴数据级硬拼接——只清除静音/淡出残留态，不做淡入渐变
-        //   （fade-in 会制造"静音跳回音频"阶跃，恰是要消除的咔哒来源）
-        // - legacy：换源提交前已交付排空静音（设备端处于零电平），新源首
-        //   采样非零时从静音一步阶跃到全幅会在 DAC 端产生咔哒声；10ms
-        //   raised-cosine 淡入消除该阶跃。PCM=begin_fade_in(0→1)；
-        //   DSD=clear_drain（复位排空态，无增益通道）。staged 自动切歌
-        //   不经此函数（无静音间隙，连续波形换源无需淡入），与实测
-        //   "自动切歌无杂音"一致
-        if crate::direct_runtime::tiny_lms_switch_enabled() {
-            playback.resume_handoff_no_fade();
-        } else {
-            playback.resume_soft();
-        }
+        // 手动 handoff 必须经过短淡入。旧源尾部与新源首块不保证零交叉，
+        // 无淡入硬拼接会在 DAC 上形成瞬时幅度阶跃，产生咔哒或爆音。
+        // staged 自动接力不经过本函数，仍保持连续波形路径。
+        playback.resume_soft();
         debug!(
             target: "diretta_handoff",
             phase = "handoff_resume",
