@@ -30,6 +30,58 @@ interface ServerWsMessage {
   speed?: number;
 }
 
+interface HeadlessOutputDevice {
+  id: string;
+  name: string;
+  is_default: boolean;
+  mmap: boolean;
+}
+
+function physicalAlsaDeviceKey(device: HeadlessOutputDevice): string | null {
+  const selector = device.id.replace(/^(?:alsa|alsammap):(?:plughw|hw):/, "");
+  if (selector === device.id) return null;
+  const card = /(?:^|,)CARD=([^,]+)/.exec(selector)?.[1];
+  const dev = /(?:^|,)DEV=([^,]+)/.exec(selector)?.[1] ?? "0";
+  if (card) return `card:${card}:dev:${dev}`;
+  const numeric = /^(\d+),(\d+)/.exec(selector);
+  return numeric ? `card:${numeric[1]}:dev:${numeric[2]}` : selector;
+}
+
+function normalizeHeadlessOutputDevices(devices: HeadlessOutputDevice[]): AudioDevice[] {
+  const candidates = devices.filter((device) =>
+    device.id.startsWith("alsammap:hw:") ||
+    device.id.startsWith("alsa:plughw:") ||
+    device.id.startsWith("alsa:hw:"),
+  );
+  const selected = new Map<string, HeadlessOutputDevice>();
+  for (const device of candidates) {
+    const mmap = device.id.startsWith("alsammap:");
+    const physicalKey = physicalAlsaDeviceKey(device);
+    if (!physicalKey) continue;
+    const key = `${mmap ? "mmap" : "alsa"}:${physicalKey}`;
+    const existing = selected.get(key);
+    if (
+      !existing ||
+      (!mmap && device.id.startsWith("alsa:plughw:") && existing.id.startsWith("alsa:hw:"))
+    ) selected.set(key, device);
+  }
+  if (selected.size === 0) {
+    const fallback = devices.find((device) => device.id === "alsa:default");
+    if (fallback) selected.set("alsa:default", fallback);
+  }
+  return [...selected.values()]
+    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
+    .map((device) => {
+      const mmap = device.id.startsWith("alsammap:");
+      const name = device.name.replace(/\s*·\s*ALSA MMAP.*$/i, "").trim();
+      return {
+        id: device.id,
+        name: `${name}（${mmap ? "ALSA MMAP" : "ALSA"}）`,
+        isDefault: Boolean(device.is_default),
+      };
+    });
+}
+
 /**
  * Web / HTTP + WebSocket 播放器客户端实现
  * 对接 Linux Headless Server (Axum)
@@ -986,22 +1038,12 @@ export class HttpPlayerClient implements IPlayerClient {
     // 本地声卡条目（设置 DeviceSelector 与投屏面板共用本列表）
     try {
       const res = await this.request<{
-        devices: Array<{ id: string; name: string; is_default: boolean; mmap: boolean }>;
+        devices: HeadlessOutputDevice[];
       }>("/api/v1/player/devices");
       if (res.success && res.data?.devices) {
-        // 只暴露每张物理声卡的 ALSA MMAP 直出条目（每卡一条，位纯真）：
-        // /player/devices 还返回 20+ 个 ALSA 插件层设备（front/surround*/
-        // iec958/plughw/dmix…同一张卡），全部展示会淹没设备面板；
-        // mmap 打开失败时服务端会自动降级 cpal（sibling plughw），无需并列暴露
-        const seen = new Set<string>();
-        const devices = res.data.devices
-          .filter((d) => d.id.startsWith("alsammap:") && !seen.has(d.id) && seen.add(d.id))
-          .map((d) => ({
-            id: d.id,
-            name: d.name,
-            isDefault: Boolean(d.is_default),
-          }));
-        return { success: true, data: devices };
+        // Each physical DAC is represented once in ALSA mode and once in
+        // ALSA MMAP mode. CPAL plugin aliases are intentionally suppressed.
+        return { success: true, data: normalizeHeadlessOutputDevices(res.data.devices) };
       }
       return { success: true, data: [] };
     } catch (error) {

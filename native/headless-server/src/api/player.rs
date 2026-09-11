@@ -4,7 +4,7 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use super::spawn_isolated_blocking;
 use axum::{
@@ -112,6 +112,29 @@ pub(crate) async fn devices_handler() -> Result<Json<PlayerResponse>, ApiError> 
                 format!("{desc} · ALSA MMAP 直出"),
                 false,
             ));
+        }
+        // Minimal ALSA installations may not return hw:* entries through
+        // HintIter even though CPAL has already enumerated them. A CPAL
+        // alsa:hw:* selector is also valid for the MMAP backend.
+        let mut mmap_selectors: HashSet<String> = devices
+            .iter()
+            .filter_map(|(id, _, _)| id.strip_prefix("alsammap:").map(str::to_owned))
+            .collect();
+        let cpal_hw_devices: Vec<(String, String)> = devices
+            .iter()
+            .filter_map(|(id, name, _)| {
+                id.strip_prefix("alsa:hw:")
+                    .map(|selector| (format!("hw:{selector}"), name.clone()))
+            })
+            .collect();
+        for (selector, name) in cpal_hw_devices {
+            if mmap_selectors.insert(selector.clone()) {
+                devices.push((
+                    format!("alsammap:{selector}"),
+                    format!("{name} · ALSA MMAP 直出"),
+                    false,
+                ));
+            }
         }
         devices
     })

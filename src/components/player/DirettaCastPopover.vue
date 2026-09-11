@@ -41,10 +41,13 @@ const loadingCaps = ref(false);
 const buttonType = computed<"default" | "cover">(() => (props.cover ? "cover" : "default"));
 const mutedClass = computed(() => (props.cover ? "text-cover/50" : "text-on-surface-variant"));
 
-const scanTargets = async () => {
+const refreshOutputTargets = async () => {
   scanning.value = true;
   try {
-    const res = await playerClient.scanDirettaTargets();
+    const [res] = await Promise.all([
+      playerClient.scanDirettaTargets(),
+      refreshDevices(),
+    ]);
     if (res.success && Array.isArray(res.data)) {
       targets.value = res.data;
     }
@@ -92,12 +95,11 @@ const showTargetCaps = async (target: DirettaTarget) => {
 };
 
 watch(popoverOpen, (open) => {
-  if (open) void scanTargets();
+  if (open) void refreshOutputTargets();
 });
 
 onMounted(() => {
-  if (status.outputDevices.length === 0) void refreshDevices();
-  void scanTargets();
+  void refreshOutputTargets();
 });
 </script>
 
@@ -148,7 +150,7 @@ onMounted(() => {
           size="small"
           :title="t('common.refresh')"
           :loading="scanning"
-          @click="scanTargets"
+          @click="refreshOutputTargets"
         >
           <template #icon>
             <IconRefresh :class="['text-xs', scanning && 'animate-spin']" />
