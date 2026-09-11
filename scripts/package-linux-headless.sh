@@ -604,6 +604,23 @@ EOF
     log "发布目录就绪: ${pkg_dir}"
 }
 
+# 自动清理调试/测试时产生的 debug 调试符号与中间依赖缓存，释放磁盘空间
+clean_debug_cache() {
+    local debug_dir="$PROJECT_ROOT/target/debug"
+    if [[ -d "$debug_dir" ]]; then
+        local debug_size
+        debug_size=$(du -sh "$debug_dir" 2>/dev/null | awk '{print $1}' || echo "")
+        if [[ -n "$debug_size" && "$debug_size" != "0" ]]; then
+            log "🧹 检测到调试中间产物 target/debug (${debug_size})，正在自动清理以释放磁盘空间..."
+            rm -rf "$debug_dir"
+            log "✨ 调试缓存清理完成！"
+        fi
+    fi
+}
+
+# 0. 自动检查并清理调试产生的庞大中间依赖缓存
+clean_debug_cache
+
 # 1. 增量构建前端 Web UI
 WEB_DIST="$PROJECT_ROOT/out/renderer"
 if [[ $SKIP_BUILD -eq 0 && $SKIP_WEB -eq 0 ]]; then

@@ -43,7 +43,7 @@ SDK 路径必须包含 Host 和 lib 目录以及所选架构的静态库。显�
 bash scripts/package-linux-headless.sh --sdk-dir /path/to/DirettaHostSDK_150 --arch v2
 ```
 
-发布包默认输出到项目 `dist`，可通过 `--output-dir` 修改。打包调用 `pnpm build:web` 和锁定依赖的 Cargo 构建。打包不再自动删除 `target/debug`，保留调试与测试缓存。
+发布包默认输出到项目 `dist`，可通过 `--output-dir` 修改。打包调用 `pnpm build:web` 和锁定依赖的 Cargo 构建。由于开发服务器磁盘空间有限，打包前默认自动清理项目 `target/debug`，这是项目维护者明确要求保留的行为；后续调试或测试会重新生成缓存。
 
 Web 静态资源仍随发布目录的 web 子目录交付，服务端可从磁盘读取；本次没有改变源码内的占位资源内嵌策略，也未执行完整 release 打包或部署。
 
