@@ -40,6 +40,12 @@ const WAIT_CEILING_MS: u32 = 50;
 /// 直出采样格式优先级（容器精度从高到低）
 const FORMAT_PRIORITY: [Format; 3] = [Format::s32(), Format::s24(), Format::s16()];
 
+/// ALSA MMAP 直出采样率安全上限。正常 PCM 最高 768k；DSD 解码 PCM 最低
+/// DSD64 = 2.8224 MHz。高于 1 MHz 的请求只可能来自 DSD 源解码——直接拒绝，
+/// 防止 USB isoc 超高带宽请求拖垮 snd-usb-audio/xHCI 导致整机死机
+/// （2026-09-11 播 DSD 经 ALSA MMAP 整机 hang 的防护）。
+const MAX_SAFE_SAMPLE_RATE: u32 = 1_000_000;
+
 /// 协商 hw 参数：采样率必须精确命中，声道固定 2。
 /// 格式按 [`FORMAT_PRIORITY`] 逐个探测。返回（格式，采样率，声道数）
 fn negotiate_hw_params(pcm: &PCM, requested_rate: Option<u32>) -> Result<(Format, u32, u16)> {
@@ -59,6 +65,10 @@ fn negotiate_hw_params(pcm: &PCM, requested_rate: Option<u32>) -> Result<(Format
 
     match requested_rate {
         Some(rate) => {
+            ensure!(
+                rate <= MAX_SAFE_SAMPLE_RATE,
+                "采样率 {rate} Hz 超出 ALSA MMAP 直出安全上限（{MAX_SAFE_SAMPLE_RATE} Hz）。                 DSD 源请使用 Diretta 输出（支持 native DSD/DoP）；本地声卡直出不支持 DSD 解码流"
+            );
             // 蓝图示例缺陷 1 修正：crate 无 Exact，用 Nearest 设置后校验实际
             // 速率必须精确命中——静默邻居速率会触发重采样破坏位纯真
             h.set_rate(rate, ValueOr::Nearest)?;
