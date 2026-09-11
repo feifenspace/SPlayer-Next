@@ -1,4 +1,4 @@
-import { HttpPlayerClient } from "./httpClient";
+import { getHttpPlayerClient } from "./httpClientInstance";
 import { useStatusStore } from "@/stores/status";
 import { createWebStreamingApi } from "@/services/streaming/web/service";
 import { generateUUID } from "@/utils/uuid";
@@ -25,10 +25,13 @@ if (typeof window !== "undefined") {
  * 为纯 Web / 浏览器环境提供完备的 window.api polyfill，
  * 彻底消除桌面端专属 API 在 Web 运行时抛出的 TypeError / Uncaught Exception
  */
+let installedApi: unknown;
+
 export const installWebPolyfill = (): void => {
   if (typeof window === "undefined" || (window.api && window.electron)) return;
+  if (installedApi && window.api === installedApi) return;
 
-  const playerClient = new HttpPlayerClient();
+  const playerClient = getHttpPlayerClient();
 
   const detectPlatform = (): NodeJS.Platform => {
     if (typeof navigator !== "undefined") {
@@ -46,10 +49,7 @@ export const installWebPolyfill = (): void => {
         if (prop in target) return (target as any)[prop];
         return (..._args: unknown[]) => {
           // 事件监听类方法返回解绑函数
-          if (
-            typeof prop === "string" &&
-            (prop.startsWith("on") || prop.startsWith("subscribe"))
-          ) {
+          if (typeof prop === "string" && (prop.startsWith("on") || prop.startsWith("subscribe"))) {
             return () => {};
           }
           // 列表类查询方法默认返回空数组，避免 .map / .filter 抛错
@@ -226,11 +226,7 @@ export const installWebPolyfill = (): void => {
       clearSession: async () => {},
     },
     apis: {
-      call: async (
-        platform: string,
-        name: string,
-        params?: Record<string, unknown>,
-      ) => {
+      call: async (platform: string, name: string, params?: Record<string, unknown>) => {
         return playerClient.callApi(platform, name, params || {});
       },
       setCookie: async (platform: string, cookie: string) => {
@@ -260,7 +256,8 @@ export const installWebPolyfill = (): void => {
       getAlbums: async () => playerClient.getLibraryAlbums(),
       getArtists: async () => playerClient.getLibraryArtists(),
       getAlbumTracks: async (albumName: string) => playerClient.getLibraryAlbumTracks(albumName),
-      getArtistTracks: async (artistName: string) => playerClient.getLibraryArtistTracks(artistName),
+      getArtistTracks: async (artistName: string) =>
+        playerClient.getLibraryArtistTracks(artistName),
       prefetchArtistAvatars: async () => ({ success: true, data: {} }),
       fetchArtistAvatar: async (artistName: string) => {
         try {
@@ -291,7 +288,9 @@ export const installWebPolyfill = (): void => {
       },
       getAll: async () => {
         const res = await playerClient.getPlaylists();
-        return res.success ? { success: true, data: (res as any).data } : { success: false, data: [] };
+        return res.success
+          ? { success: true, data: (res as any).data }
+          : { success: false, data: [] };
       },
       get: async (id: string) => {
         const res = await playerClient.getPlaylist(id);
@@ -299,7 +298,9 @@ export const installWebPolyfill = (): void => {
       },
       create: async (input: any) => {
         const res = await playerClient.createPlaylist(input);
-        return res.success ? (res as any).data : { id: `pl-${Date.now()}`, type: "local", tracks: [], ...input };
+        return res.success
+          ? (res as any).data
+          : { id: `pl-${Date.now()}`, type: "local", tracks: [], ...input };
       },
       update: async (id: string, input: any) => {
         const res = await playerClient.updatePlaylist(id, input);
@@ -608,10 +609,7 @@ export const installWebPolyfill = (): void => {
             });
             const list = resp?.data?.songs || [];
             if (list.length > 0 && (list[0].hash || list[0].id)) {
-              return (polyfillApi.lyrics as any).matchById(
-                "kugou",
-                list[0].hash || list[0].id,
-              );
+              return (polyfillApi.lyrics as any).matchById("kugou", list[0].hash || list[0].id);
             }
           }
           return { ok: false, error: "No match found" };
@@ -619,7 +617,6 @@ export const installWebPolyfill = (): void => {
           return { ok: false, error: String(e) };
         }
       },
-
 
       fetchTTMLOverlay: async (track: any, platform: string) => {
         try {
@@ -645,9 +642,7 @@ export const installWebPolyfill = (): void => {
       pickLyricRepoDir: async () => ({ ok: false }),
     },
     comments: {
-      sources: async () => [
-        { id: "builtin:netease", name: "网易云音乐", enabled: true },
-      ],
+      sources: async () => [{ id: "builtin:netease", name: "网易云音乐", enabled: true }],
       get: async (args: any) => {
         try {
           const id = args?.track?.id;
@@ -696,6 +691,7 @@ export const installWebPolyfill = (): void => {
   };
 
   (window as unknown as { api: unknown }).api = polyfillApi;
+  installedApi = polyfillApi;
 };
 
 // 自动在模块导入时执行初始化
