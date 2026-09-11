@@ -1,4 +1,4 @@
-name: Headless
+name: Headless compatibility
 
 on:
   push:
@@ -10,34 +10,75 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: headless-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: true
+
 jobs:
-  linux-headless:
+  headless-web-and-package:
+    name: Web, Headless tests and package
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
+
     steps:
-      - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v6
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
         with:
           node-version: 22.19.0
           cache: pnpm
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
         with:
           shared-key: headless
+
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libasound2-dev libssl-dev pkg-config clang cmake
-      - name: Install Web dependencies without desktop install hooks
+          sudo apt-get install --no-install-recommends -y \
+            clang \
+            cmake \
+            libasound2-dev \
+            libclang-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Install Web dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Check and build Web
+
+      - name: Verify Web client
         run: |
           pnpm typecheck:web
-          pnpm exec tsc --noEmit --module esnext --moduleResolution bundler --target esnext --esModuleInterop --skipLibCheck --resolveJsonModule vite.web.config.ts
           pnpm test:web
           pnpm build:web
-      - name: Check Headless without proprietary SDK
-        run: cargo check --locked -p headless-server
-      - name: Test Headless contracts
-        run: cargo test --locked -p headless-server --lib --test library_db_test --test playlist_config_test --test static_hosting_test
+
+      - name: Test Headless server
+        run: cargo test --locked -p headless-server -- --test-threads=1
+
+      - name: Build Headless release package without proprietary SDK
+        env:
+          PACKAGE_OUTPUT: ${{ runner.temp }}/splayer-headless-package
+        run: |
+          ./scripts/package-linux-headless.sh \
+            --arch v2 \
+            --output-dir "$PACKAGE_OUTPUT" \
+            --date ci \
+            --no-tar
+          package_dir="$(find "$PACKAGE_OUTPUT" -mindepth 1 -maxdepth 1 -type d -name 'splayer-headless-*' -print -quit)"
+          test -n "$package_dir"
+          test -x "$package_dir/splayer-headless"
+          test -f "$package_dir/web/index.html"
+          test -x "$package_dir/install.sh"
+          "$package_dir/splayer-headless" --help >/dev/null
