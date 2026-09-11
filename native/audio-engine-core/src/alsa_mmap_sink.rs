@@ -37,6 +37,14 @@ const MAX_CONTIGUOUS_ERRORS: u32 = 50;
 /// 设备事件等待上限（毫秒）：决定 play/pause 指令的响应延迟上界
 const WAIT_CEILING_MS: u32 = 50;
 
+/// hw buffer 预填高水位（毫秒）。写循环每轮只把 hw 已填水位补到该上限，
+/// 而非"有空间就灌"：消费节奏贴回真实时，解码 Shared 队列得以保留网络
+/// 缓冲垫，position 平滑前进，watchdog 不再误判流媒体"输出停滞"。
+/// 预填 200ms 远超 RT 内核调度毛刺 + 已提权音频线程的最坏等待，无 xrun
+/// 风险；本地文件场景同步受益（队列缓冲垫保留）。
+/// env `SPLAYER_ALSAMMAP_WATERMARK_MS` 可覆盖（毫秒；0 = 恢复旧行为不限速）。
+const HW_HIGH_WATERMARK_MS: u64 = 200;
+
 /// 直出采样格式优先级（容器精度从高到低）
 const FORMAT_PRIORITY: [Format; 3] = [Format::s32(), Format::s24(), Format::s16()];
 
@@ -221,10 +229,30 @@ fn write_loop(
     stop: Arc<AtomicBool>,
     on_failure: OutputFailureCallback,
 ) -> Result<()> {
-    let (pcm, format, _rate, _channels, can_pause) = open_pcm(device, requested_rate)?;
+    let (pcm, format, rate, _channels, can_pause) = open_pcm(device, requested_rate)?;
+    // v9e 诊断：一次性打印协商几何 + 启动阈值
+    {
+        let (buf, per) = pcm.get_params()?;
+        let start_th = pcm
+            .sw_params_current()
+            .and_then(|mut sw| {
+                use alsa::pcm::SwParams;
+                SwParams::get_start_threshold(&sw)
+            })
+            .unwrap_or(-1);
+        info!(
+            buf, per, start_th, rate,
+            "ALSA MMAP 写循环几何"
+        );
+    }
     let mut hardware_paused = false;
     let mut contiguous_errors: u32 = 0;
     let mut xrun_count: u64 = 0;
+    // v9e 诊断：状态轨迹（前 15s 或非 Running 时每秒一条）
+    let diag_started = std::time::Instant::now();
+    let mut diag_last = std::time::Instant::now();
+    let mut diag_writes: u64 = 0;
+    let mut diag_frames: u64 = 0;
 
     // 暂停/停止时送数字静音：f32 静音帧（写入时按格式转换）
     macro_rules! fill_frame {
@@ -289,6 +317,26 @@ fn write_loop(
             other => anyhow::bail!("ALSA 设备进入不可恢复状态: {other:?}"),
         }
 
+        let running_now = matches!(pcm.state(), State::Running);
+        if diag_last.elapsed() >= std::time::Duration::from_millis(1000)
+            && (!running_now || diag_started.elapsed() < std::time::Duration::from_secs(15))
+        {
+            // Status 无 hw_ptr/appl_ptr 访问器；delay = appl-hw+在途（播放语义），
+            // 配合 avail（=buf-filled）足以还原硬件消费进度
+            let (delay, avail_st) = pcm
+                .status()
+                .map(|s| (s.get_delay(), s.get_avail()))
+                .unwrap_or((-1, -1));
+            info!(
+                state = ?pcm.state(),
+                delay, avail_st,
+                avail_now = pcm.avail_update().unwrap_or(-1),
+                diag_writes, diag_frames,
+                "ALSA MMAP 写循环轨迹"
+            );
+            diag_last = std::time::Instant::now();
+        }
+
         let avail = match pcm.avail_update() {
             Ok(avail) => avail as usize,
             Err(err) => {
@@ -311,7 +359,34 @@ fn write_loop(
             continue;
         }
 
-        let frames = avail.min(4096);
+        // 高水位限速（v9e）：hw 已填水位 = buffer_frames - avail。每轮只补到
+        // ~HW_HIGH_WATERMARK_MS 上限，多余供给滞留在 Shared 队列作网络缓冲垫。
+        // pacing 只约束"何时写"，不碰样本路径——位纯真不受影响。
+        let buffer_frames = {
+            let (buf, _per) = pcm.get_params()?;
+            buf
+        };
+        let watermark_ms = std::env::var("SPLAYER_ALSAMMAP_WATERMARK_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(HW_HIGH_WATERMARK_MS);
+        let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
+        let filled = buffer_frames.saturating_sub(avail as u64);
+        let allowed = watermark_frames.saturating_sub(filled) as usize;
+        let frames = if watermark_ms == 0 {
+            avail.min(4096)
+        } else {
+            avail.min(4096).min(allowed)
+        };
+        if frames == 0 {
+            // 已填至高水位：hw 还在按真实时消耗，睡一小段再补。
+            // 不能用 pcm.wait——它等的是 avail>=avail_min（周期级空闲），
+            // 与水位条件 filled<watermark 不等价：水位满但 hw 仍有空闲时
+            // wait 立即返回，会造成忙转烧满一核（2026-09-11 v9e 实测教训）
+            let drain_ms = (watermark_ms / 4).clamp(2, 20);
+            std::thread::sleep(std::time::Duration::from_millis(drain_ms));
+            continue;
+        }
         // 格式为运行期值（非 const 可匹配），按相等性分派
         let result = if format == Format::s16() {
             pcm.io_i16()?.mmap(frames, |buf: &mut [i16]| {
@@ -351,7 +426,11 @@ fn write_loop(
             })
         };
         match result {
-            Ok(_) => contiguous_errors = 0,
+            Ok(n) => {
+                contiguous_errors = 0;
+                diag_writes += 1;
+                diag_frames += n as u64;
+            }
             Err(err) => {
                 if pcm.state() == State::XRun {
                     xrun_count += 1;
@@ -362,6 +441,27 @@ fn write_loop(
                 if contiguous_errors >= MAX_CONTIGUOUS_ERRORS {
                     on_failure();
                     anyhow::bail!("ALSA 连续错误超限（last: {err}）");
+                }
+            }
+        }
+
+        // v9e4：显式启动流。实测 MMAP commit 推进 appl_ptr 后内核并未按
+        // start_threshold 自动启动（state 停留 Prepared、hw_ptr 冻结、delay=0），
+        // 该路径自上线以来实际从未出声（此前"能播"仅指解码侧 position 前进）。
+        // 每轮写成功后若仍处 Prepared（含 XRun prepare / 暂停恢复路径）即显式 start
+        if matches!(pcm.state(), State::Prepared) {
+            match pcm.start() {
+                Ok(()) => {
+                    info!(filled = buffer_frames.saturating_sub(avail as u64), "ALSA MMAP 显式 start：hw 自动启动未触发，已手动拉起");
+                }
+                Err(err) => {
+                    if pcm.state() == State::XRun {
+                        xrun_count += 1;
+                        let _ = pcm.prepare();
+                    } else {
+                        contiguous_errors += 1;
+                        warn!(error = %err, "ALSA MMAP 显式 start 失败");
+                    }
                 }
             }
         }
