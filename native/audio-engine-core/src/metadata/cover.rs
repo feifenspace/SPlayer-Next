@@ -51,6 +51,7 @@ pub fn extract_directory_cover_thumbnail(source: &Path, cache_dir: &str) -> Opti
     }
 
     let cover = fs::read(source).ok()?;
+    tracing::info!(bytes = cover.len(), source = %source.display(), "目录封面缓存未命中，重读封面文件");
     fs::create_dir_all(cache_dir).ok()?;
     generate_cover_thumbnail(&cover, &thumb_file).ok()?;
     Some(thumb_file.to_string_lossy().into_owned())
@@ -97,6 +98,7 @@ pub fn extract_cover_thumbnail_with_directory_cover(
     }
 
     if let Some(cover) = reader.cover() {
+        tracing::info!(bytes = cover.data.len(), source = %source, "内嵌封面缓存未命中，重新生成缩略图");
         fs::create_dir_all(cache_dir).ok()?;
         generate_cover_thumbnail(&cover.data, &thumb_file).ok()?;
         return Some(thumb_file.to_string_lossy().into_owned());

@@ -493,6 +493,7 @@ pub fn scan_directories(
                             break;
                         }
                         let (path_str, directory_cover) = &audio_items[i];
+                        let probe_t0 = Instant::now();
                         match probe_or_skip(
                             path_str,
                             directory_cover.as_deref(),
@@ -502,6 +503,10 @@ pub fn scan_directories(
                             ProbeOutcome::Skipped => skipped += 1,
                             ProbeOutcome::StatFailed => stat_failed.push(path_str.clone()),
                             ProbeOutcome::Track(track) => tracks.push(track),
+                        }
+                        let probe_dt = probe_t0.elapsed();
+                        if probe_dt.as_millis() >= 50 {
+                            info!(elapsed = ?probe_dt, path = %path_str, "probe 慢文件");
                         }
                         if tracks.len() >= 8 || stat_failed.len() >= 16 || skipped >= 64 {
                             let _ = tx.send(WorkerBatch {
