@@ -157,7 +157,6 @@ impl AlsaMmapStream {
         let device_owned = device.to_string();
         let worker_stop = Arc::clone(&stop);
         let worker_paused = Arc::clone(&paused);
-        let worker_paused = Arc::clone(&paused);
         let worker = std::thread::Builder::new()
             .name("alsa-mmap-output".into())
             .spawn(move || {
