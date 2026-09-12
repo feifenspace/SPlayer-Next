@@ -103,6 +103,7 @@ class DirectSync final : public DIRETTA::Sync {
         !pause_silence_.empty()) {
       stream.Data.P = pause_silence_.data();
       stream.Size = pause_silence_.size();
+      pause_silence_callbacks_.fetch_add(1, std::memory_order_acq_rel);
       return true;
     }
     // pre-roll 窗口：仅在 play() 生效后（isPlay）消耗，握手期拉取不触发。
@@ -168,6 +169,7 @@ class DirectSync final : public DIRETTA::Sync {
   std::vector<std::uint8_t> preroll_silence_;
   // 暂停期间由 SDK 回调复用的静音块；控制线程准备，实时回调只读。
   std::atomic_bool pause_silence_active_{false};
+  std::atomic_uint32_t pause_silence_callbacks_{0};
   std::vector<std::uint8_t> pause_silence_;
 
  public:
@@ -181,19 +183,52 @@ class DirectSync final : public DIRETTA::Sync {
   bool setPauseSilence(bool paused) {
     const bool was_paused = pause_silence_active_.load(std::memory_order_acquire);
     if (paused) {
+      // 若已经在静音态，回调线程可能正读取 pause_silence_；只重置计数，
+      // 绝不能重新分配该缓冲，否则会破坏 SDK 对回调指针生命周期的要求。
+      if (was_paused) {
+        pause_silence_callbacks_.store(0, std::memory_order_release);
+        return true;
+      }
       const std::size_t cycle = getCycleSize();
-      if (cycle == 0) return was_paused;
+      if (cycle == 0) return false;
       std::uint8_t mute = 0x00;
       try {
         mute = getSinkConfigure().getMuteByte();
       } catch (...) {
       }
       pause_silence_.assign(cycle, mute);
+      pause_silence_callbacks_.store(0, std::memory_order_release);
       pause_silence_active_.store(true, std::memory_order_release);
     } else {
       pause_silence_active_.store(false, std::memory_order_release);
     }
     return was_paused;
+  }
+
+  // 关闭连接前，维持当前 Diretta 会话并让 SDK 实际拉取一段静音。不能只靠
+  // Rust 侧淡出：一旦 close() 立即 stop，最后一个静音块未必已经到达 Target。
+  // 此处与 DirettaRendererUPnP 的 stopPlayback(false) 对齐；它不改变曲目
+  // 数据或 DAC 格式，仅在旧格式会话中发送数字静音。
+  void flush_silence_before_stop() noexcept {
+    if (!is_connect() || !isPlay()) return;
+    try {
+      setPauseSilence(true);
+      constexpr std::uint32_t kMinCallbacks = 20;
+      constexpr auto kMinDuration = std::chrono::milliseconds(120);
+      constexpr auto kTimeout = std::chrono::milliseconds(220);
+      const auto started = std::chrono::steady_clock::now();
+      const auto deadline = started + kTimeout;
+      while ((pause_silence_callbacks_.load(std::memory_order_acquire) < kMinCallbacks ||
+              std::chrono::steady_clock::now() - started < kMinDuration) &&
+             std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      std::fprintf(stderr, "[diretta-v12] shutdown silence callbacks=%u\n",
+                   pause_silence_callbacks_.load(std::memory_order_acquire));
+      std::fflush(stderr);
+    } catch (...) {
+      // teardown must continue even if an SDK query fails.
+    }
   }
 
  private:
@@ -217,6 +252,7 @@ struct DirettaConnection {
     if (!sync) return;
     try {
       if (sync->is_connect()) {
+        sync->flush_silence_before_stop();
         sync->stop();
         sync->releaseSourceBlock();
         sync->disconnect_flgset();
