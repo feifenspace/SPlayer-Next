@@ -255,9 +255,12 @@ impl DirectStageHandle {
         duration_secs: f64,
         generation: u64,
     ) -> Result<()> {
-        if source.starts_with("http://") || source.starts_with("https://") {
-            bail!("[Direct] 当前 gapless staging 仅支持本地 seekable 音源");
+        let is_http = source.starts_with("http://") || source.starts_with("https://");
+        if is_http && open_path.is_none() {
+            bail!("[Direct] 在线 gapless staging 需要已物化的本地 seekable 输入");
         }
+        // 在线源由上层完整物化到 memfd，并通过 open_path 传入；逻辑 source 仍
+        // 用于保留格式嗅探和元数据，不能据此误判为不可 seek。
         // stop_secs：CUE 分轨有界播放的虚拟 EOF（文件时间轴 start+轨长）；
         // 非 CUE 源为 0（自然 EOF 收尾），SACD/DSD 由解码器按轨界自然结束
         let (path_str, start, cue_dur, stop_secs) =

@@ -107,16 +107,28 @@ pub(crate) fn schedule_next_preload(state: &AppState) {
         };
         let mut snapshot = snapshot;
         snapshot.align_by_source(current_source.as_deref());
-        let Some((_next_pos, item)) = snapshot.next() else {
-            info!("无缝预载：队列无下一曲（repeat/队尾），跳过");
+        let mut remaining = snapshot.items.len().saturating_sub(1);
+        let mut candidate = snapshot.next();
+        let item = loop {
+            let Some((next_pos, item)) = candidate else {
+                break None;
+            };
+            if is_loadable_candidate_source(&item.source) {
+                break Some(item.clone());
+            }
+            remaining = remaining.saturating_sub(1);
+            if remaining == 0 {
+                break None;
+            }
+            snapshot.pos = next_pos;
+            candidate = snapshot.next();
+        };
+        let Some(item) = item else {
+            info!("无缝预载：队列无有效下一曲（repeat/队尾），跳过");
             return;
         };
-        item.clone()
+        item
     };
-    if !is_loadable_candidate_source(&item.source) {
-        warn!(source = %item.source, "无缝预载：下一曲 source 不可加载，跳过");
-        return;
-    }
 
     let token = PRELOAD_TOKEN.fetch_add(1, Ordering::AcqRel) + 1;
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);

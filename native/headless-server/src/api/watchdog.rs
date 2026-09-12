@@ -83,14 +83,27 @@ fn auto_advance_candidate(
                     duration_hint: item.duration_ms.map(|ms| ms as f64 / 1000.0),
                 });
             }
-            let (_next_pos, item) = snapshot.next()?;
-            if !super::player::is_loadable_candidate_source(&item.source) {
-                return None;
+            // 在线链接异步解析时，队列可能短暂含有空 source 占位。跳过这些
+            // 无法加载的条目，寻找当前播放顺序内后续的有效曲目，避免整队停止。
+            let mut remaining = snapshot.items.len().saturating_sub(1);
+            let mut next = snapshot.next();
+            loop {
+                let Some((next_pos, item)) = next else {
+                    return None;
+                };
+                if super::player::is_loadable_candidate_source(&item.source) {
+                    return Some(PendingNext {
+                        source: item.source.clone(),
+                        duration_hint: item.duration_ms.map(|ms| ms as f64 / 1000.0),
+                    });
+                }
+                remaining = remaining.saturating_sub(1);
+                if remaining == 0 {
+                    return None;
+                }
+                snapshot.pos = next_pos;
+                next = snapshot.next();
             }
-            Some(PendingNext {
-                source: item.source.clone(),
-                duration_hint: item.duration_ms.map(|ms| ms as f64 / 1000.0),
-            })
         }
         // 未注册队列：回退前端驱动的旧单槽候选
         None => legacy,
@@ -513,5 +526,15 @@ mod tests {
         let got = auto_advance_candidate(None, Some("/x"), legacy("/legacy-next"));
         assert_eq!(got.unwrap().source, "/legacy-next");
         assert!(auto_advance_candidate(None, None, None).is_none());
+    }
+
+    #[test]
+    fn skips_unresolved_queue_entries_when_advancing() {
+        let got = auto_advance_candidate(
+            Some(queue_of(&["/a", "", "https://example.test/next.flac"])),
+            Some("/a"),
+            None,
+        );
+        assert_eq!(got.unwrap().source, "https://example.test/next.flac");
     }
 }
