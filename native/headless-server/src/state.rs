@@ -74,6 +74,38 @@ pub struct PendingNext {
     pub duration_hint: Option<f64>,
 }
 
+/// 服务端自治统计的进行中播放会话（浏览器离场也持续记录）
+#[derive(Debug, Clone)]
+pub struct ServerPlaySession {
+    pub track_id: String,
+    pub source: String,
+    pub track_json: String,
+    /// 本次播放开始 unix ms
+    pub started_at: u64,
+    /// 最近一次进入 Playing 的时刻（unix ms）；非播放态为 None
+    pub playing_since: Option<u64>,
+    /// 已累计收听毫秒（不含进行中区间）
+    pub listened_ms: u64,
+}
+
+/// 结束当前会话并移交看门狗写库；音频事件回调不直接访问数据库。
+fn complete_server_play_session(
+    current: &Mutex<Option<ServerPlaySession>>,
+    completed: &Mutex<Vec<ServerPlaySession>>,
+    requested: &std::sync::atomic::AtomicBool,
+) {
+    let Some(mut session) = current.lock().take() else {
+        return;
+    };
+    if let Some(since) = session.playing_since.take() {
+        session.listened_ms += unix_millis().saturating_sub(since);
+    }
+    if session.listened_ms >= 5000 {
+        completed.lock().push(session);
+        requested.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// 播放队列重复模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -234,6 +266,14 @@ pub struct AppState {
     /// 待自治消费的 Direct boundary generation（事件回调置位，看门狗消费——
     /// 回调线程禁止锁 player）：无缝边界后的簿记提交与再预载调度
     pub direct_boundary_event: Arc<Mutex<Option<u64>>>,
+    /// 服务端自治播放统计：当前进行中的会话（load/边界转正时开启，
+    /// 曲终/切歌/停止时结算写库）。浏览器在场时浏览器也上报，
+    /// upsert 端做 ±5s 邻近去重
+    pub server_play_session: Arc<Mutex<Option<ServerPlaySession>>>,
+    /// 已结束且待写库的会话。无缝边界先入队再创建新会话，避免错记曲目。
+    pub server_play_completed: Arc<Mutex<Vec<ServerPlaySession>>>,
+    /// 服务端自治统计结算请求（Ended/SourceError/Stop 置位，看门狗消费写库）
+    pub server_play_finalize_requested: Arc<std::sync::atomic::AtomicBool>,
     /// 在途 load 请求的网络下载取消句柄（probe 物化阶段专用，注册即轮换）。
     /// 下一次 load/stop 时 cancel 上一请求仍在途的全量下载——下载不受
     /// load token 校验中断，无此机制会占满线程与带宽直到自身超时
@@ -320,6 +360,9 @@ impl AppState {
         let pending_next = Arc::new(Mutex::new(None));
         let queue: Arc<Mutex<Option<QueueSnapshot>>> = Arc::new(Mutex::new(None));
         let direct_boundary_event: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let server_play_session: Arc<Mutex<Option<ServerPlaySession>>> = Arc::new(Mutex::new(None));
+        let server_play_completed: Arc<Mutex<Vec<ServerPlaySession>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_play_finalize_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let load_download_cancel: Arc<Mutex<Option<audio_engine_core::HttpCancelHandle>>> =
             Arc::new(Mutex::new(None));
         let now_playing: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
@@ -335,7 +378,12 @@ impl AppState {
             let staged_meta = Arc::clone(&staged_meta);
             let pending_next = Arc::clone(&pending_next);
             let direct_boundary_event = Arc::clone(&direct_boundary_event);
+            let server_play_session = Arc::clone(&server_play_session);
+            let server_play_completed = Arc::clone(&server_play_completed);
+            let server_play_finalize_requested = Arc::clone(&server_play_finalize_requested);
             let queue = Arc::clone(&queue);
+            // 自治统计的边界分支也要查队列（完整曲目 JSON 反查），单独持一份
+            let queue_for_stats = Arc::clone(&queue);
             // 当前 source → 队列条目 track id（WS 每次状态推送随带，前端按 id 采纳）
             let resolve_current_track_id = move |source: Option<&str>| -> Option<String> {
                 let source = source?;
@@ -359,6 +407,22 @@ impl AppState {
                 });
                 match event {
                     PlayerEvent::StateChanged { state } => {
+                        // 自治统计：进出 Playing 维护会话计时区间
+                        if let Some(session) = server_play_session.lock().as_mut() {
+                            match state {
+                                PlayerState::Playing => {
+                                    if session.playing_since.is_none() {
+                                        session.playing_since = Some(unix_millis());
+                                    }
+                                }
+                                _ => {
+                                    if let Some(since) = session.playing_since.take() {
+                                        session.listened_ms +=
+                                            unix_millis().saturating_sub(since);
+                                    }
+                                }
+                            }
+                        }
                         authoritative.state = state;
                         let current_source = authoritative.current_source.clone();
                         let current_track_id = resolve_current_track_id(current_source.as_deref());
@@ -396,6 +460,11 @@ impl AppState {
                         }
                     }
                     PlayerEvent::Ended => {
+                        complete_server_play_session(
+                            &server_play_session,
+                            &server_play_completed,
+                            &server_play_finalize_requested,
+                        );
                         authoritative.is_finished = true;
                         authoritative.state = PlayerState::Stopped;
                         authoritative.position = authoritative.duration;
@@ -405,6 +474,11 @@ impl AppState {
                         let _ = ws_tx.send(serde_json::json!({ "type": "ended", "data": {} }));
                     }
                     PlayerEvent::SourceError => {
+                        complete_server_play_session(
+                            &server_play_session,
+                            &server_play_completed,
+                            &server_play_finalize_requested,
+                        );
                         authoritative.position = 0.0;
                         authoritative.duration = 0.0;
                         authoritative.state = PlayerState::Idle;
@@ -453,6 +527,41 @@ impl AppState {
                             authoritative.is_finished = false;
                         }
                         *snapshot.write() = Some(authoritative);
+                        complete_server_play_session(
+                            &server_play_session,
+                            &server_play_completed,
+                            &server_play_finalize_requested,
+                        );
+                        if let Some(source) = promoted_source.as_deref() {
+                            let now = unix_millis();
+                            let (track_id, track_json) = queue_for_stats
+                                .lock()
+                                .as_ref()
+                                .and_then(|q| q.items.iter().find(|it| it.source == source))
+                                .map(|it| {
+                                    (
+                                        it.track
+                                            .as_ref()
+                                            .and_then(|t| t.get("id"))
+                                            .and_then(|v| v.as_str())
+                                            .map(String::from)
+                                            .unwrap_or_else(|| source.to_string()),
+                                        serde_json::to_string(
+                                            it.track.as_ref().unwrap_or(&serde_json::Value::Null),
+                                        )
+                                        .unwrap_or_else(|_| "{}".into()),
+                                    )
+                                })
+                                .unwrap_or_else(|| (source.to_string(), "{}".into()));
+                            *server_play_session.lock() = Some(ServerPlaySession {
+                                track_id,
+                                source: source.to_string(),
+                                track_json,
+                                started_at: now,
+                                playing_since: Some(now),
+                                listened_ms: 0,
+                            });
+                        }
                         // 边界即候选消费点：刚切入的曲子就是 pending_next 里注册的
                         // 那首，不清掉的话曲终自动连播会在它播完后重放一遍
                         // （引擎 current_source 不随边界更新，曲终时无法自证重复）。
@@ -519,6 +628,9 @@ impl AppState {
             pending_next,
             queue,
             direct_boundary_event,
+            server_play_session,
+            server_play_completed,
+            server_play_finalize_requested,
             load_download_cancel,
             alsa_dsd_stream: Arc::new(Mutex::new(None)),
             snapshot,

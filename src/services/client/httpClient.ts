@@ -9,7 +9,8 @@ import type {
   FftData,
   PlayerEvent,
   Track,
-  ServerQueueSnapshot } from "./types";
+  ServerQueueSnapshot,
+} from "./types";
 
 interface ServerStatusResponse {
   state: string;
@@ -48,10 +49,11 @@ function physicalAlsaDeviceKey(device: HeadlessOutputDevice): string | null {
 }
 
 function normalizeHeadlessOutputDevices(devices: HeadlessOutputDevice[]): AudioDevice[] {
-  const candidates = devices.filter((device) =>
-    device.id.startsWith("alsammap:hw:") ||
-    device.id.startsWith("alsa:plughw:") ||
-    device.id.startsWith("alsa:hw:"),
+  const candidates = devices.filter(
+    (device) =>
+      device.id.startsWith("alsammap:hw:") ||
+      device.id.startsWith("alsa:plughw:") ||
+      device.id.startsWith("alsa:hw:"),
   );
   const selected = new Map<string, HeadlessOutputDevice>();
   for (const device of candidates) {
@@ -63,7 +65,8 @@ function normalizeHeadlessOutputDevices(devices: HeadlessOutputDevice[]): AudioD
     if (
       !existing ||
       (!mmap && device.id.startsWith("alsa:plughw:") && existing.id.startsWith("alsa:hw:"))
-    ) selected.set(key, device);
+    )
+      selected.set(key, device);
   }
   if (selected.size === 0) {
     const fallback = devices.find((device) => device.id === "alsa:default");
@@ -137,10 +140,8 @@ export class HttpPlayerClient implements IPlayerClient {
     return headers;
   }
 
-  private async request<T = unknown>(
-    path: string,
-    options: RequestInit = {},
-  ): Promise<IpcResponse<T>> {
+  // public：webPolyfill 的 stats 代理需要直接调用未包装的 REST 端点
+  async request<T = unknown>(path: string, options: RequestInit = {}): Promise<IpcResponse<T>> {
     try {
       const url = `${this.baseUrl}${path}`;
       const res = await fetch(url, {
@@ -454,13 +455,17 @@ export class HttpPlayerClient implements IPlayerClient {
   }
 
   async getLibraryAlbumTracks(name: string): Promise<IpcResponse<any[]>> {
-    const res = await this.request<any[]>(`/api/v1/library/albums/${encodeURIComponent(name)}/tracks`);
+    const res = await this.request<any[]>(
+      `/api/v1/library/albums/${encodeURIComponent(name)}/tracks`,
+    );
     if (!res.success) return { success: false, data: [] };
     return { success: true, data: (res as any).data ?? [] };
   }
 
   async getLibraryArtistTracks(name: string): Promise<IpcResponse<any[]>> {
-    const res = await this.request<any[]>(`/api/v1/library/artists/${encodeURIComponent(name)}/tracks`);
+    const res = await this.request<any[]>(
+      `/api/v1/library/artists/${encodeURIComponent(name)}/tracks`,
+    );
     if (!res.success) return { success: false, data: [] };
     return { success: true, data: (res as any).data ?? [] };
   }
@@ -502,12 +507,14 @@ export class HttpPlayerClient implements IPlayerClient {
     return this.request("/api/v1/library/scan/status");
   }
 
-  async browseFs(path?: string): Promise<IpcResponse<{
-    current_path: string;
-    parent_path: string | null;
-    dirs: Array<{ name: string; path: string; has_children?: boolean; is_dir?: boolean }>;
-    audio_count: number;
-  }>> {
+  async browseFs(path?: string): Promise<
+    IpcResponse<{
+      current_path: string;
+      parent_path: string | null;
+      dirs: Array<{ name: string; path: string; has_children?: boolean; is_dir?: boolean }>;
+      audio_count: number;
+    }>
+  > {
     const url = path ? `/api/v1/fs/browse?path=${encodeURIComponent(path)}` : "/api/v1/fs/browse";
     const res = await this.request<any>(url);
     if (!res.success) {
@@ -542,7 +549,13 @@ export class HttpPlayerClient implements IPlayerClient {
     return res;
   }
 
-  async createPlaylist(input: { id?: string; title?: string; name?: string; description?: string; cover?: string }): Promise<IpcResponse<any>> {
+  async createPlaylist(input: {
+    id?: string;
+    title?: string;
+    name?: string;
+    description?: string;
+    cover?: string;
+  }): Promise<IpcResponse<any>> {
     return this.request("/api/v1/playlist/create", {
       method: "POST",
       body: JSON.stringify({
@@ -554,7 +567,10 @@ export class HttpPlayerClient implements IPlayerClient {
     });
   }
 
-  async updatePlaylist(id: string, input: { title?: string; name?: string; description?: string; cover?: string }): Promise<IpcResponse<any>> {
+  async updatePlaylist(
+    id: string,
+    input: { title?: string; name?: string; description?: string; cover?: string },
+  ): Promise<IpcResponse<any>> {
     return this.request(`/api/v1/playlist/${encodeURIComponent(id)}`, {
       method: "PUT",
       body: JSON.stringify({
@@ -801,35 +817,34 @@ export class HttpPlayerClient implements IPlayerClient {
       bit_rate?: number;
       codec?: string;
       cover?: string;
-    }>(
-      "/api/v1/player/load",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          source,
-          auto_play: options?.autoPlay ?? true,
-          meta: options?.meta
-            ? {
-                id: options.meta.id,
-                title: options.meta.title,
-                artist: Array.isArray(options.meta.artists)
-                  ? options.meta.artists.map((a: any) => (typeof a === "string" ? a : a.name)).join(", ")
-                  : (options.meta as any).artist,
-                album:
-                  typeof options.meta.album === "string"
-                    ? options.meta.album
-                    : options.meta.album?.name,
-                duration: options.meta.duration,
-                track: options.meta.track,
-                cue_path: options.meta.cuePath,
-                cue_audio_path: options.meta.cueAudioPath,
-                cue_start_ms: options.meta.cueStartMs,
-                cue_end_ms: options.meta.cueEndMs,
-              }
-            : undefined,
-        }),
-      },
-    );
+    }>("/api/v1/player/load", {
+      method: "POST",
+      body: JSON.stringify({
+        source,
+        auto_play: options?.autoPlay ?? true,
+        meta: options?.meta
+          ? {
+              id: options.meta.id,
+              title: options.meta.title,
+              artist: Array.isArray(options.meta.artists)
+                ? options.meta.artists
+                    .map((a: any) => (typeof a === "string" ? a : a.name))
+                    .join(", ")
+                : (options.meta as any).artist,
+              album:
+                typeof options.meta.album === "string"
+                  ? options.meta.album
+                  : options.meta.album?.name,
+              duration: options.meta.duration,
+              track: options.meta.track,
+              cue_path: options.meta.cuePath,
+              cue_audio_path: options.meta.cueAudioPath,
+              cue_start_ms: options.meta.cueStartMs,
+              cue_end_ms: options.meta.cueEndMs,
+            }
+          : undefined,
+      }),
+    });
 
     if (!res.success) {
       return { success: false, error: res.error };
@@ -839,8 +854,10 @@ export class HttpPlayerClient implements IPlayerClient {
     const sampleRate = payload?.original_sample_rate || payload?.sample_rate || 44100;
     const channels = payload?.channels || 2;
     const bitsPerSample = payload?.bits_per_sample || 16;
-    const bitRate = payload?.bit_rate || (bitsPerSample * sampleRate * channels);
-    const codec = payload?.codec || (source.endsWith(".flac") ? "flac" : source.endsWith(".mp3") ? "mp3" : "flac");
+    const bitRate = payload?.bit_rate || bitsPerSample * sampleRate * channels;
+    const codec =
+      payload?.codec ||
+      (source.endsWith(".flac") ? "flac" : source.endsWith(".mp3") ? "mp3" : "flac");
 
     const loadResult: LoadResult = {
       detail: {
@@ -854,7 +871,10 @@ export class HttpPlayerClient implements IPlayerClient {
         externalLyrics: [],
       },
       mediaInfo: {
-        duration: payload?.duration != null ? Math.round(payload.duration * 1000) : (options?.meta?.duration ?? 0),
+        duration:
+          payload?.duration != null
+            ? Math.round(payload.duration * 1000)
+            : (options?.meta?.duration ?? 0),
         cover: payload?.cover ?? options?.meta?.cover,
       },
     };
@@ -929,7 +949,12 @@ export class HttpPlayerClient implements IPlayerClient {
     source: string,
     durationSecs: number,
     generation = 0,
-    meta?: { title?: string | null; artist?: string | null; album?: string | null; cover?: string | null },
+    meta?: {
+      title?: string | null;
+      artist?: string | null;
+      album?: string | null;
+      cover?: string | null;
+    },
   ): Promise<IpcResponse<boolean>> {
     const res = await this.request<{ staged: boolean }>("/api/v1/player/direct/stage_next", {
       method: "POST",

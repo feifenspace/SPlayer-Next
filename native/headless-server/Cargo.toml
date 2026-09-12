@@ -54,6 +54,9 @@ futures-util = "0.3"
 md5 = "0.7"
 urlencoding = "2"
 
+# 播放统计聚合的本地时区日/周边界计算
+chrono = "0.4"
+
 [dev-dependencies]
 tokio-tungstenite = "0.24"
 tempfile = "3"

@@ -183,5 +183,134 @@ pub(crate) async fn stats_summary_handler(
 }
 
 // -------------------------------------------------------------------
+// 播放统计聚合与收藏事件（首页卡片 / Stats 页，Web·headless 模式）
+// -------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct TopQuery {
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DailyQuery {
+    pub days: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FavoriteEventRequest {
+    pub track: Option<Value>,
+    #[serde(rename = "trackId")]
+    pub track_id: Option<String>,
+    pub source: Option<String>,
+    pub action: Option<String>,
+}
+
+/// 播放统计汇总（本周时长/连续天数/新增收藏等）
+pub(crate) async fn stats_play_summary_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let conn = state.db.lock();
+    let summary = crate::db::get_play_stats_summary(&conn)?;
+    Ok(Json(PlayerResponse::ok(summary)))
+}
+
+/// 最常播放曲目
+pub(crate) async fn stats_top_tracks_handler(
+    State(state): State<AppState>,
+    Query(q): Query<TopQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let conn = state.db.lock();
+    let list = crate::db::get_top_tracks(&conn, q.limit.unwrap_or(10).min(100))?;
+    Ok(Json(PlayerResponse::ok(
+        serde_json::to_value(list).unwrap_or_default(),
+    )))
+}
+
+/// 最常播放专辑
+pub(crate) async fn stats_top_albums_handler(
+    State(state): State<AppState>,
+    Query(q): Query<TopQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let conn = state.db.lock();
+    let list = crate::db::get_top_albums(&conn, q.limit.unwrap_or(10).min(100))?;
+    Ok(Json(PlayerResponse::ok(
+        serde_json::to_value(list).unwrap_or_default(),
+    )))
+}
+
+/// 最常播放歌手
+pub(crate) async fn stats_top_artists_handler(
+    State(state): State<AppState>,
+    Query(q): Query<TopQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let conn = state.db.lock();
+    let list = crate::db::get_top_artists(&conn, q.limit.unwrap_or(10).min(100))?;
+    Ok(Json(PlayerResponse::ok(
+        serde_json::to_value(list).unwrap_or_default(),
+    )))
+}
+
+/// 每日播放统计
+pub(crate) async fn stats_daily_handler(
+    State(state): State<AppState>,
+    Query(q): Query<DailyQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let conn = state.db.lock();
+    let list = crate::db::get_daily_play_stats(&conn, q.days.unwrap_or(90).clamp(1, 365))?;
+    Ok(Json(PlayerResponse::ok(
+        serde_json::to_value(list).unwrap_or_default(),
+    )))
+}
+
+/// 分时播放统计
+pub(crate) async fn stats_hourly_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let conn = state.db.lock();
+    let list = crate::db::get_hourly_play_stats(&conn)?;
+    Ok(Json(PlayerResponse::ok(
+        serde_json::to_value(list).unwrap_or_default(),
+    )))
+}
+
+/// 收藏变更事件（前端 useFavorite → polyfill recordFavorite）
+pub(crate) async fn stats_favorite_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<FavoriteEventRequest>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let track_id = payload
+        .track_id
+        .or_else(|| {
+            payload
+                .track
+                .as_ref()
+                .and_then(|t| t.get("id"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let source = payload
+        .source
+        .or_else(|| {
+            payload
+                .track
+                .as_ref()
+                .and_then(|t| t.get("source"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "local".to_string());
+    let action = payload.action.unwrap_or_else(|| "add".to_string());
+    if action != "add" && action != "remove" {
+        return Err(ApiError::bad_request("action must be 'add' or 'remove'"));
+    }
+    let track_json =
+        serde_json::to_string(&payload.track.unwrap_or_default()).unwrap_or_else(|_| "{}".into());
+    let conn = state.db.lock();
+    crate::db::record_favorite_event(&conn, &track_id, &source, &action, &track_json)?;
+    Ok(Json(PlayerResponse::ok(json!({ "recorded": true }))))
+}
+
+// -------------------------------------------------------------------
 // 封面与歌词服务 Handlers
 // -------------------------------------------------------------------

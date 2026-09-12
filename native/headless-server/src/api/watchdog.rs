@@ -121,6 +121,72 @@ pub(crate) const OUTPUT_RECOVERY_MIN_RESUME_POSITION: f64 = 1.0;
 /// 输出恢复跳下一曲候选的最小间隔：防止设备整体故障时把整个队列烧穿
 pub(crate) const OUTPUT_RECOVERY_SKIP_COOLDOWN: Duration = Duration::from_secs(120);
 
+// -------------------------------------------------------------------
+// 服务端自治播放统计（浏览器离场也持续记录 play_history）
+// -------------------------------------------------------------------
+
+fn persist_server_play_session(state: &AppState, session: crate::state::ServerPlaySession) {
+    if session.listened_ms < 5000 {
+        return;
+    }
+    let conn = state.db.lock();
+    if let Err(error) = crate::db::upsert_server_play_history(
+        &conn,
+        &session.track_id,
+        &session.source,
+        session.started_at,
+        session.listened_ms,
+        &session.track_json,
+    ) {
+        tracing::warn!(error = %error, "服务端自治统计写入失败");
+    }
+}
+
+/// 结算当前会话：供 stop/load 等非音频回调路径调用。
+pub(crate) fn finalize_server_play_session(state: &AppState) {
+    let Some(mut session) = state.server_play_session.lock().take() else {
+        return;
+    };
+    if let Some(since) = session.playing_since.take() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        session.listened_ms += now_ms.saturating_sub(since);
+    }
+    persist_server_play_session(state, session);
+}
+
+/// 写入音频事件回调移交的已完成会话。
+fn flush_completed_server_play_sessions(state: &AppState) {
+    let completed = std::mem::take(&mut *state.server_play_completed.lock());
+    for session in completed {
+        persist_server_play_session(state, session);
+    }
+}
+
+/// 开启新的自治统计会话（load 成功 / 曲终接力加载成功时调用；切曲先结算上一曲）
+pub(crate) fn begin_server_play_session(
+    state: &AppState,
+    track_id: &str,
+    source: &str,
+    track_json: &str,
+) {
+    finalize_server_play_session(state);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    *state.server_play_session.lock() = Some(crate::state::ServerPlaySession {
+        track_id: track_id.to_string(),
+        source: source.to_string(),
+        track_json: track_json.to_string(),
+        started_at: now_ms,
+        playing_since: Some(now_ms),
+        listened_ms: 0,
+    });
+}
+
 /// 启动输出恢复看门狗（服务启动时调用一次）。
 /// headless 没有 Electron 主进程的 requestReinit 链路：OutputFailed/OutputStalled
 /// 在事件回调里只置位请求标志（回调线程禁止锁 player / 触发 async），由本任务
@@ -146,6 +212,14 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
+
+            // 服务端自治统计：曲终/音源失败结算请求消费（写库）
+            if state
+                .server_play_finalize_requested
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                flush_completed_server_play_sessions(&state);
+            }
 
             // Direct boundary 自治消费：无缝边界发生后的引擎簿记提交、队列推进
             // 与再下一曲预载调度（移植自 atom playbackSession 的 boundary 消费，
@@ -242,6 +316,8 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                         ),
                         Err(e) => Some(format!("{}: {}", e.code, e.message)),
                     };
+                    // 自治统计：接力加载成功的会话开启由 load 路径的
+                    // update_now_playing → begin_server_play_session 统一完成
                     if let Some(detail) = failure {
                         let new_attempts = attempts + 1;
                         // 指数退避：5s 起倍增至上限；置位等冷却后自动重试

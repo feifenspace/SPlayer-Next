@@ -210,6 +210,8 @@ pub(crate) async fn stop_handler(State(state): State<AppState>) -> Json<PlayerRe
         let taken = state.alsa_dsd_stream.lock().take();
         drop(taken);
     }
+    // 自治统计：停止即结算当前会话（≥5s 落库）
+    super::watchdog::finalize_server_play_session(&state);
     let _ = spawn_isolated_blocking("player-stop-worker", move || {
         // 停止即作废在途/已就绪的无缝预载（下一曲 staging 不属于新会话）
         super::direct_preloader::invalidate();
@@ -1607,6 +1609,29 @@ pub(crate) fn update_now_playing(
         "bit_rate": meta.bit_rate,
         "codec": meta.codec,
     }));
+
+    // 自治统计：load 成功 = 新曲会话开始（先结算上一曲）。
+    // 曲目完整 JSON 从队列快照反查（前端推送队列时携带）；
+    // 队列外曲目退化为 source 作 id、{} 作 JSON——计数统计不受影响
+    let queue_item = state
+        .queue
+        .lock()
+        .as_ref()
+        .and_then(|q| q.items.iter().find(|it| it.source == source).cloned());
+    let (track_id, track_json) = match &queue_item {
+        Some(item) => (
+            item.track
+                .as_ref()
+                .and_then(|t| t.get("id"))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .unwrap_or_else(|| source.to_string()),
+            serde_json::to_string(item.track.as_ref().unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_else(|_| "{}".into()),
+        ),
+        None => (source.to_string(), "{}".to_string()),
+    };
+    super::watchdog::begin_server_play_session(state, &track_id, source, &track_json);
 }
 
 /// 服务端权威“正在播放”快照：重开页面/无浏览器场景恢复曲目显示用。

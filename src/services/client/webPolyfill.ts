@@ -258,25 +258,70 @@ export const installWebPolyfill = (): void => {
       fetchMarket: async () => [],
     }),
     stats: createSafeProxy("stats", {
-      getLibraryStats: async () => {
-        const res = await playerClient.getLibraryStats();
-        return res.success && (res as any).data
-          ? (res as any).data
-          : {
-              totalTracks: 0,
-              totalDuration: 0,
-              totalArtists: 0,
-              totalAlbums: 0,
-            };
-      },
+      // —— 写入 ——
       recordPlay: async (payload: any) => {
         await playerClient.recordPlayHistory(payload);
       },
-      getPlayHistoryDaily: async () => {
-        const res = await playerClient.getPlayHistory();
-        return res.success ? (res as any).data : [];
+      recordFavorite: async (event: { track: any; action: "add" | "remove" }) => {
+        try {
+          await fetch("/api/v1/stats/favorite", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ track: event.track, action: event.action }),
+          });
+        } catch (error) {
+          console.warn("[stats] recordFavorite failed:", error);
+        }
       },
-      getPlayHistoryHourly: async () => [],
+      // —— 读：播放统计汇总（首页三卡片：本周时长/新增收藏/连续收听）——
+      getStatsSummary: async () => {
+        const res = await playerClient.request("/api/v1/stats/play_summary");
+        if (res.success && (res as any).data) return (res as any).data;
+        return {
+          todayListenedMs: 0,
+          weekListenedMs: 0,
+          lastWeekListenedMs: 0,
+          totalListenedMs: 0,
+          weekPlayCount: 0,
+          totalPlayCount: 0,
+          weekFavoriteAdds: 0,
+          streakDays: 0,
+        };
+      },
+      // —— 读：最常播放（首页"继续聆听/反复聆听" + Stats 页榜单）——
+      getTopTracks: async (limit = 10) => {
+        const res = await playerClient.request(`/api/v1/stats/top_tracks?limit=${limit}`);
+        return res.success ? ((res as any).data ?? []) : [];
+      },
+      getTopAlbums: async (limit = 10) => {
+        const res = await playerClient.request(`/api/v1/stats/top_albums?limit=${limit}`);
+        return res.success ? ((res as any).data ?? []) : [];
+      },
+      getTopArtists: async (limit = 10) => {
+        const res = await playerClient.request(`/api/v1/stats/top_artists?limit=${limit}`);
+        return res.success ? ((res as any).data ?? []) : [];
+      },
+      getPlayHistoryDaily: async (days = 90) => {
+        const res = await playerClient.request(`/api/v1/stats/daily?days=${days}`);
+        return res.success ? ((res as any).data ?? []) : [];
+      },
+      getPlayHistoryHourly: async () => {
+        const res = await playerClient.request("/api/v1/stats/hourly");
+        return res.success ? ((res as any).data ?? []) : [];
+      },
+      // —— 读：曲库统计（Stats 页概览；Rust 字段映射为前端 LibraryStats 形状）——
+      getLibraryStats: async () => {
+        const res = await playerClient.getLibraryStats();
+        const data: any = res.success ? (res as any).data : null;
+        return {
+          trackCount: data?.totalTracks ?? 0,
+          albumCount: data?.totalAlbums ?? 0,
+          artistCount: data?.totalArtists ?? 0,
+          totalDurationMs: data?.totalDuration ?? 0,
+          totalFileSize: 0,
+          codecs: [],
+        };
+      },
     }),
     diretta: createSafeProxy("diretta", {
       scan: async () => playerClient.scanDirettaTargets(),

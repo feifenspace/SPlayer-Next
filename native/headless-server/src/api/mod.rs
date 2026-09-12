@@ -218,6 +218,35 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/stats/summary",
             axum::routing::get(stats_summary_handler),
         )
+        // 播放统计聚合与收藏事件（Web/headless 前端统计页与首页卡片）
+        .route(
+            "/api/v1/stats/play_summary",
+            axum::routing::get(stats_play_summary_handler),
+        )
+        .route(
+            "/api/v1/stats/top_tracks",
+            axum::routing::get(stats_top_tracks_handler),
+        )
+        .route(
+            "/api/v1/stats/top_albums",
+            axum::routing::get(stats_top_albums_handler),
+        )
+        .route(
+            "/api/v1/stats/top_artists",
+            axum::routing::get(stats_top_artists_handler),
+        )
+        .route(
+            "/api/v1/stats/daily",
+            axum::routing::get(stats_daily_handler),
+        )
+        .route(
+            "/api/v1/stats/hourly",
+            axum::routing::get(stats_hourly_handler),
+        )
+        .route(
+            "/api/v1/stats/favorite",
+            axum::routing::post(stats_favorite_handler),
+        )
         // 在线音源统一调用接口
         .route(
             "/api/v1/proxy/apis/call",

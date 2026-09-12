@@ -74,7 +74,7 @@ pub struct ArtistSummary {
 /// 初始化数据库并建表
 /// 当前二进制支持的库 schema 版本。破坏性升级时 +1 并在 init_db 补迁移逻辑；
 /// 库版本高于此值（用户回滚了程序）时拒绝启动，防止降级读坏（G.2 迁移 preflight）
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// 迁移 preflight：库 schema 版本新于二进制支持版本时拒绝启动；
 /// 需要升级的旧库先 VACUUM INTO 备份到 <db目录>/backups/migration-<版本>-<时间戳>/
@@ -220,6 +220,16 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             track_json TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_play_history_started ON play_history(started_at DESC);
+
+        CREATE TABLE IF NOT EXISTS favorite_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            action TEXT NOT NULL,
+            at INTEGER NOT NULL,
+            track_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_favorite_history_at ON favorite_history(at DESC);
 
         CREATE TABLE IF NOT EXISTS account_sessions (
             platform TEXT PRIMARY KEY,
@@ -1501,6 +1511,344 @@ pub fn get_library_stats(conn: &Connection) -> Result<DbLibraryStats> {
         total_artists,
         total_albums,
     })
+}
+
+// -------------------------------------------------------------------
+// 播放统计聚合（首页卡片 / Stats 页图表，对齐 electron playStats.ts 语义）
+// -------------------------------------------------------------------
+
+/// 今日 00:00 的 unix ms（服务器本地时区）
+fn day_start_ms(now: u64) -> u64 {
+    use chrono::{Local, TimeZone};
+    let dt = Local
+        .timestamp_millis_opt(now as i64)
+        .single()
+        .unwrap_or_else(Local::now);
+    let mid = dt.date_naive().and_hms_opt(0, 0, 0).unwrap();
+    Local
+        .from_local_datetime(&mid)
+        .single()
+        .map(|t| t.timestamp_millis() as u64)
+        .unwrap_or(now)
+}
+
+/// 本周一 00:00 的 unix ms（本地时区，周一为一周起点）
+fn week_start_ms(now: u64) -> u64 {
+    use chrono::{Datelike, Local, TimeZone};
+    let dt = Local
+        .timestamp_millis_opt(now as i64)
+        .single()
+        .unwrap_or_else(Local::now);
+    let days_from_monday = i64::from(dt.weekday().num_days_from_monday());
+    let monday = dt.date_naive() - chrono::Duration::days(days_from_monday);
+    let mid = monday.and_hms_opt(0, 0, 0).unwrap();
+    Local
+        .from_local_datetime(&mid)
+        .single()
+        .map(|t| t.timestamp_millis() as u64)
+        .unwrap_or(now)
+}
+
+/// 连续收听天数：从今天（或昨天）向前数连续有播放记录的天数
+fn compute_streak(conn: &Connection) -> u64 {
+    let days: Vec<String> = match conn
+        .prepare(
+            "SELECT DISTINCT date(started_at / 1000, 'unixepoch', 'localtime') AS day \
+             FROM play_history ORDER BY day DESC",
+        )
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        }) {
+        Ok(days) => days,
+        Err(_) => return 0,
+    };
+    if days.is_empty() {
+        return 0;
+    }
+    use chrono::{Datelike, Local, TimeZone};
+    let now_ms = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let today = Local
+        .timestamp_millis_opt(now_ms as i64)
+        .single()
+        .unwrap_or_else(Local::now);
+    let key_of = |d: chrono::DateTime<chrono::Local>| {
+        format!(
+            "{:04}-{:02}-{:02}",
+            d.year(),
+            d.month(),
+            d.day()
+        )
+    };
+    let key_today = key_of(today);
+    let yest = today - chrono::Duration::days(1);
+    let key_yesterday = key_of(yest);
+    if days[0] != key_today && days[0] != key_yesterday {
+        return 0;
+    }
+    let present: std::collections::HashSet<&str> = days.iter().map(|s| s.as_str()).collect();
+    let mut cursor = if days[0] == key_today { today } else { yest };
+    let mut streak = 0u64;
+    loop {
+        let key = key_of(cursor);
+        if !present.contains(key.as_str()) {
+            break;
+        }
+        streak += 1;
+        cursor -= chrono::Duration::days(1);
+    }
+    streak
+}
+
+/// 播放统计汇总（PlayStatsSummary 形状，camelCase 直接给前端）
+pub fn get_play_stats_summary(conn: &Connection) -> Result<serde_json::Value> {
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let day_start = day_start_ms(now);
+    let week_start = week_start_ms(now);
+    let last_week_start = week_start.saturating_sub(7 * 24 * 3600 * 1000);
+
+    let scalar = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> i64 {
+        conn.query_row(sql, params, |r| r.get::<_, i64>(0)).unwrap_or(0)
+    };
+    let empty: &[&dyn rusqlite::ToSql] = &[];
+    let today_listened = scalar(
+        "SELECT COALESCE(SUM(listened_ms),0) FROM play_history WHERE started_at >= ?1",
+        &[&day_start],
+    );
+    let week_listened = scalar(
+        "SELECT COALESCE(SUM(listened_ms),0) FROM play_history WHERE started_at >= ?1",
+        &[&week_start],
+    );
+    let last_week_listened = scalar(
+        "SELECT COALESCE(SUM(listened_ms),0) FROM play_history WHERE started_at >= ?1 AND started_at < ?2",
+        &[&last_week_start, &week_start],
+    );
+    let total_listened = scalar("SELECT COALESCE(SUM(listened_ms),0) FROM play_history", empty);
+    let week_plays = scalar(
+        "SELECT COUNT(*) FROM play_history WHERE started_at >= ?1",
+        &[&week_start],
+    );
+    let total_plays = scalar("SELECT COUNT(*) FROM play_history", empty);
+    let week_fav_adds = scalar(
+        "SELECT COUNT(*) FROM favorite_history WHERE action='add' AND at >= ?1",
+        &[&week_start],
+    );
+    let streak = compute_streak(conn);
+
+    Ok(serde_json::json!({
+        "todayListenedMs": today_listened,
+        "weekListenedMs": week_listened,
+        "lastWeekListenedMs": last_week_listened,
+        "totalListenedMs": total_listened,
+        "weekPlayCount": week_plays,
+        "totalPlayCount": total_plays,
+        "weekFavoriteAdds": week_fav_adds,
+        "streakDays": streak,
+    }))
+}
+
+/// 最常播放曲目（排除 streaming 源；对齐 electron 版 SQL）
+pub fn get_top_tracks(conn: &Connection, limit: u32) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT track_json, COUNT(*) AS plays FROM play_history
+           WHERE source != 'streaming'
+           GROUP BY source, track_id
+           ORDER BY plays DESC, MAX(started_at) DESC LIMIT ?1"#,
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut list = Vec::new();
+    for r in rows {
+        let (track_json, plays) = r?;
+        let track = serde_json::from_str::<serde_json::Value>(&track_json).unwrap_or_default();
+        list.push(serde_json::json!({ "track": track, "playCount": plays }));
+    }
+    Ok(list)
+}
+
+/// 最常播放专辑（按 album.id/name 聚合，对齐 electron 版 SQL）
+pub fn get_top_albums(conn: &Connection, limit: u32) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT track_json, COUNT(*) AS plays FROM play_history
+           WHERE source != 'streaming'
+             AND TRIM(COALESCE(json_extract(track_json,'$.album.name'),'')) != ''
+           GROUP BY source, COALESCE(json_extract(track_json,'$.album.id'),
+                                     json_extract(track_json,'$.album.name'))
+           ORDER BY plays DESC, MAX(started_at) DESC LIMIT ?1"#,
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut list = Vec::new();
+    for r in rows {
+        let (track_json, plays) = r?;
+        let track = serde_json::from_str::<serde_json::Value>(&track_json).unwrap_or_default();
+        list.push(serde_json::json!({ "track": track, "playCount": plays }));
+    }
+    Ok(list)
+}
+
+/// 最常播放歌手（json_each 展开多歌手，对齐 electron 版 SQL）
+pub fn get_top_artists(conn: &Connection, limit: u32) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT track_json, artist.value AS artist_json, COUNT(*) AS plays
+           FROM play_history, json_each(play_history.track_json, '$.artists') artist
+           WHERE play_history.source != 'streaming'
+             AND TRIM(COALESCE(json_extract(artist.value,'$.name'),'')) != ''
+           GROUP BY play_history.source,
+                    COALESCE(json_extract(artist.value,'$.id'),
+                             LOWER(json_extract(artist.value,'$.name')))
+           ORDER BY plays DESC, MAX(started_at) DESC LIMIT ?1"#,
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut list = Vec::new();
+    for r in rows {
+        let (track_json, artist_json, plays) = r?;
+        let track = serde_json::from_str::<serde_json::Value>(&track_json).unwrap_or_default();
+        let artist = serde_json::from_str::<serde_json::Value>(&artist_json).unwrap_or_default();
+        list.push(serde_json::json!({
+            "artist": artist,
+            "track": track,
+            "playCount": plays,
+        }));
+    }
+    Ok(list)
+}
+
+/// 最近 N 天每日播放次数（升序；缺日由前端图表补零）
+pub fn get_daily_play_stats(conn: &Connection, days: u32) -> Result<Vec<serde_json::Value>> {
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let start = day_start_ms(now).saturating_sub(u64::from(days).saturating_sub(1) * 86400_000);
+    let mut stmt = conn.prepare(
+        "SELECT date(started_at/1000,'unixepoch','localtime') AS day, COUNT(*) AS c \
+         FROM play_history WHERE started_at >= ?1 GROUP BY day ORDER BY day ASC",
+    )?;
+    let rows = stmt.query_map(params![start], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut list = Vec::new();
+    for r in rows {
+        let (day, c) = r?;
+        list.push(serde_json::json!({ "day": day, "playCount": c }));
+    }
+    Ok(list)
+}
+
+/// 各小时累计播放次数（0-23 全量补零）
+pub fn get_hourly_play_stats(conn: &Connection) -> Result<Vec<serde_json::Value>> {
+    let mut stmt = conn.prepare(
+        "SELECT CAST(strftime('%H', started_at/1000,'unixepoch','localtime') AS INTEGER) AS h, \
+         COUNT(*) AS c FROM play_history GROUP BY h",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for r in rows {
+        let (h, c) = r?;
+        map.insert(h, c);
+    }
+    let list: Vec<_> = (0..24)
+        .map(|h| {
+            serde_json::json!({
+                "hour": h,
+                "playCount": map.get(&(h as i64)).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(list)
+}
+
+/// 记录收藏变更（前端 useFavorite → /api/v1/stats/favorite）
+pub fn record_favorite_event(
+    conn: &Connection,
+    track_id: &str,
+    source: &str,
+    action: &str,
+    track_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO favorite_history (track_id, source, action, at, track_json) VALUES (?1,?2,?3,?4,?5)",
+        params![
+            track_id,
+            source,
+            action,
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            track_json
+        ],
+    )?;
+    Ok(())
+}
+
+/// 服务端自治记录：与浏览器上报去重——同曲且 started_at 邻近（±5s）时
+/// listened_ms 取 max 更新既有行；否则按常规规则（10 分钟窗口续写/新插入）
+pub fn upsert_server_play_history(
+    conn: &Connection,
+    track_id: &str,
+    source: &str,
+    started_at: u64,
+    listened_ms: u64,
+    track_json: &str,
+) -> Result<()> {
+    // 1) 邻近去重：同曲 ±5s 内已有记录 → listened_ms 取 max
+    let near: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT rowid, listened_ms FROM play_history WHERE track_id = ?1 \
+             AND Abs(started_at - ?2) <= 5000 ORDER BY started_at DESC LIMIT 1",
+            params![track_id, started_at as i64],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    if let Some((rowid, prev_ms)) = near {
+        if (listened_ms as i64) > prev_ms {
+            conn.execute(
+                "UPDATE play_history SET listened_ms = ?1 WHERE rowid = ?2",
+                params![listened_ms as i64, rowid],
+            )?;
+        }
+        return Ok(());
+    }
+    // 2) 常规：10 分钟窗口内同曲续写
+    if let Ok(Some((rowid, prev_started, prev_listened))) = latest_play_session(conn, track_id) {
+        let prev_end = prev_started.saturating_add(prev_listened);
+        if started_at >= prev_started && started_at.saturating_sub(prev_end) <= 10 * 60 * 1000 {
+            conn.execute(
+                "UPDATE play_history SET listened_ms = listened_ms + ?1 WHERE rowid = ?2",
+                params![listened_ms as i64, rowid],
+            )?;
+            return Ok(());
+        }
+    }
+    // 3) 新插入 + 防膨胀裁剪
+    conn.execute(
+        "INSERT INTO play_history (track_id, source, started_at, listened_ms, track_json) VALUES (?1,?2,?3,?4,?5)",
+        params![track_id, source, started_at as i64, listened_ms as i64, track_json],
+    )?;
+    conn.execute(
+        "DELETE FROM play_history WHERE rowid NOT IN \
+         (SELECT rowid FROM play_history ORDER BY started_at DESC LIMIT 5000)",
+        [],
+    )?;
+    Ok(())
 }
 
 /// 辅助行转换
