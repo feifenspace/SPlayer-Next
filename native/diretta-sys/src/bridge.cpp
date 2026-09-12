@@ -379,6 +379,7 @@ void* open_direct_with_format(
   std::size_t* used_candidate_index,
   double bytes_per_second) {
   try {
+    const auto open_started = std::chrono::steady_clock::now();
     auto connection = std::make_unique<DirettaConnection>();
 
     DIRETTA::Find::Setting setting;
@@ -391,6 +392,7 @@ void* open_direct_with_format(
       if (g_last_error.empty()) set_error("no Diretta targets found");
       return nullptr;
     }
+    const auto discovery_done = std::chrono::steady_clock::now();
 
     ACQUA::IPAddress target;
     for (const auto& [address, _info] : results) {
@@ -407,6 +409,7 @@ void* open_direct_with_format(
     // 【对齐 tinyLMS】MTU 按 IP 缓存（见 measured_mtu_for）
     std::uint32_t mtu = measured_mtu_for(target, *connection->find);
     connection->mtu = mtu;
+    const auto mtu_done = std::chrono::steady_clock::now();
 
     connection->sync = std::make_unique<DirectSync>(
       source_context,
@@ -496,11 +499,14 @@ void* open_direct_with_format(
       ACQUA::Clock(),
       ACQUA::Clock::MicroSeconds(30000));
 
+    const auto configure_done = std::chrono::steady_clock::now();
+
     // true = 强制 Target 状态机重置：全量重连（跨格式/重连）需要干净的协商起点。
     // 连接建立带重试（含残留状态清理）：Target 旧会话释放慢/状态残留时
     // connectWait 可能瞬时失败（.dbg 现场 connectWait-timeout, is_connect=0），
     // 退避重试通常可自愈；RT 权限缺失等确定性失败会快速连败后按原错误返回
     bool connected = false;
+    const auto connect_started = std::chrono::steady_clock::now();
     std::string connect_error;
     for (int attempt = 1; attempt <= 3 && !connected; ++attempt) {
       if (attempt > 1) {
@@ -540,6 +546,20 @@ void* open_direct_with_format(
                                       : connect_error);
       return nullptr;
     }
+
+    const auto connected_done = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [](const auto& start, const auto& end) {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    };
+    std::fprintf(stderr,
+                 "[diretta-v13] open timing target=%s discovery_ms=%lld mtu_ms=%lld configure_ms=%lld connect_ms=%lld total_ms=%lld\n",
+                 target_id,
+                 static_cast<long long>(elapsed_ms(open_started, discovery_done)),
+                 static_cast<long long>(elapsed_ms(discovery_done, mtu_done)),
+                 static_cast<long long>(elapsed_ms(mtu_done, configure_done)),
+                 static_cast<long long>(elapsed_ms(connect_started, connected_done)),
+                 static_cast<long long>(elapsed_ms(open_started, connected_done)));
+    std::fflush(stderr);
 
     // v7 诊断开关 C：connectWait 完成后、返回上层（上层才会 play 起播）前
     // 的静默等待（SPLAYER_DIRECT_CONNECT_DELAY_MS，默认 0）。设为 3000 可把

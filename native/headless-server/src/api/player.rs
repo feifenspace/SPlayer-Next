@@ -4,7 +4,7 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use super::spawn_isolated_blocking;
 use axum::{
@@ -922,12 +922,15 @@ fn full_reconnect_load(
     task_final_token: &std::sync::atomic::AtomicU64,
     meta_duration_secs: Option<f64>,
 ) -> Result<(audio_engine_core::direct_runtime::DirectPlayback, u64), anyhow::Error> {
+    let reconnect_started = Instant::now();
+    let mut fade_drain_ms = 0_u128;
     let (old_threads, token) = match direct_initial_take {
         Some(threads) => (threads, token),
         None => {
             // 跨格式重连前必须用完整静音垫覆盖 Target 的实际缓冲。此前默认
             // 路径只等待 8 个静音周期，可能早于 DAC latency/buffer 排空；
             // 随后的 disconnect 会截断旧格式尾部并产生短促点击。
+            let fade_drain_started = Instant::now();
             let drain = {
                 let mut player = state.player.lock();
                 let _ = player.begin_direct_fade_out();
@@ -946,6 +949,7 @@ fn full_reconnect_load(
                     );
                 }
             }
+            fade_drain_ms = fade_drain_started.elapsed().as_millis();
             // 校验 + 拆连接必须同一把锁内完成，防止与更新的 load 竞态抢跑。
             // 【防爆音决策】此处不做 pause/sync->stop 软停止：真机 A/B 实测
             // sync->stop 本身产生低频咚声（暂停路径同源），而直接从"静音垫
@@ -968,14 +972,19 @@ fn full_reconnect_load(
         }
     };
     let replacing_direct_playback = old_threads.direct_playback.is_some();
+    let teardown_started = Instant::now();
     if let Some(h) = old_threads.join_aux() {
         let _ = h.join();
     }
+    let teardown_ms = teardown_started.elapsed().as_millis();
+    let stabilization_started = Instant::now();
     if replacing_direct_playback {
         // 替换现存连接后给 Target/DAC 一个格式稳定窗口（非 stream 模式的启动验证也依赖它）
         std::thread::sleep(DIRECT_FULL_RECONNECT_STABILIZATION);
     }
+    let stabilization_ms = stabilization_started.elapsed().as_millis();
 
+    let open_started = Instant::now();
     let is_http_source =
         source_for_direct.starts_with("http://") || source_for_direct.starts_with("https://");
     let playback = if stream_mode {
@@ -1052,6 +1061,18 @@ fn full_reconnect_load(
             token,
         )?
     };
+    let open_ms = open_started.elapsed().as_millis();
+    tracing::info!(
+        target: "diretta_handoff",
+        phase = "full_reconnect_timing",
+        source = %source_for_direct,
+        fade_drain_ms,
+        teardown_ms,
+        stabilization_ms,
+        open_ms,
+        total_ms = reconnect_started.elapsed().as_millis(),
+        "Diretta 全量重连分阶段耗时"
+    );
     fold_direct_format_into(metadata, playback.format());
     metadata.duration_secs = playback.duration();
     if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
