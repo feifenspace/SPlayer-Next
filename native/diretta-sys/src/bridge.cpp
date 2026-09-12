@@ -98,6 +98,13 @@ class DirectSync final : public DIRETTA::Sync {
 
  protected:
   bool getNewStream(diretta_stream& stream) override {
+    // 暂停时持续交付静音且不请求真实源块，播放位置不会前进。
+    if (pause_silence_active_.load(std::memory_order_acquire) &&
+        !pause_silence_.empty()) {
+      stream.Data.P = pause_silence_.data();
+      stream.Size = pause_silence_.size();
+      return true;
+    }
     // pre-roll 窗口：仅在 play() 生效后（isPlay）消耗，握手期拉取不触发。
     // 静音块大小取 SDK 当前周期尺寸；不消费真实音源数据
     if (preroll_remaining_bytes_.load(std::memory_order_acquire) > 0 && isPlay()) {
@@ -159,12 +166,35 @@ class DirectSync final : public DIRETTA::Sync {
   SPlayerDirettaReleaseBlock release_block_;
   std::atomic<std::int64_t> preroll_remaining_bytes_{0};
   std::vector<std::uint8_t> preroll_silence_;
+  // 暂停期间由 SDK 回调复用的静音块；控制线程准备，实时回调只读。
+  std::atomic_bool pause_silence_active_{false};
+  std::vector<std::uint8_t> pause_silence_;
 
  public:
   // v11-1: 实际协商的 wire 存储位深（默认 32）。S32 被 Target 拒绝而回退
   // S16 wire 时由上层置 16，getNewStream 据此在桥内把 i32 容器降位；
   // 热重配也以此为准（S16 wire 连接不得被重配回 S32）
   std::uint8_t wire_storage_bits = 32;
+
+  // 暂停时保持 Sync 时钟和网络传输运行，只交付数字静音。
+  // 控制线程在置位前准备好缓冲，SDK 回调线程只读取该缓冲。
+  bool setPauseSilence(bool paused) {
+    const bool was_paused = pause_silence_active_.load(std::memory_order_acquire);
+    if (paused) {
+      const std::size_t cycle = getCycleSize();
+      if (cycle == 0) return was_paused;
+      std::uint8_t mute = 0x00;
+      try {
+        mute = getSinkConfigure().getMuteByte();
+      } catch (...) {
+      }
+      pause_silence_.assign(cycle, mute);
+      pause_silence_active_.store(true, std::memory_order_release);
+    } else {
+      pause_silence_active_.store(false, std::memory_order_release);
+    }
+    return was_paused;
+  }
 
  private:
   std::vector<std::uint8_t> wire_convert_buf_;
@@ -695,7 +725,11 @@ bool splayer_diretta_play(void* opaque) {
     return false;
   }
   try {
-    connection->sync->play();
+    // 静音暂停时连接已经处于 play；恢复只解除静音，避免重复状态切换。
+    const bool resumed_from_pause = connection->sync->setPauseSilence(false);
+    if (!resumed_from_pause) {
+      connection->sync->play();
+    }
     return true;
   } catch (const std::exception& error) {
     set_error(error.what());
@@ -713,7 +747,8 @@ bool splayer_diretta_pause(void* opaque) {
     return false;
   }
   try {
-    connection->sync->stop();
+    // 保持 Sync::play，解除当前真实块并转为循环静音，避免 DAC stop 点击。
+    connection->sync->setPauseSilence(true);
     connection->sync->releaseSourceBlock();
     return true;
   } catch (const std::exception& error) {
