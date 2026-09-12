@@ -2362,15 +2362,45 @@ mod tests {
         assert_eq!(monitor.boundary_generation(), 1);
     }
 
+    /// 63191d4 尾部对齐容错：sample_count 非 DSD_SIZ_32 整数倍时向下取整
+    /// 截断（≤31 样本，DSD64 下约 11µs），不再硬拒整个文件。
+    /// 31 样本截断到 0：文件可打开、时长为 0、首读即 EOF（Ok(None)），
+    /// 且不向调用方缓冲写任何字节（零样本 = 零填充 = 无损语义）
     #[test]
-    fn dsf_unaligned_tail_fails_instead_of_padding_or_dropping_bits() {
+    fn dsf_unaligned_tail_truncates_to_dsd_siz32_units() {
         let (bytes, _) = dsf_fixture(31);
         let fixture = TempDsdFile::new("dsf", &bytes);
-        let error = match DirectDsdReader::open_local(&fixture.path) {
-            Ok(_) => panic!("未对齐 DSF 不应通过 Source Direct parser"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("DSD_SIZ_32"));
+        let mut reader = DirectDsdReader::open_local(&fixture.path)
+            .expect("未对齐尾部的 DSF 应被截断接受而非拒绝");
+        assert_eq!(reader.duration_secs(), 0.0);
+        let mut output = [0xFF_u8; 64];
+        assert!(
+            reader.read_block(&mut output).unwrap().is_none(),
+            "零样本 reader 首读即 EOF"
+        );
+        assert!(
+            output.iter().all(|byte| *byte == 0xFF),
+            "EOF 不应向调用方缓冲写入任何字节"
+        );
+    }
+
+    /// 截断语义的另一半：sample_count=95（3 个完整 unit − 1 样本）应保留
+    /// 前 64 样本（2 个 DSD_SIZ_32 unit），时长按截断后样本计算
+    #[test]
+    fn dsf_unaligned_tail_keeps_whole_units_before_truncating() {
+        let (bytes, _) = dsf_fixture(95);
+        let fixture = TempDsdFile::new("dsf", &bytes);
+        let mut reader = DirectDsdReader::open_local(&fixture.path).unwrap();
+        let expected_secs = 64.0 / 2_822_400.0;
+        assert!((reader.duration_secs() - expected_secs).abs() < 1e-12);
+        let mut output = vec![0_u8; reader.max_output_len()];
+        let first = reader.read_block(&mut output).unwrap().expect("应有整 unit 数据");
+        // 64 样本/声道 × 2 声道 × 1 bit = 16 字节交织输出
+        assert_eq!(first, 16);
+        assert!(
+            reader.read_block(&mut output).unwrap().is_none(),
+            "截断后不应有第二个块"
+        );
     }
 
     #[test]

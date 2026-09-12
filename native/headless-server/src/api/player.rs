@@ -24,7 +24,6 @@ use crate::state::{AppState, PlayerSnapshot};
 use anyhow::Context as _;
 use audio_engine_core::direct_runtime::{
     is_native_dsd_source, DirectLoadOutcome, DIRECT_FADE_DRAIN_MIN_BLOCKS,
-    DIRECT_FULL_RECONNECT_STABILIZATION,
 };
 use audio_engine_core::ram_buffer::RamTrackBuffer;
 use audio_engine_core::LoadSuperseded;
@@ -161,7 +160,9 @@ pub(crate) async fn play_handler(
     {
         let handle = state.alsa_dsd_stream.lock().clone();
         if let Some(h) = handle {
-            h.stream.play().map_err(|e| ApiError::internal(e.to_string()))?;
+            h.stream
+                .play()
+                .map_err(|e| ApiError::internal(e.to_string()))?;
             h.playing.store(true, std::sync::atomic::Ordering::Release);
             return Ok(Json(PlayerResponse::ok(json!({ "status": "playing" }))));
         }
@@ -558,8 +559,7 @@ pub(crate) async fn load_handler(
     // v12-3 点播命中预载缓存：必须在 reserve 作废 stage 之前查询命中；
     // 命中则注册直通代数并保留引擎 staged（reserve 跳过 cancel），
     // handoff 排空窗口内直接接力预载候选，跳过并行开源
-    let prestaged_generation =
-        super::direct_preloader::take_staged_for_source(&state, &source);
+    let prestaged_generation = super::direct_preloader::take_staged_for_source(&state, &source);
     audio_engine_core::player::register_prestaged_handoff(prestaged_generation);
     let reservation = reserve_player_for_load(
         &state,
@@ -651,7 +651,10 @@ fn sniff_http_codec(url: &str) -> Option<String> {
         return None;
     }
     let mut buf = Vec::with_capacity(SNIFF_BYTES);
-    response.take(SNIFF_BYTES as u64).read_to_end(&mut buf).ok()?;
+    response
+        .take(SNIFF_BYTES as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
     Some(sniff_codec_magic(&buf).to_string())
 }
 
@@ -776,12 +779,9 @@ fn probe_direct_source(
             // 轨级元数据、路径派生的艺术家/专辑标签与目录封面均依赖真实路径，
             // 从 /proc/self/fd/N 探测会产生垃圾标签（已实测）；memfd 仅用于
             // 播放期打开。在线源维持从物化产物探测（原行为）
-            let probe_path = if is_http {
-                path
-            } else {
-                source_for_direct
-            };
-            let meta = audio_engine_core::decoder::probe_metadata(probe_path, cover_dir, handle.clone())?;
+            let probe_path = if is_http { path } else { source_for_direct };
+            let meta =
+                audio_engine_core::decoder::probe_metadata(probe_path, cover_dir, handle.clone())?;
             if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
                 anyhow::bail!(LoadSuperseded);
             }
@@ -805,8 +805,7 @@ fn probe_direct_source(
             // 不能显示占位符：Range 拉首 64KB 魔数轻嗅真实容器/编码，失败
             // 才回退 "stream"。采样率/位深/声道仍由连接建立后的
             // fold_direct_format_into 用 Diretta 实际线格式折算
-            codec: sniff_http_codec(source_for_direct)
-                .unwrap_or_else(|| "stream".to_string()),
+            codec: sniff_http_codec(source_for_direct).unwrap_or_else(|| "stream".to_string()),
             ..Default::default()
         },
     };
@@ -860,38 +859,38 @@ fn try_handoff_to_new_source(
             // 时钟不跟随），预静音后全量重连才是久经验证路径
             if !audio_engine_core::direct_runtime::tiny_lms_switch_enabled() {
                 match audio_engine_core::InnerPlayer::try_direct_hot_reconfigure(
-                &state.player,
-                token,
-                source_for_direct,
-                open_path,
-                metadata.duration_secs,
-                auto_play,
-                current_format,
-                metadata,
-                is_dsd,
-            ) {
-                Ok(Some(format)) => {
-                    fold_direct_format_into(metadata, format);
-                    tracing::info!(
-                        target: "diretta_handoff",
-                        phase = "load_hot_reconfigure_ok",
-                        source = %source_for_direct,
-                        "热重配提交成功，Diretta 连接已复用"
-                    );
-                    return Ok(true);
-                }
-                Ok(None) => anyhow::bail!(LoadSuperseded),
-                Err(hot_err) => {
-                    if hot_err.is::<LoadSuperseded>() {
-                        return Err(hot_err);
+                    &state.player,
+                    token,
+                    source_for_direct,
+                    open_path,
+                    metadata.duration_secs,
+                    auto_play,
+                    current_format,
+                    metadata,
+                    is_dsd,
+                ) {
+                    Ok(Some(format)) => {
+                        fold_direct_format_into(metadata, format);
+                        tracing::info!(
+                            target: "diretta_handoff",
+                            phase = "load_hot_reconfigure_ok",
+                            source = %source_for_direct,
+                            "热重配提交成功，Diretta 连接已复用"
+                        );
+                        return Ok(true);
                     }
-                    tracing::debug!(
-                        target: "diretta_handoff",
-                        phase = "load_hot_reconfigure_skip",
-                        error = %hot_err,
-                        "热重配不可用，回退全量重连"
-                    );
-                }
+                    Ok(None) => anyhow::bail!(LoadSuperseded),
+                    Err(hot_err) => {
+                        if hot_err.is::<LoadSuperseded>() {
+                            return Err(hot_err);
+                        }
+                        tracing::debug!(
+                            target: "diretta_handoff",
+                            phase = "load_hot_reconfigure_skip",
+                            error = %hot_err,
+                            "热重配不可用，回退全量重连"
+                        );
+                    }
                 }
             }
             tracing::warn!(
@@ -933,6 +932,29 @@ fn full_reconnect_load(
             // 路径只等待 8 个静音周期，可能早于 DAC latency/buffer 排空；
             // 随后的 disconnect 会截断旧格式尾部并产生短促点击。
             let fade_drain_started = Instant::now();
+            // v12-4 tinyLMS Hard Reset 预静音（SDK 契约对齐）：拆连接前让
+            // SDK 回调层再连续交付 n 个周期数字静音（PCM 8 周期倒计时 /
+            // DSD 0x69 静音垫），叠加在数据层 fade 之上——保证 disconnect
+            // 瞬间 Target 在途数据之后紧跟零电平，消除跨格式拆线咔哒
+            //（对齐 tinyLMS TriggerPreMute(8)+WaitPreMuteDone）。倒计时由
+            // SDK 拉流消耗；连接已不拉流时倒计时不走，轮询带上限防挂死，
+            // 超时照常拆线（拆线序列本身即静音化的最终手段）
+            {
+                let player = state.player.lock();
+                let _ = player.begin_direct_pre_mute();
+            }
+            let pre_mute_deadline = Instant::now() + std::time::Duration::from_millis(200);
+            while state.player.lock().direct_pre_mute_pending() {
+                if Instant::now() >= pre_mute_deadline {
+                    tracing::warn!(
+                        target: "diretta_handoff",
+                        phase = "reconnect_pre_mute_timeout",
+                        "拆线前预静音倒计时超时（连接可能已不拉流），继续拆连接"
+                    );
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
             let drain = {
                 let mut player = state.player.lock();
                 let _ = player.begin_direct_fade_out();
@@ -979,12 +1001,24 @@ fn full_reconnect_load(
         let _ = h.join();
     }
     let teardown_ms = teardown_started.elapsed().as_millis();
-    let stabilization_started = Instant::now();
-    if replacing_direct_playback {
-        // 替换现存连接后给 Target/DAC 一个格式稳定窗口（非 stream 模式的启动验证也依赖它）
-        std::thread::sleep(DIRECT_FULL_RECONNECT_STABILIZATION);
-    }
-    let stabilization_ms = stabilization_started.elapsed().as_millis();
+    // 跨格式稳定窗：旧连接关闭→新连接 setSink 重配 DAC 输出级/PLL 锁相
+    // 需要物理时间（44.1k→96k 明显长于 44.1k→48k）。preroll 静音垫覆盖
+    // 起播首段，但它从 play() 才开始消耗——连接建立到起播之间的窗口
+    // 无保护。沿用 NAPI 侧同款稳定窗（300ms，与 Electron 路径一致），
+    // 可用 SPLAYER_DIRECT_RECONNECT_STABILIZATION_MS 覆盖/设 0 关闭
+    let stabilization_ms = {
+        let configured = std::env::var("SPLAYER_DIRECT_RECONNECT_STABILIZATION_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let ms = configured.unwrap_or(
+            audio_engine_core::direct_runtime::DIRECT_FULL_RECONNECT_STABILIZATION
+                .as_millis() as u64,
+        );
+        if replacing_direct_playback && ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        ms
+    };
 
     let open_started = Instant::now();
     let is_http_source =
@@ -1017,11 +1051,7 @@ fn full_reconnect_load(
             load_token,
             token,
         )?
-    } else if !is_http_source
-        && matches!(
-            physical_source.as_ref(),
-            Some(DirectInput::Memfd { .. })
-        )
+    } else if !is_http_source && matches!(physical_source.as_ref(), Some(DirectInput::Memfd { .. }))
     {
         // 本地 memfd 物化：经路径重新打开（全新 fd，读位置从 0 开始；try_clone
         // 会与物化写侧共享 file offset——写完停在 EOF，FFmpeg 首读即空报
@@ -1063,6 +1093,16 @@ fn full_reconnect_load(
             token,
         )?
     };
+    // 跨格式重连起播淡入：新源首块经 fade-in（零增益 10ms 升余弦渐入）
+    // 交付，衔接 preroll 静音垫末尾，消除"静音垫→全电平"阶跃。
+    // 注：open_verified_* 内部 play() 后 wait_for_direct_start 会等到首块
+    // 被消费才返回——在 wait 期间被消费的首块受 ring 建连初始态保护
+    //（新 ring 的 fade 初始为全增益非静音，preroll 垫在 bridge 层先行），
+    // 此处 resume_soft 兜底武装后续块的渐入包络（与 wait 前武装等价于
+    // 首块已被 preroll 覆盖的场景）。DSD 无增益通道，仅清排空态
+    if replacing_direct_playback && auto_play {
+        playback.resume_soft();
+    }
     let open_ms = open_started.elapsed().as_millis();
     tracing::info!(
         target: "diretta_handoff",
@@ -1429,7 +1469,9 @@ async fn run_alsa_dsd_load(
         .map_err(|e| ApiError::internal(format!("打开 ALSA DSD 流失败: {e}")))?;
     let stream = std::sync::Arc::new(stream);
     if auto_play {
-        stream.play().map_err(|e| ApiError::internal(e.to_string()))?;
+        stream
+            .play()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
     }
 
     // v10：挂载到 AppState（流生命周期 = 本次播放；下次 load/stop 时轮换 drop）
@@ -1455,7 +1497,8 @@ async fn run_alsa_dsd_load(
             while let Some(h) = ticker.upgrade() {
                 std::thread::sleep(std::time::Duration::from_millis(250));
                 if h.playing.load(std::sync::atomic::Ordering::Acquire) {
-                    h.position.fetch_add(250, std::sync::atomic::Ordering::Release);
+                    h.position
+                        .fetch_add(250, std::sync::atomic::Ordering::Release);
                 }
             }
         });

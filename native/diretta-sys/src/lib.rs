@@ -80,7 +80,6 @@ pub struct SPlayerDirettaTargetCaps {
 
 impl Default for SPlayerDirettaTargetCaps {
     fn default() -> Self {
-
         // 固定宽度 C 结构：全零即"未知/不支持"
         // SAFETY: 结构体仅由 POD（整数与 c_char 数组）组成，全零位模式有效
         unsafe { std::mem::zeroed() }
@@ -114,6 +113,8 @@ unsafe extern "C" {
         next_block: NextBlockCallback,
         release_block: ReleaseBlockCallback,
     ) -> *mut c_void;
+    pub fn splayer_diretta_arm_preroll(handle: *mut c_void, ms: u32, bytes_per_second: f64)
+        -> bool;
     pub fn splayer_diretta_play(handle: *mut c_void) -> bool;
     pub fn splayer_diretta_pause(handle: *mut c_void) -> bool;
     pub fn splayer_diretta_close(handle: *mut c_void);
@@ -176,6 +177,15 @@ pub unsafe fn splayer_diretta_open_dsd_direct(
 
 #[cfg(not(diretta_sdk_enabled))]
 pub unsafe fn splayer_diretta_play(_handle: *mut c_void) -> bool {
+    false
+}
+
+#[cfg(not(diretta_sdk_enabled))]
+pub unsafe fn splayer_diretta_arm_preroll(
+    _handle: *mut c_void,
+    _ms: u32,
+    _bytes_per_second: f64,
+) -> bool {
     false
 }
 

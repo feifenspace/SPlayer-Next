@@ -33,12 +33,13 @@ fn direct_parallel_open_enabled() -> bool {
 // 排空窗口内不再重新开源，直接 ReplaceStaged 预载好的候选（~省 170ms）。
 // 未命中 load 注册 None 重置，防上次残留串台；ReplaceStaged 的
 // expected_generation 校验仍兜底（槽过期时回退同步开源，行为安全）
-static PRESTAGED_HANDOFF_GENERATION: std::sync::Mutex<Option<u64>> =
-    std::sync::Mutex::new(None);
+static PRESTAGED_HANDOFF_GENERATION: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
 
 /// 注册/重置本次 load 的预载直通代数（load 入口调用，None=重置）
 pub fn register_prestaged_handoff(generation: Option<u64>) {
-    *PRESTAGED_HANDOFF_GENERATION.lock().unwrap_or_else(|p| p.into_inner()) = generation;
+    *PRESTAGED_HANDOFF_GENERATION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = generation;
 }
 
 fn take_prestaged_handoff() -> Option<u64> {
@@ -613,12 +614,7 @@ impl InnerPlayer {
                 } else {
                     duration_secs
                 };
-                (
-                    cue.physical_path,
-                    cue.start_time,
-                    dur,
-                    cue.start_time + dur,
-                )
+                (cue.physical_path, cue.start_time, dur, cue.start_time + dur)
             } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
                 (
                     source.to_owned(),
@@ -684,33 +680,57 @@ impl InnerPlayer {
         // 0) v12-A 并行开源：淡出排空窗口（~140ms+）内后台预打开候选源，
         //    消除原先串行在排空之后的开源耗时。默认启用；
         //    SPLAYER_DIRECT_PARALLEL_OPEN=0/false/off 关闭（回退同步开源）。
-        //    凭据为 None 时 commit 走原 ReplaceLocal 路径，行为等价改动前
-        let staged_generation = if let Some(g) = take_prestaged_handoff() {
-            info!(
-                target: "diretta_handoff",
-                phase = "handoff_prestaged_hit",
-                generation = %g,
-                "点播命中预载缓存，跳过并行开源直接接力"
-            );
-            Some(g)
-        } else if direct_parallel_open_enabled() {
-            player.lock().arm_direct_handoff_stage(source, open_path, duration_secs)
-        } else {
-            None
+        //    凭据为 None 时 commit 走原 ReplaceLocal 路径，行为等价改动前。
+        //    同一短锁内读取旧源曲终标志（finished 单向置位直至换源 reset，
+        //    与 commit 内二次读取不会翻转不一致）
+        let prestaged = take_prestaged_handoff();
+        let (staged_generation, source_finished) = {
+            let guard = player.lock();
+            let staged = match prestaged {
+                Some(g) => {
+                    info!(
+                        target: "diretta_handoff",
+                        phase = "handoff_prestaged_hit",
+                        generation = %g,
+                        "点播命中预载缓存，跳过并行开源直接接力"
+                    );
+                    Some(g)
+                }
+                None if direct_parallel_open_enabled() => {
+                    guard.arm_direct_handoff_stage(source, open_path, duration_secs)
+                }
+                None => None,
+            };
+            (
+                staged,
+                guard
+                    .direct_playback
+                    .as_ref()
+                    .is_some_and(DirectPlayback::finished),
+            )
         };
 
-        // 1) tinyLMS Quick Resume（默认）：跳过淡出与排空垫——同格式手动切歌
-        //    数据级硬拼接（对齐 tinyLMS SwapToNext / splayer 自动无缝切歌，
-        //    后者实测无杂音）；旧曲缓冲尾巴自然播完后接新曲，无静音间隙。
-        //    legacy 模式：源级淡出（暂停态为无害 no-op）；短锁取排空句柄
-        if !crate::direct_runtime::tiny_lms_switch_enabled() {
+        // 1) 拖尾消除（区分曲终接力与手动曲中切歌）：
+        //    - 曲终接力（旧源 finished，设备缓冲只剩静音尾巴）且 tinyLMS
+        //      Quick Resume 开启：跳过淡出排空，数据级无缝硬拼接（原行为）；
+        //    - 手动曲中切歌（未 finished，设备缓冲仍是旧曲真实音频约
+        //      sink buffer ~100ms + 在途块）：必须淡出+排空顶掉旧音频，
+        //      否则旧曲尾巴混入新曲开头形成拖尾；
+        //    - legacy 模式（开关关闭）：维持无条件淡出排空（原行为）。
+        //    暂停态切歌：begin_direct_fade_out 为 no-op、drain 句柄为 None，
+        //    瞬时通过（Target 缓冲已自然播空），无额外延迟。
+        //    DSD 无淡出通道：begin_drain 以 0x69 静音垫顶掉缓冲，等效排空。
+        let quick_resume = crate::direct_runtime::tiny_lms_switch_enabled() && source_finished;
+        if !quick_resume {
             let handle = {
                 let mut player = player.lock();
                 let _ = player.begin_direct_fade_out();
                 player.direct_drain_handle()
             };
             // 2) 锁外事件驱动排空：渐零完成 + 交付足量数字静音块（顶掉设备端
-            //    缓冲里的旧音频尾巴）；暂停态/无连接时句柄为 None 瞬时通过
+            //    缓冲里的旧音频尾巴）；暂停态/无连接时句柄为 None 瞬时通过。
+            //    排空窗口与并行开源重叠，开源耗时（100-300ms）掩盖排空
+            //    （drain_target 实测值通常 ~100-150ms），切歌总延迟不受损
             if let Some(monitor) = &handle {
                 // 超时与动态排空目标联动：drain_target + EXTRA，ring 未注入时
                 // drain_target 退回旧常量 200ms（行为等价改动前）
@@ -736,10 +756,15 @@ impl InnerPlayer {
             duration_secs,
             auto_play,
             staged_generation,
+            quick_resume,
         )
     }
 
     /// 同格式 Direct handoff 提交：保留 Diretta 连接，生产者线程在块边界原子换源。
+    ///
+    /// `quick_resume`：曲终接力场景（调用方已确认旧源 finished 且 tinyLMS
+    /// 开启、跳过了淡出排空）——提交后不做淡入，保持数据级硬拼接。
+    /// false = 手动切歌（已淡出排空），提交后 10ms 升余弦淡入衔接静音垫。
     ///
     /// 返回：
     /// - `Ok(Some(format))`：已切到新源，old 连接复用成功
@@ -755,6 +780,7 @@ impl InnerPlayer {
         duration: f64,
         auto_play: bool,
         staged_generation: Option<u64>,
+        quick_resume: bool,
     ) -> Result<Option<DirectFormat>> {
         if token != self.load_token.load(Ordering::Acquire) {
             return Ok(None);
@@ -777,9 +803,12 @@ impl InnerPlayer {
             cancel,
             staged_generation,
         )?;
-        // tinyLMS 同格式 Quick Resume 保持数据级连续拼接；若在这里淡入，
-        // 会凭空插入零电平阶跃并重新引入手动切歌咔哒。legacy 排空路径才淡入。
-        if crate::direct_runtime::tiny_lms_switch_enabled() {
+        // 曲终接力（quick_resume 路径）保持数据级连续拼接；若在这里淡入，
+        // 会凭空插入零电平阶跃并重新引入接力咔哒。手动切歌走了淡出排空，
+        // 新源首块需从零增益 10ms 升余弦淡入衔接排空垫末尾的数字静音，
+        // 消除"静音垫→全电平"阶跃（与 legacy 排空路径同语义）。
+        // DSD 无增益通道：resume_soft 仅清排空态不动位流，两分支等效。
+        if quick_resume {
             playback.resume_handoff_no_fade();
         } else {
             playback.resume_soft();
@@ -874,8 +903,7 @@ impl InnerPlayer {
         // v12-A: 热重配路径不走 staged 并行开源——跨格式候选会被 stage 预检
         // 拒绝，且 arm 的 CancelStaged 可能与 armed 旗标时序交叉，保守传 None
         playback.arm_cross_format_replace();
-        let format =
-            playback.handoff_drained_source(source, open_path, duration, cancel, None)?;
+        let format = playback.handoff_drained_source(source, open_path, duration, cancel, None)?;
         let DirectFormat::Pcm(pcm_format) = &format else {
             anyhow::bail!("[Direct] 热重配不支持 DSD 家族");
         };
@@ -956,10 +984,7 @@ impl InnerPlayer {
         let DirectFormat::Pcm(cur) = current_format else {
             anyhow::bail!("[Direct] 热重配仅支持 PCM 家族");
         };
-        anyhow::ensure!(
-            !is_dsd,
-            "[Direct] 热重配不支持 PCM → Native DSD"
-        );
+        anyhow::ensure!(!is_dsd, "[Direct] 热重配不支持 PCM → Native DSD");
         anyhow::ensure!(
             metadata.channels == 0 || cur.channels == metadata.channels,
             "[Direct] 热重配声道数不一致（{} → {}）",

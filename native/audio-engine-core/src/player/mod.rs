@@ -26,8 +26,8 @@ mod transition;
 #[cfg(test)]
 use events::playback_completion_event;
 pub use events::{EventEmitter, PlayerEvent, PlayerState};
-pub use transition::{LoadedPlayback, OldThreads, SeekTake};
 pub use transition::register_prestaged_handoff;
+pub use transition::{LoadedPlayback, OldThreads, SeekTake};
 
 /// 内部播放器，管理音频输出、解码和状态
 pub struct InnerPlayer {
@@ -108,7 +108,8 @@ pub const DIRECT_FADE_DRAIN_MIN_BLOCKS: u32 = 4;
 /// Direct 关流排空的事件等待上限（超时兜底，正常远快于此值）
 pub const DIRECT_FADE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
 /// 动态排空超时余量：timeout = drain_target + EXTRA（与 direct_runtime 保持一致）
-pub const DIRECT_FADE_DRAIN_EXTRA: std::time::Duration = crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA;
+pub const DIRECT_FADE_DRAIN_EXTRA: std::time::Duration =
+    crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA;
 
 impl InnerPlayer {
     /// 未初始化时通过 `AudioOutput::new` 懒构造音频输出。
@@ -277,6 +278,11 @@ impl InnerPlayer {
     }
 
     #[cfg(any(feature = "diretta", test))]
+    pub fn active_direct_format(&self) -> Option<crate::direct_runtime::DirectFormat> {
+        self.direct_playback.as_ref().map(DirectPlayback::format)
+    }
+
+    #[cfg(any(feature = "diretta", test))]
     pub fn direct_monitor(&self) -> Option<(DirectMonitor, f64, u64)> {
         self.direct_playback.as_ref().map(|playback| {
             (
@@ -382,6 +388,15 @@ impl InnerPlayer {
                         return Ok(self.current_source.clone());
                     }
                     if let Some(playback) = self.direct_playback.as_mut() {
+                        // 恢复淡入（软暂停配套）：软暂停留下了零电平静音态，
+                        // 直接 play 会从静音硬跳回信号（恢复咔哒）。先清
+                        // 静音态并 10ms 升余弦淡入。与暂停侧开关同门控——
+                        // 暂停侧未淡出（开关关）时恢复侧从零 10ms 渐入为
+                        // 无害短斜坡（与 handoff 新源起播同语义，不可闻）。
+                        // DSD 无增益通道，仅清排空态
+                        if crate::direct_runtime::direct_soft_pause_enabled() {
+                            playback.resume_soft();
+                        }
                         playback.play()?;
                     }
                     self.state = PlayerState::Playing;
@@ -445,6 +460,17 @@ impl InnerPlayer {
         #[cfg(any(feature = "diretta", test))]
         if self.direct_playback.is_some() || self.direct_mode_selected() {
             if let Some(playback) = self.direct_playback.as_mut() {
+                // 软暂停接线（Phase3 收尾）：SDK stop 前先源级淡出（PCM 10ms
+                // 升余弦渐零 / DSD 0x69 静音垫）并等待至少一个静音块交付，
+                // 消除暂停瞬间在当前块中间硬切到 DAC 静音的爆音/咔哒。
+                // 开关 SPLAYER_DIRECT_SOFT_PAUSE（默认开）；超时（150ms）或
+                // 关闭时退化为直接 stop（原行为），暂停功能不受影响。
+                // 等待为源级 fade 状态机轮询，不持其他资源；暂停/无连接
+                // 场景 pause() 内部幂等
+                if crate::direct_runtime::direct_soft_pause_enabled() {
+                    let _ =
+                        playback.begin_soft_pause_and_wait(std::time::Duration::from_millis(150));
+                }
                 playback.pause()?;
             }
             self.state = PlayerState::Paused;
@@ -1046,7 +1072,7 @@ mod tests {
         assert!(player.direct_active());
 
         let format = player
-            .commit_direct_handoff(token2, "direct-test-b.flac", None, 90.0, false)
+            .commit_direct_handoff(token2, "direct-test-b.flac", None, 90.0, false, false)
             .unwrap()
             .expect("handoff 应成功提交");
         assert!(matches!(
@@ -1080,7 +1106,7 @@ mod tests {
 
         let token2 = player.reserve_direct_handoff_token(HttpCancelHandle::new());
         player
-            .commit_direct_handoff(token2, "direct-test-b.flac", None, 90.0, true)
+            .commit_direct_handoff(token2, "direct-test-b.flac", None, 90.0, true, false)
             .unwrap()
             .expect("handoff 应成功提交");
         assert!(fake_state.playing());
@@ -1107,7 +1133,7 @@ mod tests {
         let _token3 = player.reserve_direct_handoff_token(HttpCancelHandle::new());
 
         let result = player
-            .commit_direct_handoff(token2, "direct-test-b.flac", None, 90.0, false)
+            .commit_direct_handoff(token2, "direct-test-b.flac", None, 90.0, false, false)
             .unwrap();
         assert!(result.is_none(), "过期 token 的 handoff 应被拒绝");
         // 连接与 source 保持原状，未被过期请求篡改
@@ -1121,7 +1147,7 @@ mod tests {
         let mut player = InnerPlayer::new().unwrap();
         let (_old, token) = player.take_for_async_load(HttpCancelHandle::new());
         let error = player
-            .commit_direct_handoff(token, "direct-test-b.flac", None, 90.0, false)
+            .commit_direct_handoff(token, "direct-test-b.flac", None, 90.0, false, false)
             .unwrap_err();
         assert!(error.to_string().contains("[Direct]"));
     }

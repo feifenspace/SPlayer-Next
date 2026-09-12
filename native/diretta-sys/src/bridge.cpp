@@ -104,14 +104,10 @@ class DirectSync final : public DIRETTA::Sync {
 
  protected:
   bool getNewStream(diretta_stream& stream) override {
-    // 暂停时持续交付静音且不请求真实源块，播放位置不会前进。
-    if (pause_silence_active_.load(std::memory_order_acquire) &&
-        !pause_silence_.empty()) {
-      stream.Data.P = pause_silence_.data();
-      stream.Size = pause_silence_.size();
-      pause_silence_callbacks_.fetch_add(1, std::memory_order_acq_rel);
-      return true;
-    }
+    // 【SDK148 契约】本回调永远返回 true：返回 false = 终止 SDK 发送线程
+    //（此后永不再拉流，表现为消费冻结）。回调内不管理播放状态——暂停/
+    // 淡出/预静音均已下沉到 Rust ring 的数据层（apply_fade / forced_mute），
+    // 回调只负责交付数据；任何供数空窗一律交付静音。
     // pre-roll 窗口：仅在 play() 生效后（isPlay）消耗，握手期拉取不触发。
     // 静音块大小取 SDK 当前周期尺寸；不消费真实音源数据
     if (preroll_remaining_bytes_.load(std::memory_order_acquire) > 0 && isPlay()) {
@@ -142,11 +138,22 @@ class DirectSync final : public DIRETTA::Sync {
     std::size_t size = 0;
     if (next_block_ == nullptr || source_context_ == nullptr ||
         !next_block_(source_context_, &data, &size) || data == nullptr || size == 0) {
-      // SDK148 treats false as sender termination.  A source gap is silence, never EOF.
+      // 源空窗 = 数字静音，绝不 EOF（false 会终止发送线程）。
+      // fallback_silence_ 为 65535 字节、按 wire 格式 mute byte 预备的静音池
+      //（建连后 prepareFallbackSilence 按曲目格式填充）；
+      // cycle 未知（=0）或静音池短于周期时取较小值兜底交付
       const auto cycle = getCycleSize();
-      if (cycle == 0 || fallback_silence_.size() < cycle) return false;
-      stream.Data.P = fallback_silence_.data();
-      stream.Size = cycle;
+      const std::size_t silence = cycle == 0
+                                    ? fallback_silence_.size()
+                                    : std::min(cycle, fallback_silence_.size());
+      if (silence > 0) {
+        stream.Data.P = fallback_silence_.data();
+        stream.Size = silence;
+        return true;
+      }
+      // 理论不可达（prepareFallbackSilence 保证 ≥65535）：零长兜底
+      stream.Data.P = fallback_silence_.empty() ? nullptr : fallback_silence_.data();
+      stream.Size = 0;
       return true;
     }
     // v11-1: Rust 源 payload 恒为 i32 容器；wire 协商为 SIGNED_16 时在桥内
@@ -179,69 +186,12 @@ class DirectSync final : public DIRETTA::Sync {
   std::atomic<std::int64_t> preroll_remaining_bytes_{0};
   std::vector<std::uint8_t> preroll_silence_;
   std::vector<std::uint8_t> fallback_silence_;
-  // 暂停期间由 SDK 回调复用的静音块；控制线程准备，实时回调只读。
-  std::atomic_bool pause_silence_active_{false};
-  std::atomic_uint32_t pause_silence_callbacks_{0};
-  std::vector<std::uint8_t> pause_silence_;
 
  public:
   // v11-1: 实际协商的 wire 存储位深（默认 32）。S32 被 Target 拒绝而回退
   // S16 wire 时由上层置 16，getNewStream 据此在桥内把 i32 容器降位；
   // 热重配也以此为准（S16 wire 连接不得被重配回 S32）
   std::uint8_t wire_storage_bits = 32;
-
-  // 暂停时保持 Sync 时钟和网络传输运行，只交付数字静音。
-  // 控制线程在置位前准备好缓冲，SDK 回调线程只读取该缓冲。
-  bool setPauseSilence(bool paused) {
-    const bool was_paused = pause_silence_active_.load(std::memory_order_acquire);
-    if (paused) {
-      // 若已经在静音态，回调线程可能正读取 pause_silence_；只重置计数，
-      // 绝不能重新分配该缓冲，否则会破坏 SDK 对回调指针生命周期的要求。
-      if (was_paused) {
-        pause_silence_callbacks_.store(0, std::memory_order_release);
-        return true;
-      }
-      const std::size_t cycle = getCycleSize();
-      if (cycle == 0) return false;
-      std::uint8_t mute = 0x00;
-      try {
-        mute = getSinkConfigure().getMuteByte();
-      } catch (...) {
-      }
-      pause_silence_.assign(cycle, mute);
-      pause_silence_callbacks_.store(0, std::memory_order_release);
-      pause_silence_active_.store(true, std::memory_order_release);
-    } else {
-      pause_silence_active_.store(false, std::memory_order_release);
-    }
-    return was_paused;
-  }
-
-  // 关闭连接前，维持当前 Diretta 会话并让 SDK 实际拉取一段静音。不能只靠
-  // Rust 侧淡出：一旦 close() 立即 stop，最后一个静音块未必已经到达 Target。
-  // 此处与 DirettaRendererUPnP 的 stopPlayback(false) 对齐；它不改变曲目
-  // 数据或 DAC 格式，仅在旧格式会话中发送数字静音。
-  void flush_silence_before_stop() noexcept {
-    if (!is_connect() || !isPlay()) return;
-    try {
-      setPauseSilence(true);
-      constexpr std::uint32_t kMinCallbacks = 20;
-      constexpr auto kMinDuration = std::chrono::milliseconds(120);
-      constexpr auto kTimeout = std::chrono::milliseconds(220);
-      const auto started = std::chrono::steady_clock::now();
-      const auto deadline = started + kTimeout;
-      while ((pause_silence_callbacks_.load(std::memory_order_acquire) < kMinCallbacks ||
-              std::chrono::steady_clock::now() - started < kMinDuration) &&
-             std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-      std::fprintf(stderr, "[diretta-v12] shutdown silence callbacks=%u\n",
-                   pause_silence_callbacks_.load(std::memory_order_acquire));
-      std::fflush(stderr);
-    } catch (...) {
-      // teardown must continue even if an SDK query fails.
-    }
-  }
 
  private:
   std::vector<std::uint8_t> wire_convert_buf_;
@@ -819,6 +769,28 @@ void* splayer_diretta_open_dsd_direct(
       : !source_lsb_first;
   }
   return connection;
+}
+
+bool splayer_diretta_arm_preroll(void* opaque, std::uint32_t ms, double bytes_per_second) {
+  clear_error();
+  auto* connection = static_cast<DirettaConnection*>(opaque);
+  if (connection == nullptr || !connection->sync) {
+    set_error("invalid Diretta connection");
+    return false;
+  }
+  if (ms == 0 || bytes_per_second <= 0.0) {
+    set_error("invalid Diretta preroll parameters");
+    return false;
+  }
+  try {
+    connection->sync->set_preroll(ms, bytes_per_second);
+    return true;
+  } catch (const std::exception& error) {
+    set_error(error.what());
+  } catch (...) {
+    set_error("unknown exception while arming Diretta preroll");
+  }
+  return false;
 }
 
 bool splayer_diretta_play(void* opaque) {

@@ -145,12 +145,12 @@ mod imp {
         DirectPcmStageHandle,
     };
     use diretta_sys::{
-        splayer_diretta_close, splayer_diretta_cycle_size, splayer_diretta_last_error,
-        splayer_diretta_mute_byte, splayer_diretta_open_direct, splayer_diretta_open_dsd_direct,
-        splayer_diretta_pause, splayer_diretta_pcm_reconfigure, splayer_diretta_play,
-        splayer_diretta_query_target_caps, splayer_diretta_scan, splayer_diretta_sink_buffer_us,
-        splayer_diretta_sink_latency_us, SPlayerDirettaDevice, SPlayerDirettaTargetCaps,
-        TARGET_FW_MAX, TARGET_TEXT_MAX, TEXT_CAPACITY,
+        splayer_diretta_arm_preroll, splayer_diretta_close, splayer_diretta_cycle_size,
+        splayer_diretta_last_error, splayer_diretta_mute_byte, splayer_diretta_open_direct,
+        splayer_diretta_open_dsd_direct, splayer_diretta_pause, splayer_diretta_pcm_reconfigure,
+        splayer_diretta_play, splayer_diretta_query_target_caps, splayer_diretta_scan,
+        splayer_diretta_sink_buffer_us, splayer_diretta_sink_latency_us, SPlayerDirettaDevice,
+        SPlayerDirettaTargetCaps, TARGET_FW_MAX, TARGET_TEXT_MAX, TEXT_CAPACITY,
     };
 
     const MAX_SCAN_DEVICES: usize = 32;
@@ -375,6 +375,16 @@ mod imp {
             let mute_byte = unsafe { splayer_diretta_mute_byte(self.raw.as_ptr()) };
             let drain_target_micros = compute_drain_target_micros(latency_us, buffer_us);
             self.source.set_drain_target_micros(drain_target_micros);
+            let preroll_ms = ((drain_target_micros.max(150_000) + 999) / 1_000) as u32;
+            let bytes_per_second = wire_format.sample_rate as f64
+                * wire_format.channels as f64
+                * (wire_format.storage_bits as f64 / 8.0);
+            if !unsafe {
+                splayer_diretta_arm_preroll(self.raw.as_ptr(), preroll_ms, bytes_per_second)
+            } {
+                tracing::warn!(target: "diretta_handoff", phase = "startup_preroll_failed",
+                    "unable to arm Diretta PCM startup silence");
+            }
             tracing::info!(
                 target: "diretta_handoff",
                 phase = "sink_params",
@@ -632,6 +642,14 @@ mod imp {
             let drain_target_micros = compute_drain_target_micros(latency_us, buffer_us);
             self.source.set_drain_target_micros(drain_target_micros);
             self.source.set_mute_byte(mute_byte);
+            let preroll_ms = ((drain_target_micros.max(150_000) + 999) / 1_000) as u32;
+            let bytes_per_second = wire_format.bit_rate as f64 * wire_format.channels as f64 / 8.0;
+            if !unsafe {
+                splayer_diretta_arm_preroll(self.raw.as_ptr(), preroll_ms, bytes_per_second)
+            } {
+                tracing::warn!(target: "diretta_dsd", phase = "startup_preroll_failed",
+                    "unable to arm Diretta DSD startup silence");
+            }
             tracing::info!(
                 target: "diretta_dsd",
                 phase = "sink_params",
@@ -873,10 +891,13 @@ mod tests {
         assert!(connection.contains("~DirettaConnection()"));
         assert!(connection.contains("shutdown();"));
         assert!(connection.contains("disconnect_flgset();"));
-        assert!(connection.contains("disconnect(true);"));
+        // db127f7（lifecycle 对齐 SDK148）：断连发起与等待拆分——
+        // disconnect(false) 不在内部阻塞等待，由显式 disconnectWait() 兜底，
+        // 保证清理路径每一步都可见、无隐藏超时
+        assert!(connection.contains("disconnect(false);"));
         assert!(connection.contains("disconnectWait();"));
         assert!(connection.contains("sync->close();"));
-        assert!(!connection.contains("disconnect(false);"));
+        assert!(!connection.contains("disconnect(true);"));
         assert!(!connection.contains("kDisconnectTimeout"));
 
         let open = bridge

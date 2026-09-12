@@ -4,6 +4,7 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use axum::{extract::State, Json};
@@ -199,8 +200,15 @@ pub(crate) fn create_memfd_file() -> anyhow::Result<(std::fs::File, String)> {
 fn copy_with_abort(
     reader: &mut impl std::io::Read,
     writer: &mut impl std::io::Write,
+    expected_bytes: Option<u64>,
     abort: impl Fn() -> bool,
 ) -> anyhow::Result<(u64, bool)> {
+    if let Some(expected) = expected_bytes {
+        if expected > DIRECT_PRELOAD_MAX_BYTES {
+            return Ok((expected, true));
+        }
+    }
+
     let mut chunk = vec![0u8; 256 * 1024];
     let mut written: u64 = 0;
     loop {
@@ -209,6 +217,13 @@ fn copy_with_abort(
         }
         let n = reader.read(&mut chunk)?;
         if n == 0 {
+            if let Some(expected) = expected_bytes {
+                if written != expected {
+                    anyhow::bail!(
+                        "在线音源下载不完整：收到 {written} 字节，HTTP 声明应为 {expected} 字节"
+                    );
+                }
+            }
             return Ok((written, false));
         }
         writer.write_all(&chunk[..n])?;
@@ -266,12 +281,19 @@ pub(crate) fn materialize_direct_input(
         }
     }
 
-    let mut reader: Box<dyn std::io::Read> = {
+    let (mut reader, expected_bytes): (Box<dyn std::io::Read>, Option<u64>) = {
         match audio_engine_core::ffmpeg_audio::HttpAudioSource::new_with_cancel_handle(
             url,
             cancel.clone(),
         ) {
-            Ok(source) => Box::new(source),
+            Ok(mut source) => {
+                // HttpAudioSource 只把总长度保存在私有字段中。通过 SeekFrom::End(0)
+                // 取出已由 Content-Range 验证的长度，再回到起点；末尾 seek 不会发
+                // 网络请求，回到 0 会建立新的、可从头读取的 Range 响应。
+                let expected = source.seek(SeekFrom::End(0))?;
+                source.seek(SeekFrom::Start(0))?;
+                (Box::new(source), Some(expected))
+            }
             Err(error) => {
                 tracing::warn!(url = %url, %error, "Range 流式下载通道不可用，回退一次性 GET");
                 let client = reqwest::blocking::Client::builder()
@@ -311,7 +333,8 @@ pub(crate) fn materialize_direct_input(
                         }
                     }
                 }
-                Box::new(response)
+                let expected = response.content_length();
+                (Box::new(response), expected)
             }
         }
     };
@@ -335,7 +358,8 @@ pub(crate) fn materialize_direct_input(
     {
         match create_memfd_file() {
             Ok((mut file, path)) => {
-                let (written, exceeded) = copy_with_abort(&mut reader, &mut file, &abort)?;
+                let (written, exceeded) =
+                    copy_with_abort(&mut reader, &mut file, expected_bytes, &abort)?;
                 if exceeded {
                     anyhow::bail!("在线音源超过 preload 大小上限 {DIRECT_PRELOAD_MAX_BYTES} 字节");
                 }
@@ -351,7 +375,8 @@ pub(crate) fn materialize_direct_input(
 
     let part_file = cache_dir.join(format!("{}.{}.part", hash, ext));
     let mut file = File::create(&part_file)?;
-    let (written, exceeded) = copy_with_abort(&mut reader, &mut file, &abort)?;
+    let (written, exceeded) =
+        copy_with_abort(&mut reader, &mut file, expected_bytes, &abort)?;
     file.sync_all()?;
     drop(file);
 
@@ -629,4 +654,34 @@ pub(crate) async fn direct_commit_boundary_handler(
         "source": payload.source,
         "duration": payload.duration_secs,
     }))))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::copy_with_abort;
+
+    #[test]
+    fn preload_rejects_truncated_content_with_known_length() {
+        let mut reader = Cursor::new(b"partial".to_vec());
+        let mut output = Vec::new();
+        let error = copy_with_abort(&mut reader, &mut output, Some(8), || false)
+            .expect_err("truncated HTTP response must not be accepted");
+
+        assert!(error.to_string().contains("下载不完整"));
+        assert_eq!(output, b"partial");
+    }
+
+    #[test]
+    fn preload_accepts_complete_content_with_known_length() {
+        let mut reader = Cursor::new(b"complete".to_vec());
+        let mut output = Vec::new();
+        let (written, exceeded) =
+            copy_with_abort(&mut reader, &mut output, Some(8), || false).expect("complete data");
+
+        assert_eq!(written, 8);
+        assert!(!exceeded);
+        assert_eq!(output, b"complete");
+    }
 }

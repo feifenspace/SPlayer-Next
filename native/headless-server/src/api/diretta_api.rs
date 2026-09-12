@@ -173,6 +173,7 @@ pub struct DirettaTargetInfoRequest {
 
 /// 查询指定 Diretta 目标 DAC 的信息
 pub(crate) async fn diretta_target_info_handler(
+    State(state): State<AppState>,
     Json(payload): Json<DirettaTargetInfoRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
     let target = payload
@@ -186,15 +187,46 @@ pub(crate) async fn diretta_target_info_handler(
         return Err(ApiError::bad_request("Diretta target is required"));
     }
 
+    let active_format = {
+        let player = state.player.lock();
+        let selected = player
+            .selected_device()
+            .and_then(audio_engine_core::diretta::selector_target)
+            .unwrap_or("");
+        if selected == target {
+            player.active_direct_format()
+        } else {
+            None
+        }
+    };
+    if let Some(format) = active_format {
+        let description = match format {
+            audio_engine_core::direct_runtime::DirectFormat::Pcm(v) => format!(
+                "当前播放：{} Hz / {} bit / {} 声道",
+                v.sample_rate, v.valid_bits, v.channels
+            ),
+            audio_engine_core::direct_runtime::DirectFormat::Dsd(v) => format!(
+                "当前播放：Native DSD {} Hz / {} 声道",
+                v.bit_rate, v.channels
+            ),
+        };
+        tracing::info!(target = %target, "Diretta 查询复用活动连接，未创建 QuerySync");
+        return Ok(Json(PlayerResponse::ok(
+            json!({"target_address": target, "pcm_format_desc": description, "dsd_format_desc": "活动连接模式不探测完整硬件能力", "query_source": "active_connection", "is_live_snapshot": true}),
+        )));
+    }
+
+    let target_for_query = target.clone();
     let caps = match tokio::time::timeout(
         DIRETTA_PROBE_TIMEOUT,
         spawn_isolated_blocking("diretta-info-worker", move || {
-            audio_engine_core::diretta::query_target_caps(&target)
+            audio_engine_core::diretta::query_target_caps(&target_for_query)
         }),
     )
     .await
     {
         Ok(Ok(result)) => result.map_err(|e| {
+            tracing::warn!(target = %target, error = %e, phase = "query_target_caps", "Diretta 硬件能力查询失败");
             ApiError::internal(format!("Diretta target capability query failed: {e}"))
         })?,
         Ok(Err(e)) => {

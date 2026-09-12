@@ -718,6 +718,13 @@ impl DirectPlayback {
             transport,
         };
         if auto_play {
+            // v12-5 首块淡入前置：play() 之前武装 fade-in（零增益 10ms 升余弦
+            // 渐入），保证 SDK 第一次拉到的真实音频块就带渐入包络——消除
+            // preroll 静音垫耗尽到全电平首块之间的阶跃（此前 resume_soft 在
+            // open 返回后调用，wait_for_direct_start 期间消费的首块不受保护）。
+            // 首次冷启动（无旧连接）同样无害：10ms 渐入不可闻且防止 DAC
+            // 未稳时全电平冲击。DSD 传输 resume_soft 仅清排空态，不动位流
+            playback.resume_soft();
             playback.play()?;
         }
         Ok(playback)
@@ -814,6 +821,8 @@ impl DirectPlayback {
             transport,
         };
         if auto_play {
+            // v12-5 首块淡入前置（与 open_local 同语义，见其注释）
+            playback.resume_soft();
             playback.play()?;
         }
         Ok(playback)

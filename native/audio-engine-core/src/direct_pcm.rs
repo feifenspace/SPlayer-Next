@@ -1489,6 +1489,8 @@ impl DirectPcmDecoder {
             return Ok(false);
         }
         frame.clear();
+        // 单个损坏 packet 可以跳过；限制连续次数避免坏输入使 producer 自旋。
+        let mut invalid_frames = 0u8;
 
         loop {
             let receive_result = unsafe {
@@ -1501,6 +1503,24 @@ impl DirectPcmDecoder {
             if receive_result == sys::AVERROR_EOF {
                 self.drained = true;
                 return Ok(false);
+            }
+            if receive_result == sys::AVERROR_INVALIDDATA {
+                // 该 packet 已被 avcodec 接收；继续 receive 会回到 EAGAIN，再送下
+                // 一个 packet。逐帧编码通常可恢复后续有效帧，不能因此误判为
+                // Diretta 输出失败并重连 DAC。
+                frame.clear();
+                invalid_frames = invalid_frames.saturating_add(1);
+                if invalid_frames > 8 {
+                    return Err(anyhow!(
+                        "Source Direct 连续 {invalid_frames} 帧压缩数据无效，停止解码以避免自旋"
+                    ));
+                }
+                warn!(
+                    phase = "decoder_invalid_compressed_frame",
+                    invalid_frames,
+                    "Source Direct 跳过一帧无法解码的压缩数据"
+                );
+                continue;
             }
             if receive_result != sys::AVERROR_EAGAIN {
                 return Err(ffmpeg_error(receive_result, "解码 Source Direct PCM frame"));
