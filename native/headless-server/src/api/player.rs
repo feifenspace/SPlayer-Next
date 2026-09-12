@@ -925,51 +925,25 @@ fn full_reconnect_load(
     let (old_threads, token) = match direct_initial_take {
         Some(threads) => (threads, token),
         None => {
-            // v12-4 tinyLMS Hard Reset（默认）：拆连接前 SDK 回调层预静音——
-            // PCM 连续交付 8 周期数字静音 / DSD 置 0x69 静音垫并同步短等，
-            // 对齐 tinyLMS TriggerPreMute+WaitPreMuteDone。此后在途数据尾部
-            // 必为零电平，disconnect 清空 Target 缓冲无咔哒
-            if audio_engine_core::direct_runtime::tiny_lms_switch_enabled() {
-                let premute = state.player.lock().begin_direct_pre_mute();
-                if premute {
-                    // 锁外事件驱动等待倒计时消耗完（连接暂停/无拉流时由超时兜底）
-                    // 预静音必须覆盖 Target 的实际播放延迟和缓冲；测试机约为
-                    // 110ms latency + 100ms buffer，120ms 余量不足，容易在
-                    // disconnect/reconnect 边界留下旧格式数据。
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(320);
-                    while state.player.lock().direct_pre_mute_pending()
-                        && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    tracing::debug!(
+            // 跨格式重连前必须用完整静音垫覆盖 Target 的实际缓冲。此前默认
+            // 路径只等待 8 个静音周期，可能早于 DAC latency/buffer 排空；
+            // 随后的 disconnect 会截断旧格式尾部并产生短促点击。
+            let drain = {
+                let mut player = state.player.lock();
+                let _ = player.begin_direct_fade_out();
+                player.direct_drain_handle()
+            };
+            if let Some(monitor) = &drain {
+                if !monitor.wait_fade_drained(
+                    DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                    std::time::Duration::from_micros(monitor.drain_target_micros())
+                        + audio_engine_core::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
+                ) {
+                    tracing::warn!(
                         target: "diretta_handoff",
-                        phase = "reconnect_pre_mute_done",
-                        "Hard Reset 预静音完成，开始拆连接"
+                        phase = "reconnect_fade_drain_timeout",
+                        "全量重连前静音排空超时，仍继续拆连接"
                     );
-                }
-            } else {
-                // legacy：handoff 尝试失败，确保旧源排空后再拆（sequence 中可能已淡出）。
-                // 事件驱动等待，无固定 sleep；暂停态/无连接瞬时通过
-                {
-                    let mut player = state.player.lock();
-                    let _ = player.begin_direct_fade_out();
-                }
-                // 排空等待最长 600ms：短锁取句柄，在锁外等待不占全局 player 锁
-                let drain = state.player.lock().direct_drain_handle();
-                if let Some(monitor) = &drain {
-                    // 超时与动态排空目标联动（drain_target + EXTRA）
-                    if !monitor.wait_fade_drained(
-                        DIRECT_FADE_DRAIN_MIN_BLOCKS,
-                        std::time::Duration::from_micros(monitor.drain_target_micros())
-                            + audio_engine_core::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
-                    ) {
-                        tracing::warn!(
-                            target: "diretta_handoff",
-                            phase = "reconnect_fade_drain_timeout",
-                            "全量重连前排空等待超时，仍继续拆连接"
-                        );
-                    }
                 }
             }
             // 校验 + 拆连接必须同一把锁内完成，防止与更新的 load 竞态抢跑。

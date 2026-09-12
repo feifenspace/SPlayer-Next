@@ -455,21 +455,23 @@ impl InnerPlayer {
         #[cfg(any(feature = "diretta", test))]
         if self.direct_playback.is_some() || self.direct_mode_selected() {
             if let Some(playback) = self.direct_playback.as_mut() {
-                // Phase3 软暂停：淡出（PCM）/ 0x69 置零（DSD）到零电平再停发，
-                // 消除暂停时末块非零样本的块边界阶跃（"哒"声）。
-                // 锁内短阻塞 ≤150ms：pause worker 运行在隔离阻塞线程，可接受；
-                // 超时则退化为改动前的硬停（安全兜底）
+                // 先淡出并持续交付静音，直到静音长度覆盖 Target 的实际缓冲。
+                // 不能只等一个静音块：随后 Sync::stop 会截断 DAC 中尚未被静音
+                // 覆盖的旧数据，表现为短促点击。
                 if crate::direct_runtime::direct_soft_pause_enabled() {
                     let soft_begin = std::time::Instant::now();
-                    let soft_ok = playback.begin_soft_pause_and_wait(std::time::Duration::from_millis(
-                        150,
-                    ));
+                    playback.begin_fade_out();
+                    let soft_ok = playback.wait_fade_drained(
+                        crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_BLOCKS,
+                        std::time::Duration::from_micros(playback.drain_target_micros())
+                            + crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
+                    );
                     debug!(
                         target: "diretta_handoff",
                         phase = "soft_pause",
                         ok = soft_ok,
                         elapsed_ms = soft_begin.elapsed().as_millis() as u64,
-                        "软暂停等待结束（ok=true=已到零电平并交付静音块）"
+                        "软暂停完整静音排空结束（ok=true=静音已覆盖 Target 缓冲）"
                     );
                 }
                 playback.pause()?;
