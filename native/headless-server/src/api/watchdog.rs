@@ -128,7 +128,8 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
         let mut no_candidate_announced = false;
         // 曲终接力候选加载失败的退避状态（见 AdvanceBackoff）
         let mut advance_backoff: Option<AdvanceBackoff> = None;
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        // 跨格式、PCM↔DSD 与 stream 在线源走曲终完整重连；缩短其调度等待。
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;

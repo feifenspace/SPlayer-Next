@@ -500,8 +500,10 @@ pub(crate) fn stage_direct_core(
             abort,
         )
         .map_err(|e| anyhow::anyhow!("Failed to preload stream to RAM: {e}"))?;
-        let stage_source = input.path().to_owned();
-        (stage_source, input, None)
+        // 保留 URL 作为逻辑源以识别 DSF/DFF/SACD；实际打开使用 memfd/缓存路径。
+        // /proc/self/fd/N 没有扩展名，不能作为 Native DSD 家族判断依据。
+        let open_path = input.path().to_owned();
+        (source.clone(), input, Some(open_path))
     } else {
         let ram_preload = state.config.playback.ram_preload;
         let ram_max_bytes = state.config.resolved_ram_preload_max_bytes();
