@@ -78,7 +78,7 @@ pub fn direct_soft_pause_enabled() -> bool {
 
 /// Diretta full reconnect 后的 Target/DAC 格式稳定窗口。
 /// 仅替换现存 DirectPlayback（全量重连）时使用；同格式 staged/handoff 不经过此路径
-pub const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(800);
+pub const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(300);
 
 /// 源扩展名判断是否 DSD 原生流（DSF/DFF/SACD ISO）
 pub fn is_native_dsd_source(source: &str) -> bool {
