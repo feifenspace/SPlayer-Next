@@ -748,8 +748,11 @@ bool splayer_diretta_pause(void* opaque) {
   }
   try {
     // 保持 Sync::play，解除当前真实块并转为循环静音，避免 DAC stop 点击。
+    // 不可在控制线程提前归还当前源块：SDK148 规定回调返回的内存在
+    // 下一次 getNewStream 调用前必须保持有效。pause_silence 会在下一次
+    // 回调接管输出；恢复后的 next_block 再自然归还旧块，避免 Target
+    // 发送线程仍读取被 Rust 环形缓冲复用的块而产生短促点击。
     connection->sync->setPauseSilence(true);
-    connection->sync->releaseSourceBlock();
     return true;
   } catch (const std::exception& error) {
     set_error(error.what());
