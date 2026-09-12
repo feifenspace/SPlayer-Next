@@ -382,16 +382,6 @@ impl InnerPlayer {
                         return Ok(self.current_source.clone());
                     }
                     if let Some(playback) = self.direct_playback.as_mut() {
-                        // Phase3：清除软暂停留下的静音/排空态（PCM 另做 10ms 淡入）。
-                        // 不清除则恢复后所有交付块持续静音（正确性关键）
-                        if crate::direct_runtime::direct_soft_pause_enabled() {
-                            playback.resume_soft();
-                            debug!(
-                                target: "diretta_handoff",
-                                phase = "soft_resume",
-                                "恢复淡入已提交"
-                            );
-                        }
                         playback.play()?;
                     }
                     self.state = PlayerState::Playing;
@@ -455,25 +445,6 @@ impl InnerPlayer {
         #[cfg(any(feature = "diretta", test))]
         if self.direct_playback.is_some() || self.direct_mode_selected() {
             if let Some(playback) = self.direct_playback.as_mut() {
-                // 先淡出并持续交付静音，直到静音长度覆盖 Target 的实际缓冲。
-                // 不能只等一个静音块：随后 Sync::stop 会截断 DAC 中尚未被静音
-                // 覆盖的旧数据，表现为短促点击。
-                if crate::direct_runtime::direct_soft_pause_enabled() {
-                    let soft_begin = std::time::Instant::now();
-                    playback.begin_fade_out();
-                    let soft_ok = playback.wait_fade_drained(
-                        crate::direct_runtime::DIRECT_FADE_DRAIN_MIN_BLOCKS,
-                        std::time::Duration::from_micros(playback.drain_target_micros())
-                            + crate::direct_runtime::DIRECT_FADE_DRAIN_EXTRA,
-                    );
-                    debug!(
-                        target: "diretta_handoff",
-                        phase = "soft_pause",
-                        ok = soft_ok,
-                        elapsed_ms = soft_begin.elapsed().as_millis() as u64,
-                        "软暂停完整静音排空结束（ok=true=静音已覆盖 Target 缓冲）"
-                    );
-                }
                 playback.pause()?;
             }
             self.state = PlayerState::Paused;

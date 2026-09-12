@@ -90,6 +90,12 @@ class DirectSync final : public DIRETTA::Sync {
     wire_convert_buf_.reserve(input_bytes / 2 + 64);
   }
 
+  void prepareFallbackSilence() {
+    std::uint8_t mute = 0x00;
+    try { mute = getSinkConfigure().getMuteByte(); } catch (...) {}
+    fallback_silence_.assign(65535, mute);
+  }
+
   void releaseSourceBlock() {
     if (release_block_ != nullptr && source_context_ != nullptr) {
       release_block_(source_context_);
@@ -136,7 +142,12 @@ class DirectSync final : public DIRETTA::Sync {
     std::size_t size = 0;
     if (next_block_ == nullptr || source_context_ == nullptr ||
         !next_block_(source_context_, &data, &size) || data == nullptr || size == 0) {
-      return false;
+      // SDK148 treats false as sender termination.  A source gap is silence, never EOF.
+      const auto cycle = getCycleSize();
+      if (cycle == 0 || fallback_silence_.size() < cycle) return false;
+      stream.Data.P = fallback_silence_.data();
+      stream.Size = cycle;
+      return true;
     }
     // v11-1: Rust 源 payload 恒为 i32 容器；wire 协商为 SIGNED_16 时在桥内
     // 降位（>>16 取高 16 位，bit-exact 对应容器升位的逆变换）。
@@ -167,6 +178,7 @@ class DirectSync final : public DIRETTA::Sync {
   SPlayerDirettaReleaseBlock release_block_;
   std::atomic<std::int64_t> preroll_remaining_bytes_{0};
   std::vector<std::uint8_t> preroll_silence_;
+  std::vector<std::uint8_t> fallback_silence_;
   // 暂停期间由 SDK 回调复用的静音块；控制线程准备，实时回调只读。
   std::atomic_bool pause_silence_active_{false};
   std::atomic_uint32_t pause_silence_callbacks_{0};
@@ -252,11 +264,10 @@ struct DirettaConnection {
     if (!sync) return;
     try {
       if (sync->is_connect()) {
-        sync->flush_silence_before_stop();
         sync->stop();
         sync->releaseSourceBlock();
         sync->disconnect_flgset();
-        sync->disconnect(true);
+        sync->disconnect(false);
         sync->disconnectWait();
       } else {
         sync->releaseSourceBlock();
@@ -553,6 +564,7 @@ void* open_direct_with_format(
       }
     }
 
+    connection->sync->prepareFallbackSilence();
     connection->format = connection->sync->getSinkConfigure();
     return connection.release();
   } catch (const std::exception& error) {
@@ -761,11 +773,7 @@ bool splayer_diretta_play(void* opaque) {
     return false;
   }
   try {
-    // 静音暂停时连接已经处于 play；恢复只解除静音，避免重复状态切换。
-    const bool resumed_from_pause = connection->sync->setPauseSilence(false);
-    if (!resumed_from_pause) {
-      connection->sync->play();
-    }
+    connection->sync->play();
     return true;
   } catch (const std::exception& error) {
     set_error(error.what());
@@ -788,7 +796,7 @@ bool splayer_diretta_pause(void* opaque) {
     // 下一次 getNewStream 调用前必须保持有效。pause_silence 会在下一次
     // 回调接管输出；恢复后的 next_block 再自然归还旧块，避免 Target
     // 发送线程仍读取被 Rust 环形缓冲复用的块而产生短促点击。
-    connection->sync->setPauseSilence(true);
+    if (connection->sync->is_connect()) connection->sync->stop();
     return true;
   } catch (const std::exception& error) {
     set_error(error.what());

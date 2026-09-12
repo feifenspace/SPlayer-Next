@@ -777,10 +777,13 @@ impl InnerPlayer {
             cancel,
             staged_generation,
         )?;
-        // 手动 handoff 必须经过短淡入。旧源尾部与新源首块不保证零交叉，
-        // 无淡入硬拼接会在 DAC 上形成瞬时幅度阶跃，产生咔哒或爆音。
-        // staged 自动接力不经过本函数，仍保持连续波形路径。
-        playback.resume_soft();
+        // tinyLMS 同格式 Quick Resume 保持数据级连续拼接；若在这里淡入，
+        // 会凭空插入零电平阶跃并重新引入手动切歌咔哒。legacy 排空路径才淡入。
+        if crate::direct_runtime::tiny_lms_switch_enabled() {
+            playback.resume_handoff_no_fade();
+        } else {
+            playback.resume_soft();
+        }
         debug!(
             target: "diretta_handoff",
             phase = "handoff_resume",
