@@ -312,6 +312,32 @@ bool discover(DIRETTA::Find& find, DIRETTA::Find::PortResalts& results) {
 std::mutex g_mtu_cache_mutex;
 std::map<std::string, std::uint32_t> g_mtu_cache;
 
+// 跨格式切歌必须重建 Sync 会话，但 Target 的 IPv6/端口和网卡索引在同一进程内
+// 稳定。缓存已成功发现过的端点，避免每次 Find::findOutput 固定等待约 272ms。
+// 缓存只用于建新会话的寻址，不复用旧连接、不跳过 setSink/格式协商/connectWait；
+// Target 变更后新的 target_id 不命中，仍会走完整发现。
+struct CachedTargetEndpoint {
+  ACQUA::IPAddress address;
+  std::uint32_t mtu = 1500;
+};
+std::mutex g_target_endpoint_cache_mutex;
+std::map<std::string, CachedTargetEndpoint> g_target_endpoint_cache;
+
+bool cached_target_for(const std::string& target_id, CachedTargetEndpoint& out) {
+  std::lock_guard<std::mutex> lock(g_target_endpoint_cache_mutex);
+  const auto it = g_target_endpoint_cache.find(target_id);
+  if (it == g_target_endpoint_cache.end()) return false;
+  out = it->second;
+  return true;
+}
+
+void cache_target_endpoint(const std::string& target_id,
+                           const ACQUA::IPAddress& address,
+                           std::uint32_t mtu) {
+  std::lock_guard<std::mutex> lock(g_target_endpoint_cache_mutex);
+  g_target_endpoint_cache[target_id] = CachedTargetEndpoint{address, mtu};
+}
+
 std::uint32_t measured_mtu_for(const ACQUA::IPAddress& target, DIRETTA::Find& find) {
   {
     std::lock_guard<std::mutex> lock(g_mtu_cache_mutex);
@@ -387,29 +413,38 @@ void* open_direct_with_format(
     setting.ProductID = 0;
     connection->find = std::make_unique<DIRETTA::Find>(setting);
 
-    DIRETTA::Find::PortResalts results;
-    if (!discover(*connection->find, results) || results.empty()) {
-      if (g_last_error.empty()) set_error("no Diretta targets found");
-      return nullptr;
-    }
-    const auto discovery_done = std::chrono::steady_clock::now();
-
     ACQUA::IPAddress target;
-    for (const auto& [address, _info] : results) {
-      if (address.get_full_str() == target_id) {
-        target = address;
-        break;
+    std::uint32_t mtu = 1500;
+    CachedTargetEndpoint cached;
+    const bool target_cache_hit = cached_target_for(target_id, cached);
+    auto discovery_done = open_started;
+    auto mtu_done = open_started;
+    if (target_cache_hit) {
+      target = cached.address;
+      mtu = cached.mtu;
+    } else {
+      DIRETTA::Find::PortResalts results;
+      if (!discover(*connection->find, results) || results.empty()) {
+        if (g_last_error.empty()) set_error("no Diretta targets found");
+        return nullptr;
       }
+      discovery_done = std::chrono::steady_clock::now();
+      for (const auto& [address, _info] : results) {
+        if (address.get_full_str() == target_id) {
+          target = address;
+          break;
+        }
+      }
+      if (target.is_empty()) {
+        set_error("requested Diretta target was not found");
+        return nullptr;
+      }
+      // 【对齐 tinyLMS】MTU 按 IP 缓存（见 measured_mtu_for）
+      mtu = measured_mtu_for(target, *connection->find);
+      mtu_done = std::chrono::steady_clock::now();
+      cache_target_endpoint(target_id, target, mtu);
     }
-    if (target.is_empty()) {
-      set_error("requested Diretta target was not found");
-      return nullptr;
-    }
-
-    // 【对齐 tinyLMS】MTU 按 IP 缓存（见 measured_mtu_for）
-    std::uint32_t mtu = measured_mtu_for(target, *connection->find);
     connection->mtu = mtu;
-    const auto mtu_done = std::chrono::steady_clock::now();
 
     connection->sync = std::make_unique<DirectSync>(
       source_context,
@@ -552,8 +587,9 @@ void* open_direct_with_format(
       return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
     };
     std::fprintf(stderr,
-                 "[diretta-v13] open timing target=%s discovery_ms=%lld mtu_ms=%lld configure_ms=%lld connect_ms=%lld total_ms=%lld\n",
+                 "[diretta-v13] open timing target=%s target_cache_hit=%d discovery_ms=%lld mtu_ms=%lld configure_ms=%lld connect_ms=%lld total_ms=%lld\n",
                  target_id,
+                 target_cache_hit ? 1 : 0,
                  static_cast<long long>(elapsed_ms(open_started, discovery_done)),
                  static_cast<long long>(elapsed_ms(discovery_done, mtu_done)),
                  static_cast<long long>(elapsed_ms(mtu_done, configure_done)),
