@@ -79,6 +79,8 @@ pub fn direct_soft_pause_enabled() -> bool {
 /// Diretta full reconnect 后的 Target/DAC 格式稳定窗口。
 /// 仅替换现存 DirectPlayback（全量重连）时使用；同格式 staged/handoff 不经过此路径
 pub const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(300);
+/// DSD stream setup needs a longer DAC/PLL stabilization window after a hard reconnect.
+pub const DIRECT_DSD_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(800);
 
 /// 源扩展名判断是否 DSD 原生流（DSF/DFF/SACD ISO）
 pub fn is_native_dsd_source(source: &str) -> bool {
@@ -270,12 +272,7 @@ impl DirectStageHandle {
                 } else {
                     duration_secs
                 };
-                (
-                    cue.physical_path,
-                    cue.start_time,
-                    dur,
-                    cue.start_time + dur,
-                )
+                (cue.physical_path, cue.start_time, dur, cue.start_time + dur)
             } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
                 (
                     source.to_owned(),
@@ -352,6 +349,20 @@ impl DirectTransport {
             // 空枚举兜底：既无 diretta 也非 test 的构建不存在可构造的传输
             #[cfg(not(any(feature = "diretta", test)))]
             _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// Cross-format hard reset: PCM drains zeros and DSD drains 0x69.
+    fn begin_mute_drain(&self) {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.begin_mute_drain(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => value.begin_drain(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => {}
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct transport only exists with diretta/test enabled"),
         }
     }
 
@@ -529,9 +540,7 @@ impl DirectTransport {
     ) -> Option<u64> {
         match self {
             #[cfg(feature = "diretta")]
-            Self::Pcm(value) => {
-                value.arm_handoff_stage(path, start_secs, stop_secs, duration_secs)
-            }
+            Self::Pcm(value) => value.arm_handoff_stage(path, start_secs, stop_secs, duration_secs),
             #[cfg(feature = "diretta")]
             Self::Dsd(_) => None,
             #[cfg(all(test, not(feature = "diretta")))]
@@ -636,12 +645,7 @@ impl DirectPlayback {
                 } else {
                     duration
                 };
-                (
-                    cue.physical_path,
-                    cue.start_time,
-                    dur,
-                    cue.start_time + dur,
-                )
+                (cue.physical_path, cue.start_time, dur, cue.start_time + dur)
             } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
                 (
                     source.to_owned(),
@@ -679,13 +683,12 @@ impl DirectPlayback {
                 (actual_position - cue_start).max(0.0),
             )
         } else {
-            let (connection, actual_position) =
-                DirettaDirectConnection::open_local_at(
-                    selector,
-                    path,
-                    cue_start + position_secs,
-                    cue_stop,
-                )?;
+            let (connection, actual_position) = DirettaDirectConnection::open_local_at(
+                selector,
+                path,
+                cue_start + position_secs,
+                cue_stop,
+            )?;
             (
                 DirectTransport::Pcm(connection),
                 (actual_position - cue_start).max(0.0),
@@ -851,12 +854,7 @@ impl DirectPlayback {
                 } else {
                     duration
                 };
-                (
-                    cue.physical_path,
-                    cue.start_time,
-                    dur,
-                    cue.start_time + dur,
-                )
+                (cue.physical_path, cue.start_time, dur, cue.start_time + dur)
             } else if let Some(sacd) = crate::sacd::parse_sacd_virtual_path(source) {
                 (
                     source.to_owned(),
@@ -980,6 +978,13 @@ impl DirectPlayback {
             #[cfg(not(any(feature = "diretta", test)))]
             _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
         }
+    }
+
+    /// Cross-format reconnect: drain pure digital silence before disconnect.
+    /// PCM sends zero-valued S32 frames; DSD sends its native 0x69 mute pattern.
+    /// Already delivered program samples are never altered.
+    pub fn begin_mute_drain(&self) {
+        self.transport.begin_mute_drain();
     }
 
     /// 换源/关流前的源级淡出（详见 DirectTransport::begin_fade_out）

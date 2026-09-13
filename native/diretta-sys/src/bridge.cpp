@@ -76,11 +76,15 @@ class DirectSync final : public DIRETTA::Sync {
     const long long bytes = static_cast<long long>(
       (static_cast<double>(ms) / 1000.0) * bytes_per_second);
     if (bytes <= 0) return;
-    // 复审加固：在控制线程预reserve静音缓冲——上限 = 最大信息包周期
-    //（compute_cycle_time_us 钳制 10ms）的字节数 + 冗余。回调内的
-    // assign(cycle) 在容量充足时仅填充不复分配，RT 线程零堆分配
-    preroll_silence_.reserve(
-      static_cast<std::size_t>(bytes_per_second * 0.011) + 64);
+    // getCycleSize() may be zero in the first callback after play().
+    // Always provide a valid mute block until the SDK reports its cycle.
+    preroll_fallback_chunk_bytes_ = std::clamp<std::size_t>(
+      static_cast<std::size_t>(bytes_per_second * 0.002),
+      256,
+      kSilenceBlockBytes);
+    std::uint8_t mute = 0x00;
+    try { mute = getSinkConfigure().getMuteByte(); } catch (...) {}
+    preroll_silence_.assign(kSilenceBlockBytes, mute);
     preroll_remaining_bytes_.store(bytes, std::memory_order_release);
   }
 
@@ -93,7 +97,7 @@ class DirectSync final : public DIRETTA::Sync {
   void prepareFallbackSilence() {
     std::uint8_t mute = 0x00;
     try { mute = getSinkConfigure().getMuteByte(); } catch (...) {}
-    fallback_silence_.assign(65535, mute);
+    fallback_silence_.assign(kSilenceBlockBytes, mute);
   }
 
   void releaseSourceBlock() {
@@ -109,30 +113,30 @@ class DirectSync final : public DIRETTA::Sync {
     // 淡出/预静音均已下沉到 Rust ring 的数据层（apply_fade / forced_mute），
     // 回调只负责交付数据；任何供数空窗一律交付静音。
     // pre-roll 窗口：仅在 play() 生效后（isPlay）消耗，握手期拉取不触发。
-    // 静音块大小取 SDK 当前周期尺寸；不消费真实音源数据
+    // 首回调的 getCycleSize() 可能暂未就绪（返回 0）；不能跳过预静音，
+    // 否则会直接交付真实 source block。此时按当前格式字节率给出约 2ms 的
+    // 完整静音块，后续回调恢复 SDK 报告的 cycle 大小。
     if (preroll_remaining_bytes_.load(std::memory_order_acquire) > 0 && isPlay()) {
-      const std::size_t cycle = getCycleSize();
-      if (cycle > 0) {
-        if (preroll_silence_.size() != cycle) {
-          std::uint8_t mute = 0x00;
-          try {
-            mute = getSinkConfigure().getMuteByte();
-          } catch (...) {
-          }
-          preroll_silence_.assign(cycle, mute);
-        }
-        stream.Data.P = preroll_silence_.data();
-        stream.Size = cycle;
-        const std::int64_t remaining =
-          preroll_remaining_bytes_.fetch_sub(static_cast<std::int64_t>(cycle),
-                                             std::memory_order_acq_rel) -
-          static_cast<std::int64_t>(cycle);
-        if (remaining <= 0) {
-          std::fprintf(stderr, "[diretta-v11] preroll silence done, real audio starts\n");
-          std::fflush(stderr);
-        }
-        return true;
+      const std::size_t sdk_cycle = getCycleSize();
+      const std::size_t cycle = std::min(
+        sdk_cycle == 0 ? preroll_fallback_chunk_bytes_ : sdk_cycle,
+        preroll_silence_.size());
+      if (cycle == 0) return true;
+      stream.Data.P = preroll_silence_.data();
+      stream.Size = cycle;
+      const std::int64_t take = static_cast<std::int64_t>(
+        std::min<std::int64_t>(static_cast<std::int64_t>(cycle),
+                               preroll_remaining_bytes_.load(std::memory_order_acquire)));
+      preroll_remaining_bytes_.fetch_sub(take, std::memory_order_acq_rel);
+      if (preroll_remaining_bytes_.load(std::memory_order_acquire) <= 0) {
+        preroll_remaining_bytes_.store(0, std::memory_order_release);
+        std::fprintf(stderr,
+                     "[diretta-v14] post-mute complete; first real audio may start "
+                     "(sdk_cycle=%zu)\n",
+                     sdk_cycle);
+        std::fflush(stderr);
       }
+      return true;
     }
     const std::uint8_t* data = nullptr;
     std::size_t size = 0;
@@ -183,7 +187,9 @@ class DirectSync final : public DIRETTA::Sync {
   void* source_context_;
   SPlayerDirettaNextBlock next_block_;
   SPlayerDirettaReleaseBlock release_block_;
+  static constexpr std::size_t kSilenceBlockBytes = 65535;
   std::atomic<std::int64_t> preroll_remaining_bytes_{0};
+  std::size_t preroll_fallback_chunk_bytes_ = 1024;
   std::vector<std::uint8_t> preroll_silence_;
   std::vector<std::uint8_t> fallback_silence_;
 

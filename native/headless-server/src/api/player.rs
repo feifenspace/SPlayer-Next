@@ -957,7 +957,7 @@ fn full_reconnect_load(
             }
             let drain = {
                 let mut player = state.player.lock();
-                let _ = player.begin_direct_fade_out();
+                let _ = player.begin_direct_mute_drain();
                 player.direct_drain_handle()
             };
             if let Some(monitor) = &drain {
@@ -1010,10 +1010,12 @@ fn full_reconnect_load(
         let configured = std::env::var("SPLAYER_DIRECT_RECONNECT_STABILIZATION_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok());
-        let ms = configured.unwrap_or(
+        let default_stabilization = if is_native_dsd_source(source_for_direct) {
+            audio_engine_core::direct_runtime::DIRECT_DSD_FULL_RECONNECT_STABILIZATION
+        } else {
             audio_engine_core::direct_runtime::DIRECT_FULL_RECONNECT_STABILIZATION
-                .as_millis() as u64,
-        );
+        };
+        let ms = configured.unwrap_or(default_stabilization.as_millis() as u64);
         if replacing_direct_playback && ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(ms));
         }

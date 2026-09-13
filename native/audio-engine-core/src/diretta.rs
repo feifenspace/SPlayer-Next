@@ -518,6 +518,11 @@ mod imp {
             self.source.begin_fade_out();
         }
 
+        /// Cross-format hard reset: future callback blocks are PCM silence.
+        pub fn begin_mute_drain(&self) {
+            self.source.begin_mute_drain();
+        }
+
         /// 淡出是否已生效（后续块均为数字静音）
         pub fn is_faded_out(&self) -> bool {
             self.source.is_faded_out()

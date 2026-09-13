@@ -549,6 +549,20 @@ impl InnerPlayer {
         Ok(())
     }
 
+    /// Cross-format hard reset uses mute drain instead of PCM gain processing.
+    #[cfg(any(feature = "diretta", test))]
+    pub fn begin_direct_mute_drain(&mut self) -> Result<()> {
+        let playback = match self.direct_playback.as_ref() {
+            Some(playback) => playback,
+            None => return Ok(()),
+        };
+        if self.state != PlayerState::Playing && !playback.finished() {
+            return Ok(());
+        }
+        playback.begin_mute_drain();
+        Ok(())
+    }
+
     /// 淡出是否已完全生效（无连接 / 非播放态视为已静音）
     #[cfg(any(feature = "diretta", test))]
     pub fn direct_faded_out(&self) -> bool {

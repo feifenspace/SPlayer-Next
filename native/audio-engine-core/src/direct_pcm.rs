@@ -121,8 +121,7 @@ impl DirectPcmFrame {
             DirectPcmRepackBuffer::Signed32(buffer) => buffer.len() < samples,
         };
         if needs_replacement {
-            self.repack =
-                DirectPcmRepackBuffer::Signed32(vec![0_i32; samples].into_boxed_slice());
+            self.repack = DirectPcmRepackBuffer::Signed32(vec![0_i32; samples].into_boxed_slice());
         }
         Ok(())
     }
@@ -353,13 +352,7 @@ impl DirectPcmFrame {
                         !ptr.is_null(),
                         "Source Direct packed 16-bit PCM 缺少 data[0]"
                     );
-                    repack_packed_i16_to_i32(
-                        ptr,
-                        source_channels,
-                        start_sample,
-                        samples,
-                        output,
-                    )?;
+                    repack_packed_i16_to_i32(ptr, source_channels, start_sample, samples, output)?;
                 } else {
                     bail!("Source Direct packed repack buffer 类型不匹配");
                 }
@@ -1517,8 +1510,7 @@ impl DirectPcmDecoder {
                 }
                 warn!(
                     phase = "decoder_invalid_compressed_frame",
-                    invalid_frames,
-                    "Source Direct 跳过一帧无法解码的压缩数据"
+                    invalid_frames, "Source Direct 跳过一帧无法解码的压缩数据"
                 );
                 continue;
             }
@@ -1871,6 +1863,19 @@ impl DirectPcmFadeState {
         self.ramping.store(true, Ordering::Release);
     }
 
+    /// Cross-format hard reset drains pure digital silence.
+    fn begin_mute_drain(&self, sample_bits: u8, valid_bits: u8, sample_rate: u32) {
+        self.sample_bits.store(sample_bits, Ordering::Release);
+        self.valid_bits.store(valid_bits, Ordering::Release);
+        self.sample_rate.store(sample_rate, Ordering::Release);
+        self.gain_start_micro.store(0, Ordering::Release);
+        self.gain_end_micro.store(0, Ordering::Release);
+        self.ramping.store(false, Ordering::Release);
+        self.silence_blocks.store(0, Ordering::Release);
+        self.silence_micros.store(0, Ordering::Release);
+        self.silent.store(true, Ordering::Release);
+    }
+
     /// 恢复播放淡入（Phase3 软暂停配套）：清除软暂停留下的静音态，
     /// 从零增益 10ms 升余弦渐入全增益——复用 apply_fade 的 ramping 通路，
     /// 与 begin_fade_out 对称。静音态不清除则恢复后永久静音（正确性关键）
@@ -1888,8 +1893,7 @@ impl DirectPcmFadeState {
 
     /// 软暂停就绪谓词：已渐零且至少交付一个静音块（停发时末尾为零电平）
     fn soft_pause_ready(&self) -> bool {
-        self.silent.load(Ordering::Acquire)
-            && self.silence_blocks.load(Ordering::Acquire) >= 1
+        self.silent.load(Ordering::Acquire) && self.silence_blocks.load(Ordering::Acquire) >= 1
     }
 
     fn silent(&self) -> bool {
@@ -2421,7 +2425,12 @@ fn install_staged_pcm_slot(
         .store(staged.generation, Ordering::Relaxed);
     slot.boundary.store(true, Ordering::Relaxed);
     slot.state.store(SLOT_READY, Ordering::Release);
-    Ok((staged.decoder, staged.format, staged.start_secs, staged.stop_micros))
+    Ok((
+        staged.decoder,
+        staged.format,
+        staged.start_secs,
+        staged.stop_micros,
+    ))
 }
 
 /// 收取后台 stage prepare 的就绪结果（producer 主循环与 ReplaceStaged
@@ -2765,14 +2774,22 @@ impl DirectPcmSource {
         Ok(source)
     }
 
-    pub fn open_local_at(path: &Path, position_secs: f64, stop_file_secs: f64) -> Result<(Self, f64)> {
+    pub fn open_local_at(
+        path: &Path,
+        position_secs: f64,
+        stop_file_secs: f64,
+    ) -> Result<(Self, f64)> {
         let decoder = DirectPcmDecoder::open_local(path)?;
         Self::open_with_decoder(decoder, position_secs, stop_file_secs)
     }
 
     /// 以流式 Reader 打开（在线音源 stream 模式）。
     /// `position_secs > 0` 由 demuxer 级 accurate seek 完成（Reader 层触发 Range 重连）。
-    pub fn open_reader_at(reader: Box<dyn ReadSeek>, position_secs: f64, stop_file_secs: f64) -> Result<(Self, f64)> {
+    pub fn open_reader_at(
+        reader: Box<dyn ReadSeek>,
+        position_secs: f64,
+        stop_file_secs: f64,
+    ) -> Result<(Self, f64)> {
         let decoder = DirectPcmDecoder::open_reader(reader)?;
         Self::open_with_decoder(decoder, position_secs, stop_file_secs)
     }
@@ -2846,8 +2863,7 @@ impl DirectPcmSource {
                 // 后台 stage prepare 的结果通道：prepare 在独立线程执行（打开解码器/
                 // 首帧解码/CUE seek 可达数百 ms，绝不能阻塞 producer 数据通路，
                 // 否则 fresh ring 被吃空 → 欠载静音 → 恢复时静音跳回音频=可闻咔哒）
-                let (stage_result_tx, stage_result_rx) =
-                    mpsc::channel::<StagePrepareOutcome>();
+                let (stage_result_tx, stage_result_rx) = mpsc::channel::<StagePrepareOutcome>();
                 let mut next_slot = 1; // slot 0 已被首帧占用
                 while !producer_ring.stopped.load(Ordering::Acquire) {
                     // 消费命令前清提示位：此后发送方的新命令会重新置位并唤醒
@@ -2904,9 +2920,7 @@ impl DirectPcmSource {
                                     };
                                     // 推进代数：旧候选的在途 prepare 结果作废
                                     producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
-                                    producer_ring
-                                        .stage_pending
-                                        .store(false, Ordering::Release);
+                                    producer_ring.stage_pending.store(false, Ordering::Release);
                                     let _ = response.send(Ok(new_format));
                                     next_slot = 1;
                                 }
@@ -2942,8 +2956,8 @@ impl DirectPcmSource {
                                     generation_matched = true;
                                     break;
                                 }
-                                let remaining = deadline
-                                    .saturating_duration_since(std::time::Instant::now());
+                                let remaining =
+                                    deadline.saturating_duration_since(std::time::Instant::now());
                                 if remaining.is_zero() {
                                     break;
                                 }
@@ -2955,57 +2969,57 @@ impl DirectPcmSource {
                                     remaining,
                                 );
                             }
-                            let outcome: Result<(
-                                DirectPcmDecoder,
-                                DirectPcmFormat,
-                                f64,
-                                u64,
-                            )> = if generation_matched {
-                                let candidate =
-                                    staged.take().expect("generation 已匹配必有候选");
-                                let StagedPcmSource {
-                                    decoder: new_decoder,
-                                    first_frame,
-                                    format: new_format,
-                                    start_secs: cand_start,
-                                    stop_micros: cand_stop,
-                                    ..
-                                } = candidate;
-                                match install_prepared_first_frame(
-                                    &producer_ring,
-                                    first_frame,
-                                    new_format,
-                                    &new_decoder,
-                                ) {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            target: "diretta_handoff",
-                                            phase = "pcm_handoff_staged_install",
-                                            source = %source,
-                                            sample_rate = %new_format.sample_rate,
-                                            channels = %new_format.channels,
-                                            "staged 预打开候选已装填（并行开源生效）"
-                                        );
-                                        Ok((new_decoder, new_format, cand_start, cand_stop))
+                            let outcome: Result<(DirectPcmDecoder, DirectPcmFormat, f64, u64)> =
+                                if generation_matched {
+                                    let candidate =
+                                        staged.take().expect("generation 已匹配必有候选");
+                                    let StagedPcmSource {
+                                        decoder: new_decoder,
+                                        first_frame,
+                                        format: new_format,
+                                        start_secs: cand_start,
+                                        stop_micros: cand_stop,
+                                        ..
+                                    } = candidate;
+                                    match install_prepared_first_frame(
+                                        &producer_ring,
+                                        first_frame,
+                                        new_format,
+                                        &new_decoder,
+                                    ) {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                target: "diretta_handoff",
+                                                phase = "pcm_handoff_staged_install",
+                                                source = %source,
+                                                sample_rate = %new_format.sample_rate,
+                                                channels = %new_format.channels,
+                                                "staged 预打开候选已装填（并行开源生效）"
+                                            );
+                                            Ok((new_decoder, new_format, cand_start, cand_stop))
+                                        }
+                                        Err(error) => {
+                                            producer_ring.failed.store(true, Ordering::Release);
+                                            Err(error)
+                                        }
                                     }
-                                    Err(error) => {
-                                        producer_ring.failed.store(true, Ordering::Release);
-                                        Err(error)
-                                    }
-                                }
-                            } else {
-                                // 回退：候选缺失/过期/generation 不符，丢弃候选后
-                                // 走与 ReplaceLocal 完全相同的同步开源路径
-                                staged = None;
-                                replace_pcm_ring(
-                                    &source,
-                                    start_secs,
-                                    &producer_ring,
-                                    active_format,
-                                    &cancel,
-                                )
-                                .map(|(decoder, format)| (decoder, format, start_secs, stop_micros))
-                            };
+                                } else {
+                                    // 回退：候选缺失/过期/generation 不符，丢弃候选后
+                                    // 走与 ReplaceLocal 完全相同的同步开源路径
+                                    staged = None;
+                                    replace_pcm_ring(
+                                        &source,
+                                        start_secs,
+                                        &producer_ring,
+                                        active_format,
+                                        &cancel,
+                                    )
+                                    .map(
+                                        |(decoder, format)| {
+                                            (decoder, format, start_secs, stop_micros)
+                                        },
+                                    )
+                                };
                             match outcome {
                                 Ok((new_decoder, new_format, eff_start, eff_stop)) => {
                                     decoder = new_decoder;
@@ -3019,9 +3033,7 @@ impl DirectPcmSource {
                                     };
                                     // 推进代数：旧候选的在途 prepare 结果作废
                                     producer_ring.stage_epoch.fetch_add(1, Ordering::AcqRel);
-                                    producer_ring
-                                        .stage_pending
-                                        .store(false, Ordering::Release);
+                                    producer_ring.stage_pending.store(false, Ordering::Release);
                                     let _ = response.send(Ok(new_format));
                                     next_slot = 1;
                                 }
@@ -3060,9 +3072,8 @@ impl DirectPcmSource {
                                     );
                                     match result {
                                         Ok(candidate) => {
-                                            let _ = result_tx.send(StagePrepareOutcome::Ready(
-                                                epoch, candidate,
-                                            ));
+                                            let _ = result_tx
+                                                .send(StagePrepareOutcome::Ready(epoch, candidate));
                                             // 唤醒 finished 分支的等待（结果已就绪）
                                             flag.staged_ready.store(true, Ordering::Release);
                                             flag.notify_state();
@@ -3070,8 +3081,8 @@ impl DirectPcmSource {
                                         }
                                         Err(error) => {
                                             flag.stage_pending.store(false, Ordering::Release);
-                                            let _ = result_tx
-                                                .send(StagePrepareOutcome::Failed(epoch));
+                                            let _ =
+                                                result_tx.send(StagePrepareOutcome::Failed(epoch));
                                             let _ = response.send(Err(error));
                                         }
                                     }
@@ -3176,17 +3187,13 @@ impl DirectPcmSource {
                                         None
                                     };
                                     producer_ring.finished.store(false, Ordering::Release);
-                                    producer_ring
-                                        .stage_pending
-                                        .store(false, Ordering::Release);
+                                    producer_ring.stage_pending.store(false, Ordering::Release);
                                     next_slot = (next_slot + 1) % producer_ring.slots.len();
                                 }
                                 Err(_) => {
                                     slot.state.store(SLOT_FREE, Ordering::Release);
                                     producer_ring.failed.store(true, Ordering::Release);
-                                    producer_ring
-                                        .stage_pending
-                                        .store(false, Ordering::Release);
+                                    producer_ring.stage_pending.store(false, Ordering::Release);
                                 }
                             }
                             continue;
@@ -3256,8 +3263,7 @@ impl DirectPcmSource {
                     // CUE 分轨有界播放：文件时间轴到达轨末边界 → 视作 EOF，
                     // 走既有 Ok(false) 通路（装填 staged 候选或曲终 finished），
                     // 防止越过曲界继续解码共享音频（曲终不触发/播到下一轨）
-                    let at_bound =
-                        matches!(bound_stop_secs, Some(stop) if file_pos_secs >= stop);
+                    let at_bound = matches!(bound_stop_secs, Some(stop) if file_pos_secs >= stop);
                     let read_out = if at_bound {
                         Ok(false)
                     } else {
@@ -3333,18 +3339,14 @@ impl DirectPcmSource {
                                     match outcome {
                                         StagePrepareOutcome::Ready(epoch, candidate) => {
                                             if epoch
-                                                == producer_ring
-                                                    .stage_epoch
-                                                    .load(Ordering::Acquire)
+                                                == producer_ring.stage_epoch.load(Ordering::Acquire)
                                             {
                                                 staged = Some(candidate);
                                             }
                                         }
                                         StagePrepareOutcome::Failed(epoch) => {
                                             if epoch
-                                                == producer_ring
-                                                    .stage_epoch
-                                                    .load(Ordering::Acquire)
+                                                == producer_ring.stage_epoch.load(Ordering::Acquire)
                                             {
                                                 producer_ring
                                                     .stage_pending
@@ -3355,32 +3357,26 @@ impl DirectPcmSource {
                                 }
                             }
                             match staged.take() {
-                                Some(candidate) => {
-                                    match install_staged_pcm_slot(candidate, slot) {
-                                        Ok((new_decoder, new_format, cand_start, cand_stop)) => {
-                                            decoder = new_decoder;
-                                            active_format = new_format;
-                                            file_pos_secs = cand_start;
-                                            bound_stop_secs = if cand_stop > 0 {
-                                                Some(cand_stop as f64 / 1_000_000.0)
-                                            } else {
-                                                None
-                                            };
-                                            producer_ring.finished.store(false, Ordering::Release);
-                                            producer_ring
-                                                .stage_pending
-                                                .store(false, Ordering::Release);
-                                            next_slot = (next_slot + 1) % producer_ring.slots.len();
-                                        }
-                                        Err(_) => {
-                                            slot.state.store(SLOT_FREE, Ordering::Release);
-                                            producer_ring.failed.store(true, Ordering::Release);
-                                            producer_ring
-                                                .stage_pending
-                                                .store(false, Ordering::Release);
-                                        }
+                                Some(candidate) => match install_staged_pcm_slot(candidate, slot) {
+                                    Ok((new_decoder, new_format, cand_start, cand_stop)) => {
+                                        decoder = new_decoder;
+                                        active_format = new_format;
+                                        file_pos_secs = cand_start;
+                                        bound_stop_secs = if cand_stop > 0 {
+                                            Some(cand_stop as f64 / 1_000_000.0)
+                                        } else {
+                                            None
+                                        };
+                                        producer_ring.finished.store(false, Ordering::Release);
+                                        producer_ring.stage_pending.store(false, Ordering::Release);
+                                        next_slot = (next_slot + 1) % producer_ring.slots.len();
                                     }
-                                }
+                                    Err(_) => {
+                                        slot.state.store(SLOT_FREE, Ordering::Release);
+                                        producer_ring.failed.store(true, Ordering::Release);
+                                        producer_ring.stage_pending.store(false, Ordering::Release);
+                                    }
+                                },
                                 None => {
                                     slot.state.store(SLOT_FREE, Ordering::Release);
                                     producer_ring.finished.store(true, Ordering::Release);
@@ -3480,6 +3476,16 @@ impl DirectPcmSource {
         self.ring.notify_state();
     }
 
+    /// Cross-format hard reset: future callback blocks are digital silence.
+    pub fn begin_mute_drain(&self) {
+        self.ring.fade.begin_mute_drain(
+            self.format.storage_bits,
+            self.format.valid_bits,
+            self.format.sample_rate,
+        );
+        self.ring.notify_state();
+    }
+
     /// 软暂停等待（Phase3）：淡出完成且已交付至少一个静音块（末尾为零电平），
     /// 或超时（超时后调用方仍会停发，退化为改动前行为）。控制线程 5ms 轮询
     pub fn wait_soft_pause(&self, timeout: Duration) -> bool {
@@ -3544,9 +3550,7 @@ impl DirectPcmSource {
     /// 仅热重配实验路径使用：wire 已由 FFI reconfigure 同步重配，源与 wire
     /// 的格式一致性由编排层（transition.rs）保证
     pub fn arm_cross_format_replace(&self) {
-        self.ring
-            .cross_format_armed
-            .store(true, Ordering::Release);
+        self.ring.cross_format_armed.store(true, Ordering::Release);
     }
 
     pub fn replace_drained_local(
@@ -3614,9 +3618,7 @@ impl DirectPcmSource {
             .round()
             .clamp(0.0, u64::MAX as f64) as u64;
         let generation = HANDOFF_STAGE_GENERATION.fetch_add(1, Ordering::Relaxed);
-        self.control_tx
-            .send(DirectPcmCommand::CancelStaged)
-            .ok()?;
+        self.control_tx.send(DirectPcmCommand::CancelStaged).ok()?;
         self.ring.signal_command();
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         self.control_tx
@@ -3978,7 +3980,10 @@ mod tests {
             .map(|i| ((i * 37) % 20000 - 10000) as i16)
             .flat_map(|sample| (i32::from(sample) << 16).to_le_bytes())
             .collect();
-        assert_eq!(streamed_blocks, promoted, "s16 WAV 经 AVIO 解码后应保持位精确");
+        assert_eq!(
+            streamed_blocks, promoted,
+            "s16 WAV 经 AVIO 解码后应保持位精确"
+        );
     }
 
     #[test]
