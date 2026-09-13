@@ -349,6 +349,7 @@ package_single_arch() {
                 export DIRETTA_SDK_DIR="$SDK_DIR"
             fi
             export DIRETTA_ARCH="${arch_var}"
+            export DIRETTA_SDK_VERSION="${SDK_VERSION}"
             export CARGO_INCREMENTAL=1
 
             cargo build --locked --release --package headless-server

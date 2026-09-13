@@ -26,6 +26,10 @@ namespace {
 constexpr std::size_t kTextCapacity = 256;
 thread_local std::string g_last_error;
 
+#ifndef SPLAYER_DIRETTA_SDK_VERSION
+#define SPLAYER_DIRETTA_SDK_VERSION 148
+#endif
+
 using SPlayerDirettaNextBlock = bool (*)(void*, const std::uint8_t**, std::size_t*);
 using SPlayerDirettaReleaseBlock = void (*)(void*);
 
@@ -209,6 +213,8 @@ struct DirettaConnection {
   DIRETTA::FormatConfigure format;
   // setSink 时记录的请求缓冲时长（µs）：Sink 自报值不可用时兜底
   std::uint64_t requested_sink_buffer_us = 0;
+  // SDK150: Sync::play(Clock) owns the delayed start; 148 always leaves this at zero.
+  int sdk_play_delay_ms = 0;
   // v11：open 时实测的 MTU，热重配重算传输周期用
   std::uint32_t mtu = 1500;
 
@@ -553,16 +559,25 @@ void* open_direct_with_format(
                  static_cast<long long>(elapsed_ms(open_started, connected_done)));
     std::fflush(stderr);
 
-    // v7 诊断开关 C：connectWait 完成后、返回上层（上层才会 play 起播）前
-    // 的静默等待（SPLAYER_DIRECT_CONNECT_DELAY_MS，默认 0）。设为 3000 可把
-    // "咚"精确定位在新会话建立瞬间 vs 首帧起播瞬间。
+    // SDK 148 has no timed play; keep its historical host-side wait. SDK 150
+    // delegates the same delay to its own playback state machine.
     const int connect_delay_ms = env_int("SPLAYER_DIRECT_CONNECT_DELAY_MS", 0, 0, 10000);
+#if SPLAYER_DIRETTA_SDK_VERSION >= 150
+    connection->sdk_play_delay_ms = connect_delay_ms;
+    if (connect_delay_ms > 0) {
+      std::fprintf(stderr,
+                   "[diretta-v15] SDK150 scheduled play delay armed: %d ms\n",
+                   connect_delay_ms);
+      std::fflush(stderr);
+    }
+#else
     if (connect_delay_ms > 0) {
       std::fprintf(stderr, "[diretta-v7] connect done, holding silence %d ms before play\n",
                    connect_delay_ms);
       std::fflush(stderr);
       std::this_thread::sleep_for(std::chrono::milliseconds(connect_delay_ms));
     }
+#endif
 
     // v11：post-play pre-roll 静音武装（SPLAYER_DIRECT_PREROLL_MS，默认 0=关闭）。
     // play() 后前 N ms 交付静音块给 DAC 锁相留时间，之后 SDK 才拉到真实音频
@@ -807,7 +822,16 @@ bool splayer_diretta_play(void* opaque) {
     return false;
   }
   try {
+#if SPLAYER_DIRETTA_SDK_VERSION >= 150
+    if (connection->sdk_play_delay_ms > 0) {
+      connection->sync->play(
+        ACQUA::Clock::MilliSeconds(static_cast<ACQUA::Clock::Type>(connection->sdk_play_delay_ms)));
+    } else {
+      connection->sync->play();
+    }
+#else
     connection->sync->play();
+#endif
     return true;
   } catch (const std::exception& error) {
     set_error(error.what());

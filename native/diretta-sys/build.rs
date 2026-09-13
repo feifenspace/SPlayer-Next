@@ -12,6 +12,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=DIRETTA_SDK_DIR");
     println!("cargo:rerun-if-env-changed=DIRETTA_SDK_ROOT");
     println!("cargo:rerun-if-env-changed=DIRETTA_USE_SDK_LOG");
+    println!("cargo:rerun-if-env-changed=DIRETTA_SDK_VERSION");
 
     // 显式指定 SDK，避免构建结果随机器目录发生变化。
     let sdk_dir_opt = env::var("DIRETTA_SDK_DIR")
@@ -36,6 +37,14 @@ fn main() {
 
     // 微架构判定
     let diretta_arch = env::var("DIRETTA_ARCH").unwrap_or_else(|_| "auto".to_string());
+    // SDK 148 is the conservative compatibility default. Packaging passes 148/150 explicitly.
+    let sdk_version = env::var("DIRETTA_SDK_VERSION").unwrap_or_else(|_| "148".to_string());
+    match sdk_version.as_str() {
+        "148" | "149" | "150" => {}
+        _ => panic!("unsupported DIRETTA_SDK_VERSION: {sdk_version}"),
+    }
+    println!("cargo:warning=[diretta-sys] SDK behavior version: {sdk_version}");
+
     let use_sdk_log = env::var("DIRETTA_USE_SDK_LOG")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -68,7 +77,8 @@ fn main() {
         .include(&sdk_include)
         .flag_if_supported("-fPIC")
         .flag_if_supported("-O3")
-        .flag_if_supported("-Wno-ignored-qualifiers");
+        .flag_if_supported("-Wno-ignored-qualifiers")
+        .define("SPLAYER_DIRETTA_SDK_VERSION", Some(sdk_version.as_str()));
     // 注意：绝不给 bridge.cpp 传 -march=<变体>——march 只用于选择 SDK 静态库
     // 变体；桥接代码含内联 libstdc++ 模板（std::string 等），march=v2 会让
     // v1 级 CPU（如 Atom x5-E8000）执行到非法指令而 SIGILL（真机已复现）。
