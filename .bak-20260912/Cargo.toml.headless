@@ -1,0 +1,62 @@
+[package]
+name = "headless-server"
+version = "0.1.0"
+edition = "2021"
+description = "Linux headless HTTP/WebSocket server for SPlayer"
+
+[[bin]]
+name = "headless-server"
+path = "src/main.rs"
+
+[dependencies]
+# 音频核心（headless 模式：纯 ALSA / Diretta 输出，免去桌面级 PipeWire 动态库依赖；关闭 FFT 频谱和 MIDI）
+audio-engine-core = { path = "../audio-engine-core", default-features = false, features = ["headless"] }
+
+# memfd_create（preload 模式纯内存流缓存）
+libc = "0.2"
+
+# CLI 参数解析
+clap = { version = "4", features = ["derive"] }
+
+# Web 资源内嵌（D.13.1：默认内嵌，首屏零磁盘 IO；--web-root 显式指定时优先磁盘）
+rust-embed = "8"
+
+# HTTP 框架
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "fs", "compression-gzip"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 配置
+serde_yaml = "0.9"
+
+# 数据库
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 在线音源与网络
+ncm-api-rs = { git = "https://github.com/SPlayer-Dev/ncm-api-rs", rev = "133b65bfe482e41ebccf018870d3fce07bf58eb3", features = ["server"] }
+qqkg-api = { path = "../qqkg-api" }
+streaming-api = { path = "../streaming-api" }
+reqwest = { version = "0.12", features = ["json", "stream", "blocking", "gzip", "deflate"] }
+
+# 工具
+anyhow = "1"
+parking_lot = "0.12"
+futures-util = "0.3"
+md5 = "0.7"
+urlencoding = "2"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+tempfile = "3"
+
+[lints]
+workspace = true

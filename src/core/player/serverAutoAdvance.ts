@@ -143,10 +143,59 @@ export const adoptServerAdvancedTrack = (match: {
   return true;
 };
 
+/**
+ * 手动点歌待采纳：客户端发起 load 时登记（source/track/预期队列位），
+ * WS 状态推送确认到达后对齐 UI。
+ * 修手动切歌 UI 显示与实际播放不同步（显示旧曲/队列游标脱节）：
+ * adoptServerAdvancedTrack 只服务自动接力（registeredNext 匹配），手动点歌时
+ * 该槽已被 resetServerAutoAdvance 清空，服务端推来的正确 current_source /
+ * current_track_id 会被直接丢弃，UI 停留在旧曲；下一曲随后按旧游标计算，
+ * 造成"跳曲"。本槽位让手动点歌同样按服务端权威状态对齐
+ */
+let manualPending: { source: string; track: Track; index: number } | null = null;
+
+/** 客户端 load 提交前登记本次点歌的 source/track/预期队列位 */
+export const markManualServerLoad = (
+  source: string,
+  track: Track | null,
+  index: number,
+): void => {
+  if (!playerClient.supportsServerAutoAdvance) return;
+  if (!source || !track) return;
+  manualPending = { source, track, index };
+};
+
+/**
+ * WS 状态推送到达时消费 manualPending：source 精确相等（与提交串一致）
+ * 或队列曲目 id 相等即采纳，对齐 playIndex/media/currentSource。
+ * 与 adoptServerAdvancedTrack 的差异：不要求 registeredNext 存在
+ */
+export const tryAdoptManualServerLoad = (match: {
+  source?: string;
+  trackId?: string;
+}): boolean => {
+  if (!manualPending) return false;
+  const bySource = !!match.source && match.source === manualPending.source;
+  const byTrackId =
+    !!match.trackId && !!manualPending.track.id && match.trackId === manualPending.track.id;
+  if (!bySource && !byTrackId) return false;
+  const { track, index, source } = manualPending;
+  manualPending = null;
+
+  const status = useStatusStore();
+  const media = useMediaStore();
+  status.playIndex = index;
+  status.trackLoading = false;
+  media.setTrack(track);
+  status.currentSource = source;
+  return true;
+};
+
 /** 客户端主动加载新曲时清空注册状态（防止服务端接力与手动切歌竞态） */
 export const resetServerAutoAdvance = (): void => {
   registeredNext = null;
   registeredForSource = null;
+  manualPending = null;
   resolvingTrackId = null;
   lastResolveAttemptAt = 0;
 };

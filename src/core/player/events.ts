@@ -8,7 +8,7 @@ import * as abLoop from "@/services/abLoop";
 import * as cacheScheduler from "@/services/cacheScheduler";
 import * as playStats from "./stats";
 import { playerClient } from "@/services/client";
-import { adoptServerAdvancedTrack, maybeRegisterNextCandidate } from "./serverAutoAdvance";
+import { adoptServerAdvancedTrack, maybeRegisterNextCandidate, tryAdoptManualServerLoad } from "./serverAutoAdvance";
 import { isServerQueueActive } from "./serverQueue";
 import {
   hasReachedSeekTarget,
@@ -96,11 +96,19 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       playback.setDuration(event.data.duration);
       playback.setPlaying(event.data.state === "playing");
       // headless 自动连播：服务端接力/boundary 切曲后按曲目 id（回退 source）采纳队列曲目
-      if (
+      const adoptedServerTrack =
         (event.data.currentSource || event.data.currentTrackId) &&
         playerClient.supportsServerAutoAdvance
-      ) {
-        adoptServerAdvancedTrack({
+          ? adoptServerAdvancedTrack({
+              source: event.data.currentSource,
+              trackId: event.data.currentTrackId,
+            })
+          : false;
+      // 手动点歌确认：registeredNext 已被 load() 清空，自动接力采纳必然 miss；
+      // 用 load 时登记的 manualPending 按服务端权威状态对齐 UI
+      //（修"实际播放已是新曲、UI 仍显示旧曲、下一曲按旧游标跳曲"）
+      if (!adoptedServerTrack && playerClient.supportsServerAutoAdvance) {
+        tryAdoptManualServerLoad({
           source: event.data.currentSource,
           trackId: event.data.currentTrackId,
         });
