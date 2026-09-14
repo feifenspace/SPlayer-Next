@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{Read, Seek};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -36,6 +37,37 @@ const AVERROR_EIO: i32 = sys::averror(libc::EIO);
 
 const OUTPUT_CEILING: f32 = 0.98;
 const LIMITER_RELEASE: f32 = 0.0005;
+
+/// Reject the most common non-audio responses before they reach FFmpeg.
+pub fn validate_audio_prefix(prefix: &[u8], source: &str) -> Result<()> {
+    let trimmed = prefix
+        .iter()
+        .copied()
+        .skip_while(u8::is_ascii_whitespace)
+        .collect::<Vec<_>>();
+    let lower = String::from_utf8_lossy(&trimmed[..trimmed.len().min(256)]).to_ascii_lowercase();
+    let looks_like_html = lower.starts_with("<html")
+        || lower.starts_with("<!doctype html")
+        || lower.starts_with("<head")
+        || lower.starts_with("<body");
+    let looks_like_json_error = (lower.starts_with('{') || lower.starts_with('['))
+        && (lower.contains("\"error\"")
+            || lower.contains("\"code\"")
+            || lower.contains("\"message\""));
+    if looks_like_html || looks_like_json_error {
+        anyhow::bail!("在线音源返回网页或 JSON 错误响应，而不是音频数据: {source}");
+    }
+    Ok(())
+}
+
+fn validate_http_source(source: &mut (impl Read + Seek), url: &str) -> Result<()> {
+    let mut prefix = [0u8; 256];
+    let read = source.read(&mut prefix).context("读取在线音源头部失败")?;
+    source
+        .seek(std::io::SeekFrom::Start(0))
+        .context("回退在线音源读取位置失败")?;
+    validate_audio_prefix(&prefix[..read], url)
+}
 
 struct OutputLimiter {
     gain: f32,
@@ -243,6 +275,28 @@ fn prepare_from_opened(
     ensure!(stream_info.channels > 0, "源音频没有有效声道");
     let source_channels = u16::try_from(stream_info.channels).context("源音频声道数超出范围")?;
     let codec = info.codec_name.clone().unwrap_or_default();
+    let sample_fmt = info.sample_fmt.as_deref().unwrap_or("unknown");
+    let source_kind = if source.starts_with("http://") || source.starts_with("https://") {
+        "http"
+    } else if crate::sacd::parse_sacd_virtual_path(source).is_some() {
+        "sacd"
+    } else if crate::cue::parse_cue_virtual_path(source).is_some() {
+        "cue"
+    } else {
+        "file"
+    };
+    tracing::info!(
+        source = %source,
+        source_kind,
+        codec = %codec,
+        sample_format = sample_fmt,
+        sample_rate = stream_info.sample_rate,
+        channels = source_channels,
+        bits_per_sample = stream_info.bits_per_sample,
+        bit_rate = stream_info.bit_rate,
+        duration_secs,
+        "音频格式探测完成"
+    );
 
     let raw_metadata = reader.metadata();
     let tags = metadata::extract_file_tags(source, &reader);
@@ -471,7 +525,8 @@ fn open_source(
     }
 
     let (reader, cancel) = if source.starts_with("http://") || source.starts_with("https://") {
-        let http = HttpAudioSource::new_with_cancel_handle(source, &cancel_handle)?;
+        let mut http = HttpAudioSource::new_with_cancel_handle(source, &cancel_handle)?;
+        validate_http_source(&mut http, source)?;
         let reader =
             AudioReader::new(http).with_context(|| format!("打开网络音频失败: {source}"))?;
         (reader, Some(cancel_handle))
@@ -692,6 +747,18 @@ mod tests {
         bytes.extend_from_slice(&data_size.to_le_bytes());
         bytes.resize(44 + data_size as usize, 0);
         bytes
+    }
+
+    #[test]
+    fn rejects_html_and_json_error_bodies_before_ffmpeg() {
+        assert!(validate_audio_prefix(b"<!doctype html><html>login</html>", "https://example.test").is_err());
+        assert!(validate_audio_prefix(br#"{"code":403,"message":"expired"}"#, "https://example.test").is_err());
+    }
+
+    #[test]
+    fn accepts_binary_audio_headers() {
+        assert!(validate_audio_prefix(b"fLaC\x00\x00\x00\x22", "https://example.test").is_ok());
+        assert!(validate_audio_prefix(b"RIFF\x24\x00\x00\x00WAVE", "https://example.test").is_ok());
     }
 
     #[test]

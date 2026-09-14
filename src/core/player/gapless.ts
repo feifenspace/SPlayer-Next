@@ -22,6 +22,7 @@ import { useHistoryStore } from "@/stores/history";
 import * as lyricLoader from "@/services/lyric/loader";
 import * as coverLoader from "@/services/coverLoader";
 import { extractColorFromUrl } from "@/utils/color";
+import { syncNowPlayingQuality } from "./syncNowPlaying";
 import * as playback from "@/services/playback";
 import * as playStats from "./stats";
 
@@ -208,22 +209,29 @@ export const advanceGaplessBoundary = async (
     return true;
   }
 
-  const candidate = getNextTrackCandidate({
+  const derivedCandidate = getNextTrackCandidate({
     playIndex: status.playIndex,
     queue: queue.queue.value,
     fmMode: status.fmMode,
     fuckDjMode: settings.preset.fuckDjMode,
     shuffleMode: status.shuffleMode,
   });
-  // 服务端自治无缝切曲的曲目 id 与前端队列推导不一致 = 队列权威失同步信号
-  // （前端仍按推导推进，warn 供联调定位）
-  if (trackId && candidate && candidate.track.id !== trackId) {
+  // 边界事件携带实际已经播放的 track_id。插入/重排与播放边界同时发生时，
+  // 优先按服务端 ID 对齐，避免本地 playIndex 尚未同步而跳过插入曲目。
+  const authoritativeIndex = trackId
+    ? queue.queue.value.findIndex((item) => item.id === trackId)
+    : -1;
+  const candidate =
+    authoritativeIndex >= 0
+      ? { track: queue.queue.value[authoritativeIndex], index: authoritativeIndex }
+      : derivedCandidate;
+  if (trackId && derivedCandidate && derivedCandidate.track.id !== trackId) {
     console.warn(
-      "[gapless] boundary 曲目与前端队列推导不一致",
+      "[gapless] boundary 曲目与前端队列推导不一致，已按服务端 track_id 对齐",
       "server:",
       trackId,
       "local:",
-      candidate.track.id,
+      derivedCandidate.track.id,
     );
   }
   // 引擎已切入下一曲但前端无法定位候选：只能提交时长，保持引擎侧状态正确
@@ -246,6 +254,7 @@ export const advanceGaplessBoundary = async (
   status.currentSource = null;
   lyricLoader.beginLoad();
   media.setTrack(track);
+  void syncNowPlayingQuality(track.id);
   media.setPlaybackContext(status.currentPlaybackContext);
   status.position = 0;
   status.duration = durationMs > 0 ? durationMs : (track.duration ?? 0);

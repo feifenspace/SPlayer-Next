@@ -1961,6 +1961,9 @@ struct DirectPcmRing {
     /// 单一状态信号：producer 与控制线程共享的条件等待通道（避免任何忙等/轮询）
     signal: Mutex<()>,
     signal_cv: Condvar,
+    /// 换源屏障：置位后新的 SDK 回调只交付静音，不触碰 slot/frame。
+    transitioning: AtomicBool,
+    callback_active: AtomicUsize,
     /// 控制通道存在待处理命令的提示位：命令发送方置位并唤醒，producer 消费命令前清零
     command_pending: AtomicBool,
     /// staged 候选已接受且尚未装填进 ring：曲终判定必须避开此窗口——
@@ -2012,6 +2015,8 @@ impl DirectPcmRing {
             pre_mute_buf: Mutex::new(Vec::new()),
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
+            transitioning: AtomicBool::new(false),
+            callback_active: AtomicUsize::new(0),
             command_pending: AtomicBool::new(false),
             stage_pending: AtomicBool::new(false),
             stage_epoch: AtomicU64::new(0),
@@ -2139,6 +2144,16 @@ impl DirectPcmRing {
     }
 
     fn next_block(&self) -> Option<DirectPcmBlock> {
+        self.callback_active.fetch_add(1, Ordering::AcqRel);
+        let _callback_guard = DirectPcmCallbackGuard { ring: self };
+        // 控制线程即将清理 slot/frame 时，回调不得再读取旧数据；保持 SDK
+        // 发送线程活着，交付预分配静音直到屏障解除。
+        if self.transitioning.load(Ordering::Acquire) {
+            // SDK 回调重新进入时，上一块已交付数据已不再被当前回调读取；
+            // 先归还 in_flight，再交付静音，避免 begin_transition 等待自锁。
+            self.release_in_flight();
+            return self.pre_mute_block();
+        }
         self.release_in_flight();
         if self.failed.load(Ordering::Acquire) {
             return None;
@@ -2272,6 +2287,37 @@ impl DirectPcmRing {
         })
     }
 
+    /// 建立换源屏障，保证 producer 清理 slot/frame 时 SDK 回调不再持有旧块。
+    fn begin_transition(&self) -> Result<()> {
+        self.transitioning.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let callbacks = self.callback_active.load(Ordering::Acquire);
+            let in_flight = self.in_flight.load(Ordering::Acquire);
+            if callbacks == 0 && in_flight == NO_SLOT {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    target: "diretta_handoff",
+                    phase = "pcm_transition_barrier_timeout",
+                    callbacks = %callbacks,
+                    in_flight = %in_flight,
+                    "PCM handoff 回调屏障超时，继续使用保守路径"
+                );
+                return Err(anyhow!(
+                    "PCM handoff 回调屏障超时（callbacks={callbacks}, in_flight={in_flight}）"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn end_transition(&self) {
+        self.transitioning.store(false, Ordering::Release);
+        self.notify_state();
+    }
+
     fn reset_for_transition(&self) {
         self.release_in_flight();
         self.consumer_index.store(0, Ordering::Relaxed);
@@ -2292,6 +2338,17 @@ impl DirectPcmRing {
         }
         // finished/failed 已清除、fade 已复位：唤醒 producer 与排空等待方
         self.notify_state();
+    }
+}
+
+struct DirectPcmCallbackGuard<'a> {
+    ring: &'a DirectPcmRing,
+}
+
+impl Drop for DirectPcmCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.ring.callback_active.fetch_sub(1, Ordering::AcqRel);
+        self.ring.notify_state();
     }
 }
 
@@ -2518,6 +2575,22 @@ fn replace_pcm_ring(
 /// 保证两条路径的簿记语义（pre-mute/reset_for_transition/boundary/R3 块几何）
 /// 完全一致。decoder 仅用于 repack 预分配的 frame_samples_hint
 fn install_prepared_first_frame(
+    ring: &DirectPcmRing,
+    prepared: DirectPcmFrame,
+    new_format: DirectPcmFormat,
+    decoder: &DirectPcmDecoder,
+) -> Result<()> {
+    if let Err(error) = ring.begin_transition() {
+        // 超时也必须撤销 transitioning，否则后续所有回调都会永久只发静音。
+        ring.end_transition();
+        return Err(error);
+    }
+    let result = install_prepared_first_frame_inner(ring, prepared, new_format, decoder);
+    ring.end_transition();
+    result
+}
+
+fn install_prepared_first_frame_inner(
     ring: &DirectPcmRing,
     mut prepared: DirectPcmFrame,
     new_format: DirectPcmFormat,

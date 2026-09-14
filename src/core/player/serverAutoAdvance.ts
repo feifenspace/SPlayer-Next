@@ -12,12 +12,17 @@ import { playerClient } from "@/services/client";
 import { peekNextTrackPreload } from "@/services/nextTrackPreloader";
 import { resolveTrackSource } from "@/services/audioSource";
 import { buildStagingSource } from "@/core/player/gapless";
-import { pushServerQueueSnapshot } from "./serverQueue";
+import {
+  pushServerQueueSnapshot,
+  isServerQueueActive,
+  markServerQueueSynchronized,
+} from "./serverQueue";
 import { getNextTrackCandidate } from "./candidate";
 import type { CandidateResult } from "./candidate";
 import * as lyricLoader from "@/services/lyric/loader";
 import * as coverLoader from "@/services/coverLoader";
 import { extractColorFromUrl } from "@/utils/color";
+import { syncNowPlayingQuality } from "./syncNowPlaying";
 
 /** 已注册的下一曲候选（曲终服务端接力后用于前端采纳） */
 let registeredNext: { source: string; track: Track; index: number } | null = null;
@@ -36,6 +41,7 @@ const RESOLVE_RETRY_COOLDOWN_MS = 30_000;
  */
 export const maybeRegisterNextCandidate = (): void => {
   if (!playerClient.supportsServerAutoAdvance) return;
+  if (isServerQueueActive()) return;
   const status = useStatusStore();
   const settings = useSettingsStore();
   if (status.repeatMode === "one" || status.fmMode) return;
@@ -115,14 +121,46 @@ const resolveThenRegister = (candidate: CandidateResult): void => {
  * 两者都不可用时放弃采纳（UI 保持原曲，避免错位推进）。
  * 采纳后清空注册状态
  */
-export const adoptServerAdvancedTrack = (match: {
-  source?: string;
-  trackId?: string;
-}): boolean => {
-  if (!registeredNext) return false;
+export const adoptServerAdvancedTrack = (match: { source?: string; trackId?: string }): boolean => {
+  // 手动切歌尚未收到目标曲目确认时，旧的 WS 状态不能被当作自动接力采纳。
+  // 完整重连期间服务端可能仍发送上一曲快照；若此处提前采纳，会造成 UI
+  // 短暂回退到上一曲，随后又被手动切歌确认切回目标曲目。
+  if (manualPending) return false;
+  if (!registeredNext) {
+    // 重连后可能跨过多首歌，没有浏览器登记的单槽候选；按服务端身份恢复。
+    const index = match.trackId
+      ? queue.queue.value.findIndex((track) => track.id === match.trackId)
+      : match.source
+        ? queue.findTrackIndexByServerSource(match.source)
+        : -1;
+    if (index < 0) return false;
+    const track = queue.getTrack(index);
+    if (!track) return false;
+    const status = useStatusStore();
+    const media = useMediaStore();
+    if (media.track?.id === track.id && status.playIndex === index) return true;
+    status.playIndex = index;
+    status.currentSource = match.source ?? track.path ?? track.id;
+    status.trackLoading = false;
+    media.setTrack(track);
+  void syncNowPlayingQuality(track.id);
+    markServerQueueSynchronized();
+    lyricLoader.beginLoad();
+    void lyricLoader.loadForTrack(null);
+    void coverLoader.loadCoverForTrack(track);
+    return true;
+  }
   const byTrackId = !!match.trackId && registeredNext.track.id === match.trackId;
   const bySource = !!match.source && registeredNext.source === match.source;
-  if (!byTrackId && !bySource) return false;
+  if (!byTrackId && !bySource) {
+    if (match.trackId && queue.queue.value.some((track) => track.id === match.trackId)) {
+      registeredNext = null;
+      registeredForSource = null;
+      resolvingTrackId = null;
+      return adoptServerAdvancedTrack(match);
+    }
+    return false;
+  }
   const { track, index, source } = registeredNext;
   registeredNext = null;
   registeredForSource = null;
@@ -134,7 +172,9 @@ export const adoptServerAdvancedTrack = (match: {
   status.playIndex = index;
   status.trackLoading = false;
   media.setTrack(track);
+  void syncNowPlayingQuality(track.id);
   status.currentSource = source;
+  markServerQueueSynchronized();
   // 候选曲 detail 未探测：先走在线歌词/封面，本地嵌入歌词等下次完整 load 恢复
   lyricLoader.beginLoad();
   void lyricLoader.loadForTrack(null);
@@ -155,11 +195,7 @@ export const adoptServerAdvancedTrack = (match: {
 let manualPending: { source: string; track: Track; index: number } | null = null;
 
 /** 客户端 load 提交前登记本次点歌的 source/track/预期队列位 */
-export const markManualServerLoad = (
-  source: string,
-  track: Track | null,
-  index: number,
-): void => {
+export const markManualServerLoad = (source: string, track: Track | null, index: number): void => {
   if (!playerClient.supportsServerAutoAdvance) return;
   if (!source || !track) return;
   manualPending = { source, track, index };
@@ -170,10 +206,7 @@ export const markManualServerLoad = (
  * 或队列曲目 id 相等即采纳，对齐 playIndex/media/currentSource。
  * 与 adoptServerAdvancedTrack 的差异：不要求 registeredNext 存在
  */
-export const tryAdoptManualServerLoad = (match: {
-  source?: string;
-  trackId?: string;
-}): boolean => {
+export const tryAdoptManualServerLoad = (match: { source?: string; trackId?: string }): boolean => {
   if (!manualPending) return false;
   const bySource = !!match.source && match.source === manualPending.source;
   const byTrackId =
@@ -187,6 +220,7 @@ export const tryAdoptManualServerLoad = (match: {
   status.playIndex = index;
   status.trackLoading = false;
   media.setTrack(track);
+  void syncNowPlayingQuality(track.id);
   status.currentSource = source;
   return true;
 };

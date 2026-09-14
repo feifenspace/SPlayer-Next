@@ -1,4 +1,4 @@
-import type { MediaInfo, PlaybackContext, Track, TrackDetail } from "@shared/types/player";
+import type { AudioQuality, MediaInfo, PlaybackContext, Track, TrackDetail } from "@shared/types/player";
 import type { LyricData, LyricFormat, LyricInput, LyricLine } from "@shared/types/lyrics";
 import { findLyricIndex } from "@shared/utils/lyric";
 import { useSettingsStore } from "@/stores/settings";
@@ -64,8 +64,20 @@ export const useMediaStore = defineStore("media", () => {
    * @param newDetail - 新的歌曲详细信息；省略则保留现有 detail
    */
   const setTrack = (newTrack: Track, newDetail?: TrackDetail): void => {
+    const previousTrack = track.value;
     track.value = newTrack;
     if (newDetail) detail.value = newDetail;
+    else if (!previousTrack || previousTrack.id !== newTrack.id || previousTrack.path !== newTrack.path) {
+      detail.value = null;
+    }
+  };
+
+  const setPlaybackQuality = (quality: AudioQuality): void => {
+    detail.value = { quality, externalLyrics: detail.value?.externalLyrics ?? [] };
+  };
+
+  const clearDetail = (): void => {
+    detail.value = null;
   };
 
   /**
@@ -227,6 +239,8 @@ export const useMediaStore = defineStore("media", () => {
     lyricLoading,
     lyricIndex,
     setTrack,
+    setPlaybackQuality,
+    clearDetail,
     setPlaybackContext,
     enrichTrack,
     patchCover,

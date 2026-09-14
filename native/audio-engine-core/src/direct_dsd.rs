@@ -725,6 +725,8 @@ struct DirectDsdRing {
     finished: AtomicBool,
     failed: AtomicBool,
     stopped: AtomicBool,
+    transitioning: AtomicBool,
+    callback_active: AtomicUsize,
     /// 单一状态信号：producer 与控制线程共享的条件等待通道（避免任何忙等/轮询）
     signal: Mutex<()>,
     signal_cv: Condvar,
@@ -786,6 +788,8 @@ impl DirectDsdRing {
             finished: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            transitioning: AtomicBool::new(false),
+            callback_active: AtomicUsize::new(0),
             signal: Mutex::new(()),
             signal_cv: Condvar::new(),
             command_pending: AtomicBool::new(false),
@@ -846,7 +850,12 @@ impl DirectDsdRing {
     }
 
     fn next_block(&self) -> Option<DirectDsdBlock> {
+        self.callback_active.fetch_add(1, Ordering::AcqRel);
+        let _callback_guard = DirectDsdCallbackGuard { ring: self };
         self.release_in_flight();
+        if self.transitioning.load(Ordering::Acquire) {
+            return self.pre_mute_block();
+        }
         if self.failed.load(Ordering::Acquire) {
             return None;
         }
@@ -932,6 +941,31 @@ impl DirectDsdRing {
     /// 供数空窗时交付 0x69 静音块而非"无块"，消除 Target 侧欠载杂音。
     /// 缓冲预分配在本函数（producer/控制线程上下文）完成，
     /// SDK 回调线程内只读不分配（R1：回调路径禁止堆分配）
+    fn begin_transition(&self) {
+        self.transitioning.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while self.callback_active.load(Ordering::Acquire) != 0
+            || self.in_flight.load(Ordering::Acquire) != NO_SLOT
+        {
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    target: "diretta_dsd",
+                    phase = "dsd_transition_barrier_timeout",
+                    callbacks = %self.callback_active.load(Ordering::Acquire),
+                    in_flight = %self.in_flight.load(Ordering::Acquire),
+                    "DSD callback 屏障超时，继续执行保守复位"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn end_transition(&self) {
+        self.transitioning.store(false, Ordering::Release);
+        self.notify_state();
+    }
+
     fn trigger_pre_mute(&self) {
         let len = self.last_delivered_len.load(Ordering::Acquire);
         if len > 0 {
@@ -1051,7 +1085,8 @@ impl DirectDsdRing {
         }
     }
 
-    fn reset_for_transition(&self) {
+    fn reset_for_transition(&self) -> DirectDsdTransitionGuard<'_> {
+        self.begin_transition();
         self.release_in_flight();
         self.consumer_index.store(0, Ordering::Relaxed);
         self.in_flight.store(NO_SLOT, Ordering::Relaxed);
@@ -1073,6 +1108,7 @@ impl DirectDsdRing {
         }
         // finished/failed 已清除：唤醒 producer
         self.notify_state();
+        DirectDsdTransitionGuard { ring: self }
     }
 
     fn ensure_capacity(&self, capacity: usize) {
@@ -1095,7 +1131,7 @@ fn seek_dsd_ring(
 ) -> Result<f64> {
     // seek 复位同样存在供数空窗：pre-mute 窗口内 SDK 拉取拿到 0x69 静音块而非欠载
     ring.trigger_pre_mute();
-    ring.reset_for_transition();
+    let _transition = ring.reset_for_transition();
     let actual_position = reader.seek_seconds(position_secs)?;
     ensure!(
         reader.format() == expected_format,
@@ -1108,6 +1144,26 @@ fn seek_dsd_ring(
 
 fn same_dsd_transport(left: DirectDsdFormat, right: DirectDsdFormat) -> bool {
     left.bit_rate == right.bit_rate && left.channels == right.channels
+}
+
+struct DirectDsdCallbackGuard<'a> {
+    ring: &'a DirectDsdRing,
+}
+
+impl Drop for DirectDsdCallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.ring.callback_active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct DirectDsdTransitionGuard<'a> {
+    ring: &'a DirectDsdRing,
+}
+
+impl Drop for DirectDsdTransitionGuard<'_> {
+    fn drop(&mut self) {
+        self.ring.end_transition();
+    }
 }
 
 struct StagedDsdSource {
@@ -1197,7 +1253,7 @@ fn replace_dsd_ring(
         .clamp(0.0, u64::MAX as f64) as u64;
     // 换源复位有供数空窗：pre-mute 窗口内 SDK 拉取拿到 0x69 静音块而非欠载（消除切杂音）
     ring.trigger_pre_mute();
-    ring.reset_for_transition();
+    let _transition = ring.reset_for_transition();
     ring.ensure_capacity(reader.max_output_len());
     // 对齐 staged 安装语义：boundary 元数据在 slot 发布（READY）前写好，
     // duration/generation 随新源首块被消费时才原子切换——ReplaceLocal 瞬间

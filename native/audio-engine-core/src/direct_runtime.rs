@@ -78,7 +78,7 @@ pub fn direct_soft_pause_enabled() -> bool {
 
 /// Diretta full reconnect 后的 Target/DAC 格式稳定窗口。
 /// 仅替换现存 DirectPlayback（全量重连）时使用；同格式 staged/handoff 不经过此路径
-pub const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(300);
+pub const DIRECT_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(150);
 /// DSD stream setup needs a longer DAC/PLL stabilization window after a hard reconnect.
 pub const DIRECT_DSD_FULL_RECONNECT_STABILIZATION: Duration = Duration::from_millis(800);
 
@@ -335,6 +335,34 @@ enum DirectTransport {
 }
 
 impl DirectTransport {
+    /// 停止 SDK 拉流并释放当前回调租约，供 handoff 在清理 ring 前使用。
+    fn pause_for_handoff(&mut self) -> Result<()> {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.pause(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => value.pause(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => Ok(()),
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
+    /// handoff 完成后重新启动同一 Diretta 会话。
+    fn play_after_handoff(&mut self) -> Result<()> {
+        match self {
+            #[cfg(feature = "diretta")]
+            Self::Pcm(value) => value.play(),
+            #[cfg(feature = "diretta")]
+            Self::Dsd(value) => value.play(),
+            #[cfg(all(test, not(feature = "diretta")))]
+            Self::Fake(_) => Ok(()),
+            #[cfg(not(any(feature = "diretta", test)))]
+            _ => unreachable!("Direct 传输仅在 diretta/test 配置下可用"),
+        }
+    }
+
     /// 换源/关流前的源级静音垫请求：PCM 走淡出（下一交付块 10ms 升余弦渐零，
     /// 随后块为静音）；DSD 位流不可乘增益（无淡出通道），改为请求排空——
     /// 此后每个交付块在回调侧替换为 0x69 静音，持续顶掉设备端缓冲
@@ -880,9 +908,15 @@ impl DirectPlayback {
             || path_str.contains(".iso|")
             || path_str.contains(".ISO|");
 
+        // SDK 可能在停止拉流后仍持有最后一个回调块。先停止并显式释放
+        // lease，再允许 producer 清理旧 ring；否则 handoff 会与 SDK 读旧内存竞态。
+        // 同格式 handoff 保持 SDK 拉流线程和 Sync 会话持续运行，只在 producer
+        // 的安全块边界原子替换 ring。禁止调用 SDK stop/release/play，避免
+        // 连接复用时重新引入尾帧、点击声和线程生命周期竞态。
         // set_duration 必须先于 replace：slot 的 boundary_duration 在 replace 内发布，
         // 后设只改 ring 值会在边界消费时被旧时长覆盖
-        let format = match &mut self.transport {
+        let replaced: Result<DirectFormat> = (|| {
+            Ok(match &mut self.transport {
             DirectTransport::Pcm(value) => {
                 if is_dsd {
                     bail!("[Direct] PCM → Native DSD 需要重新协商 Diretta connection");
@@ -911,6 +945,11 @@ impl DirectPlayback {
                 let format = value.replace_drained_local_source(open_str, cue_start)?;
                 DirectFormat::Dsd(format)
             }
+            })
+        })();
+        let format = match replaced {
+            Ok(format) => format,
+            Err(error) => return Err(error),
         };
         self.source = source.to_owned();
         self.duration = cue_dur;

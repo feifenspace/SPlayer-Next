@@ -97,6 +97,9 @@ fn auto_advance_candidate(
                         duration_hint: item.duration_ms.map(|ms| ms as f64 / 1000.0),
                     });
                 }
+                if super::queue_source_resolver::can_resolve(item) {
+                    return None;
+                }
                 remaining = remaining.saturating_sub(1);
                 if remaining == 0 {
                     return None;
@@ -207,6 +210,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
         let mut no_candidate_announced = false;
         // 曲终接力候选加载失败的退避状态（见 AdvanceBackoff）
         let mut advance_backoff: Option<AdvanceBackoff> = None;
+        let mut unresolved_retry: Option<std::time::Instant> = None;
         // 跨格式、PCM↔DSD 与 stream 在线源走曲终完整重连；缩短其调度等待。
         let mut interval = tokio::time::interval(Duration::from_millis(250));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -271,24 +275,28 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                         _ => 0,
                     };
                     if attempts >= AUTO_ADVANCE_MAX_ATTEMPTS {
-                        // 同一候选反复失败：放弃重试（不置位），等队列/候选
-                        // 重新注册（source 变化即重置 attempts）后自动恢复
+                        // 达到单轮上限后降低重试频率，网络恢复不需要浏览器介入。
                         if !no_candidate_announced {
                             no_candidate_announced = true;
                             tracing::warn!(
                                 source = %next.source,
                                 attempts,
-                                "曲终接力候选连续加载失败，放弃重试；候选更新后将自动接续"
+                                "曲终接力候选连续加载失败，冷却后开启下一轮重试"
                             );
                             let _ = state.ws_tx.send(serde_json::json!({
                                 "type": "autoAdvanceFailed",
                                 "data": {
                                     "source": next.source,
                                     "attempts": attempts,
-                                    "final": true,
+                                    "final": false,
                                 },
                             }));
                         }
+                        advance_backoff = Some(AdvanceBackoff {
+                            source: next.source.clone(), attempts: 0,
+                            next_at: std::time::Instant::now() + AUTO_ADVANCE_RETRY_MAX,
+                        });
+                        state.auto_advance_requested.store(true, std::sync::atomic::Ordering::Release);
                         continue;
                     }
                     no_candidate_announced = false;
@@ -319,6 +327,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                     // 自治统计：接力加载成功的会话开启由 load 路径的
                     // update_now_playing → begin_server_play_session 统一完成
                     if let Some(detail) = failure {
+                        super::direct_preloader::refresh_failed_source(&state, &next.source).await;
                         let new_attempts = attempts + 1;
                         // 指数退避：5s 起倍增至上限；置位等冷却后自动重试
                         let delay = AUTO_ADVANCE_RETRY_BASE
@@ -352,8 +361,24 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                         advance_backoff = None;
                     }
                 } else if still_ended {
-                    // 无候选兜底（停播根因①）：重新置位等待客户端补注册候选，
-                    // 注册后下一 tick 自动接续；同时广播一次让在线客户端可感知。
+                    // 曲终时下一曲可能仍在平台解析退避窗口。直接由服务端
+                    // 现场解析，成功后重新置位接力标志，避免后台解析成功却
+                    // 没有任何事件唤醒 watchdog。所有在线平台走统一 resolver。
+                    if unresolved_retry.is_none_or(|at| at.elapsed() >= Duration::from_secs(5)) {
+                        unresolved_retry = Some(std::time::Instant::now());
+                        match super::direct_preloader::resolve_next_unresolved_candidate(&state).await {
+                            Ok(Some(next)) => {
+                                *state.pending_next.lock() = Some(next);
+                                state.auto_advance_requested.store(true, std::sync::atomic::Ordering::Release);
+                                no_candidate_announced = false;
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(error) => tracing::debug!(%error, "曲终接力现场解析暂未成功"),
+                        }
+                    }
+                    // 无候选兜底：重新置位等待客户端补注册候选或服务端下一轮解析，
+                    // 注册/解析成功后下一 tick 自动接续；同时广播一次让在线客户端可感知。
                     // 此前此处为静默跳过——浏览器离场时曲终即永久停播
                     state
                         .auto_advance_requested
@@ -530,6 +555,12 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unresolved_online_track_waits_instead_of_skipping() {
+        let mut queue = queue_of(&["/a", "", "https://example.test/later.flac"]);
+        queue.items[1].track = Some(serde_json::json!({"id":"song", "source":"qqmusic"}));
+        assert!(auto_advance_candidate(Some(queue), Some("/a"), None).is_none());
+    }
     use super::auto_advance_candidate;
     use crate::state::{PendingNext, QueueItem, QueueRepeat, QueueSnapshot};
 

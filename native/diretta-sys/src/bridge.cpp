@@ -227,10 +227,10 @@ struct DirettaConnection {
     try {
       if (sync->is_connect()) {
         sync->stop();
-        sync->releaseSourceBlock();
         sync->disconnect_flgset();
         sync->disconnect(false);
         sync->disconnectWait();
+        sync->releaseSourceBlock();
       } else {
         sync->releaseSourceBlock();
       }
@@ -392,7 +392,7 @@ void* open_direct_with_format(
       }
       discovery_done = std::chrono::steady_clock::now();
       for (const auto& [address, _info] : results) {
-        if (address.get_full_str() == target_id) {
+        if (address.get_full_str() == target_id || address.get_str() == target_id) {
           target = address;
           break;
         }
@@ -641,7 +641,7 @@ std::size_t splayer_diretta_scan(SPlayerDirettaDevice* devices, std::size_t capa
       }
       ++index;
     }
-    return results.size();
+    return count;
   } catch (const std::exception& error) {
     set_error(error.what());
   } catch (...) {
@@ -854,7 +854,11 @@ bool splayer_diretta_pause(void* opaque) {
     // 下一次 getNewStream 调用前必须保持有效。pause_silence 会在下一次
     // 回调接管输出；恢复后的 next_block 再自然归还旧块，避免 Target
     // 发送线程仍读取被 Rust 环形缓冲复用的块而产生短促点击。
-    if (connection->sync->is_connect()) connection->sync->stop();
+    if (connection->sync->is_connect()) {
+      connection->sync->stop();
+      // Keep the lease alive across pause; the next SDK callback releases it.
+      // Explicit release here can race SDK148 final read of the old block.
+    }
     return true;
   } catch (const std::exception& error) {
     set_error(error.what());

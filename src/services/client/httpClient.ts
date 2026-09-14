@@ -778,17 +778,22 @@ export class HttpPlayerClient implements IPlayerClient {
           statusRes.data &&
           (statusRes.data.state === "playing" || statusRes.data.state === "paused")
         ) {
+          const nowPlaying = await this.getNowPlaying();
+          const metadata = nowPlaying.success ? (nowPlaying.data as any)?.metadata : null;
+          const quality = metadata ? {
+            sampleRate: metadata.original_sample_rate || metadata.sample_rate || 0,
+            channels: metadata.channels || 0,
+            bitsPerSample: metadata.bits_per_sample || 0,
+            bitRate: metadata.bit_rate || 0,
+            codec: metadata.codec || "unknown",
+          } : options?.meta?.quality ?? {
+            sampleRate: 0, channels: 0, bitsPerSample: 0, bitRate: 0, codec: "unknown",
+          };
           return {
             success: true,
             data: {
               detail: {
-                quality: {
-                  sampleRate: 44100,
-                  channels: 2,
-                  bitsPerSample: 16,
-                  bitRate: 1411200,
-                  codec: "flac",
-                },
+                quality,
                 externalLyrics: [],
               },
               mediaInfo: {

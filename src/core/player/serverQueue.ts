@@ -16,6 +16,7 @@ import { toRaw, watch } from "vue";
 import type { Track } from "@shared/types/player";
 import { useMediaStore } from "@/stores/media";
 import { useStatusStore } from "@/stores/status";
+import { useSettingsStore } from "@/stores/settings";
 import * as queue from "@/stores/queue";
 import { playerClient } from "@/services/client";
 import { peekNextTrackPreload } from "@/services/nextTrackPreloader";
@@ -54,6 +55,8 @@ const snapshotSourceFor = (track: Track): string => {
 
 let lastSignature = "";
 let pushTimer: ReturnType<typeof setTimeout> | null = null;
+// 快照请求串行发送，避免快速插入/重排时旧快照晚到覆盖新快照。
+let pushChain: Promise<unknown> = Promise.resolve();
 
 const computePayload = () => {
   const status = useStatusStore();
@@ -67,7 +70,7 @@ const computePayload = () => {
     cover: track.cover ?? null,
     // 完整曲目快照（服务端透传）：浏览器存储被清空后重开页面时，可恢复
     // 平台身份（id/source/extId/serverId/CUE 分段/音质等），而不仅是展示字段
-    track: toRaw(track),
+    track: { ...toRaw(track), headlessQuality: useSettingsStore().player.songLevel },
   }));
   // 缓存随队列瘦身：已移出队列的曲目不再保留旧直链
   const liveIds = new Set(tracks.map((track) => track.id));
@@ -77,7 +80,7 @@ const computePayload = () => {
   return {
     items,
     index: Math.max(0, Math.min(status.playIndex, Math.max(tracks.length - 1, 0))),
-    repeat: status.repeatMode,
+    repeat: status.repeatMode === "list" ? "all" : status.repeatMode,
     shuffle: false,
   };
 };
@@ -111,8 +114,9 @@ export const pushServerQueueSnapshot = (): void => {
     return;
   }
 
-  void playerClient
-    .pushQueueSnapshot(payload)
+  pushChain = pushChain
+    .catch(() => undefined)
+    .then(() => playerClient.pushQueueSnapshot(payload))
     .then((result) => {
       if (result.success) {
         serverQueueActive = true;
@@ -143,6 +147,7 @@ export const installServerQueueSync = (): void => {
       status.playIndex,
       status.repeatMode,
       status.shuffleMode,
+      useSettingsStore().player.songLevel,
       media.track?.id ?? "",
       queue.queue.value.map((track) => track.id).join(","),
     ],

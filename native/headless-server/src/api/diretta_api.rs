@@ -4,7 +4,9 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::{extract::State, Json};
 use serde::Deserialize;
@@ -19,6 +21,46 @@ use crate::state::AppState;
 /// target_info 探测包含完整建连（扫描 + MTU 测量 + setSink + connectWait，典型 2-3s），
 /// 3s 硬超时过于贴近正常耗时、易误杀，导致前端频繁查询失败 → 放宽到 6s
 pub(crate) const DIRETTA_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+
+const DIRETTA_CAPS_CACHE_TTL: Duration = Duration::from_secs(600);
+
+fn diretta_caps_cache() -> &'static Mutex<HashMap<String, (Instant, audio_engine_core::diretta::DirettaTargetCapabilities)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, audio_engine_core::diretta::DirettaTargetCapabilities)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_target_caps(target: &str) -> Option<audio_engine_core::diretta::DirettaTargetCapabilities> {
+    let mut cache = diretta_caps_cache().lock().ok()?;
+    let (stored_at, caps) = cache.get(target)?;
+    if stored_at.elapsed() > DIRETTA_CAPS_CACHE_TTL {
+        cache.remove(target);
+        return None;
+    }
+    Some(caps.clone())
+}
+
+pub(crate) fn prime_target_caps(target: String) {
+    std::thread::Builder::new()
+        .name("diretta-caps-prewarm".into())
+        .spawn(move || {
+            match audio_engine_core::diretta::query_target_caps(&target) {
+                Ok(caps) => {
+                    cache_target_caps(&target, caps);
+                    tracing::info!(target = %target, "Diretta Target 完整能力预热缓存完成");
+                }
+                Err(error) => {
+                    tracing::debug!(target = %target, error = %error, "Diretta Target 能力预热暂未完成");
+                }
+            }
+        })
+        .ok();
+}
+
+fn cache_target_caps(target: &str, caps: audio_engine_core::diretta::DirettaTargetCapabilities) {
+    if let Ok(mut cache) = diretta_caps_cache().lock() {
+        cache.insert(target.to_string(), (Instant::now(), caps));
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct DirettaSelectRequest {
@@ -123,12 +165,19 @@ pub(crate) async fn diretta_select_handler(
             match tokio::time::timeout(
                 DIRETTA_PROBE_TIMEOUT,
                 spawn_isolated_blocking("diretta-select-verify", move || {
-                    audio_engine_core::diretta::query_target_caps(&target).is_ok()
+                    audio_engine_core::diretta::query_target_caps(&target)
                 }),
             )
             .await
             {
-                Ok(Ok(reachable)) => reachable,
+                Ok(Ok(Ok(caps))) => {
+                    cache_target_caps(&target_for_log, caps);
+                    true
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(target = %target_for_log, error = %e, "Diretta 可达性探测失败");
+                    false
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "Diretta 可达性探测线程异常");
                     false
@@ -173,7 +222,7 @@ pub struct DirettaTargetInfoRequest {
 
 /// 查询指定 Diretta 目标 DAC 的信息
 pub(crate) async fn diretta_target_info_handler(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Json(payload): Json<DirettaTargetInfoRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
     let target = payload
@@ -187,43 +236,18 @@ pub(crate) async fn diretta_target_info_handler(
         return Err(ApiError::bad_request("Diretta target is required"));
     }
 
-    let active_format = {
-        let player = state.player.lock();
-        let selected = player
-            .selected_device()
-            .and_then(audio_engine_core::diretta::selector_target)
-            .unwrap_or("");
-        if selected == target {
-            player.active_direct_format()
-        } else {
-            None
-        }
-    };
-    if let Some(format) = active_format {
-        let description = match format {
-            audio_engine_core::direct_runtime::DirectFormat::Pcm(v) => format!(
-                "当前播放：{} Hz / {} bit / {} 声道",
-                v.sample_rate, v.valid_bits, v.channels
-            ),
-            audio_engine_core::direct_runtime::DirectFormat::Dsd(v) => format!(
-                "当前播放：Native DSD {} Hz / {} 声道",
-                v.bit_rate, v.channels
-            ),
-        };
-        tracing::info!(target = %target, "Diretta 查询复用活动连接，未创建 QuerySync");
-        return Ok(Json(PlayerResponse::ok(
-            json!({"target_address": target, "pcm_format_desc": description, "dsd_format_desc": "活动连接模式不探测完整硬件能力", "query_source": "active_connection", "is_live_snapshot": true}),
-        )));
-    }
-
-    let target_for_query = target.clone();
-    let caps = match tokio::time::timeout(
-        DIRETTA_PROBE_TIMEOUT,
-        spawn_isolated_blocking("diretta-info-worker", move || {
-            audio_engine_core::diretta::query_target_caps(&target_for_query)
-        }),
-    )
-    .await
+    let caps = if let Some(cached) = cached_target_caps(&target) {
+        tracing::info!(target = %target, "Diretta 查询复用已缓存的完整 Target 能力");
+        cached
+    } else {
+        let target_for_query = target.clone();
+        let queried = match tokio::time::timeout(
+            DIRETTA_PROBE_TIMEOUT,
+            spawn_isolated_blocking("diretta-info-worker", move || {
+                audio_engine_core::diretta::query_target_caps(&target_for_query)
+            }),
+        )
+        .await
     {
         Ok(Ok(result)) => result.map_err(|e| {
             tracing::warn!(target = %target, error = %e, phase = "query_target_caps", "Diretta 硬件能力查询失败");
@@ -234,11 +258,14 @@ pub(crate) async fn diretta_target_info_handler(
                 "Diretta target info task failed: {e}"
             )))
         }
-        Err(_) => {
-            return Err(ApiError::internal(
-                "Diretta target 探测超时（DKS 调用无内部超时，已中止等待）",
-            ))
-        }
+            Err(_) => {
+                return Err(ApiError::internal(
+                    "Diretta target 探测超时（DKS 调用无内部超时，已中止等待）",
+                ))
+            }
+        };
+        cache_target_caps(&target, queried.clone());
+        queried
     };
 
     let pcm_format_desc = if caps.supports_pcm {

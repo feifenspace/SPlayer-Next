@@ -539,6 +539,10 @@ pub(crate) async fn load_handler(
         .auto_advance_requested
         .store(false, std::sync::atomic::Ordering::Release);
 
+    // 在完整重连开始前立即更新 WS/HTTP 快照，避免重连窗口继续暴露上一曲。
+    // 前端手动切歌会以该 source 作为权威确认，防止旧状态覆盖目标曲目。
+    state.note_source_change(Some(&source));
+
     // 若为后台冷启动恢复请求（auto_play: false），且当前播放器已处于活跃播放或暂停状态，直接返回现有状态，不打断后台音频流
     if !auto_play {
         let snap = state.snapshot();
@@ -621,6 +625,7 @@ fn fold_direct_format_into(
             metadata.original_sample_rate = format.bit_rate;
             metadata.channels = format.channels;
             metadata.bits_per_sample = 1;
+            metadata.codec = String::from_utf8(vec![100, 115, 100]).unwrap();
         }
     }
 }
@@ -825,6 +830,22 @@ fn try_handoff_to_new_source(
     metadata: &mut audio_engine_core::AudioMetadata,
     is_dsd: bool,
 ) -> Result<bool, anyhow::Error> {
+    // SDK150 在同一 Sync 会话 stop→play 复用时存在原生线程生命周期
+    // 崩溃风险。Headless 默认走完整重连，保留环境变量仅供后续 SDK 修复后
+    // 显式启用 handoff 做 A/B 验证。
+    let handoff_enabled = std::env::var("SPLAYER_HEADLESS_DIRECT_HANDOFF")
+        .ok()
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off" | "OFF"))
+        .unwrap_or(true);
+    if !handoff_enabled {
+        tracing::info!(
+            target: "diretta_handoff",
+            phase = "headless_handoff_disabled",
+            "Headless Diretta 默认禁用连接复用 handoff，改走安全完整重连"
+        );
+        return Ok(false);
+    }
+
     match audio_engine_core::InnerPlayer::try_direct_handoff(
         &state.player,
         token,
@@ -943,17 +964,15 @@ fn full_reconnect_load(
                 let player = state.player.lock();
                 let _ = player.begin_direct_pre_mute();
             }
-            let pre_mute_deadline = Instant::now() + std::time::Duration::from_millis(200);
-            while state.player.lock().direct_pre_mute_pending() {
-                if Instant::now() >= pre_mute_deadline {
-                    tracing::warn!(
-                        target: "diretta_handoff",
-                        phase = "reconnect_pre_mute_timeout",
-                        "拆线前预静音倒计时超时（连接可能已不拉流），继续拆连接"
-                    );
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+            // SDK148 callback 次数不是可靠的完成条件：stop/Target 等待期间
+            // 可能不再拉流，等待 forced_mute_cycles 会被动耗满固定 200ms。
+            // 后续 mute-drain 以可拉流时的静音交付和 lease 排空为准。
+            if state.player.lock().direct_pre_mute_pending() {
+                tracing::debug!(
+                    target: "diretta_handoff",
+                    phase = "reconnect_pre_mute_deferred",
+                    "SDK 暂未消耗完预静音，交由后续 mute-drain 和断开屏障处理"
+                );
             }
             let drain = {
                 let mut player = state.player.lock();
@@ -1507,6 +1526,7 @@ async fn run_alsa_dsd_load(
 
     update_now_playing(&state, &source, &metadata);
     state.note_source_change(Some(&source));
+    super::direct_preloader::schedule_next_preload(&state);
     Ok(Json(PlayerResponse::ok(json!({
         "status": "loaded",
         "source": source,
@@ -1603,6 +1623,7 @@ async fn finish_regular_load(
         Some(meta) => {
             update_now_playing(state, &source, &meta);
             state.note_source_change(Some(&source));
+            super::direct_preloader::schedule_next_preload(state);
             // 开流格式观测：把每次 load 的采样率/位深/编解码留在日志里，
             // 用于与输出停滞的相关性分析（Target 对特定格式拒收的定位）
             tracing::info!(
@@ -1640,8 +1661,21 @@ pub(crate) fn update_now_playing(
     source: &str,
     meta: &audio_engine_core::AudioMetadata,
 ) {
+    // 队列快照携带完整曲目 ID；写入 now-playing 后，前端可以判断元数据
+    // 是否已经切换到当前曲，避免自动切歌窗口读到上一曲的格式。
+    let queue_track_id = state
+        .queue
+        .lock()
+        .as_ref()
+        .and_then(|q| q.items.iter().find(|it| it.source == source))
+        .and_then(|item| item.track.as_ref())
+        .and_then(|track| track.get("id"))
+        .and_then(|id| id.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| source.to_string());
     *state.now_playing.lock() = Some(json!({
         "source": source,
+        "track_id": queue_track_id,
         "title": meta.title,
         "artist": meta.artist,
         "album": meta.album,

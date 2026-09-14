@@ -28,7 +28,11 @@ import {
   scheduleNextTrackPreload,
 } from "@/services/nextTrackPreloader";
 import { installPlayStats } from "./stats";
-import { installServerQueueSync, setRestoringQueue, markServerQueueSynchronized } from "./serverQueue";
+import {
+  installServerQueueSync,
+  setRestoringQueue,
+  markServerQueueSynchronized,
+} from "./serverQueue";
 import { useFavorite } from "@/composables/useFavorite";
 import { extractColorFromUrl } from "@/utils/color";
 import { handleError, isSkippableError } from "@/utils/errors";
@@ -140,6 +144,7 @@ export const load = async (
   seekTarget = null;
   playback.setSeeking(false);
   resetForLoad(meta?.duration ?? 0);
+  useMediaStore().clearDetail();
   // 客户端主动加载：清空自动连播注册（防止服务端接力与手动切歌竞态）
   resetServerAutoAdvance();
   // 登记 manualPending：WS 状态确认到达后对齐 UI（修显示与实际播放不同步）
@@ -947,7 +952,7 @@ export const insertToQueue = (
   const existingIdx = queue.findTrackIndex(item.id);
   if (existingIdx !== -1) {
     queue.updateQueueItem(existingIdx, item, context);
-    // 移动：目标需 clamp 到 length-1
+    // 已存在的曲目移动到下一曲位置时，统一调整 playIndex，避免当前曲错位。
     const safeAt = Math.max(0, Math.min(raw, len - 1));
     if (existingIdx === safeAt) return existingIdx;
     moveInQueue(existingIdx, safeAt);
@@ -1144,7 +1149,6 @@ export const initPlayer = async (): Promise<void> => {
   installServerQueueSync();
 };
 
-
 /** 恢复上次播放状态 */
 export const restoreLastTrack = async (): Promise<void> => {
   const status = useStatusStore();
@@ -1192,7 +1196,15 @@ export const restoreLastTrack = async (): Promise<void> => {
           cover: meta.cover || undefined,
           duration: Math.round((meta.duration_secs ?? 0) * 1000),
         };
-        media.setTrack(track);
+        const quality = {
+          sampleRate: meta.original_sample_rate || meta.sample_rate || 0,
+          channels: meta.channels || 0,
+          bitsPerSample: meta.bits_per_sample || 0,
+          bitRate: meta.bit_rate || 0,
+          codec: meta.codec || "unknown",
+        };
+        track.quality = quality;
+        media.setTrack(track, { quality, externalLyrics: [] });
         status.trackLoading = false;
         status.currentSource = serverSource;
         lyricLoader.beginLoad();
@@ -1204,9 +1216,7 @@ export const restoreLastTrack = async (): Promise<void> => {
           const snap = await playerClient.getQueueSnapshot();
           if (snap.success && snap.data && snap.data.registered && snap.data.items.length > 0) {
             const snapshotItems = snap.data.items;
-            const localEmpty = queue.queueEntries.value.length === 0;
-
-            if (localEmpty) {
+            {
               // Rebuild local queue from server snapshot.
               // 新版快照条目携带完整 Track（平台身份 id/source、流媒体 serverId、
               // CUE 分段、音质等），原样恢复即可重新解析直链/歌词/喜欢；
@@ -1228,7 +1238,11 @@ export const restoreLastTrack = async (): Promise<void> => {
                     },
               );
               queue.setQueue(rebuiltTracks);
-              console.log("[player] Rebuilt local queue from server snapshot:", rebuiltTracks.length, "tracks");
+              console.log(
+                "[player] Rebuilt local queue from server snapshot:",
+                rebuiltTracks.length,
+                "tracks",
+              );
             }
 
             // Align playIndex: prefer finding current source in local queue.
@@ -1242,7 +1256,7 @@ export const restoreLastTrack = async (): Promise<void> => {
                 // 用队列里结构完整的曲目（正确 id/标题/封面）覆盖 Step A 用引擎
                 // tag 拼出的哑曲目（本地曲目 path/id 与服务端 source 全等命中）
                 media.setTrack(matched);
-                status.currentSource = matched.id || serverSource;
+                status.currentSource = serverSource;
               }
             } else {
               // Fallback to server-reported index
@@ -1270,7 +1284,12 @@ export const restoreLastTrack = async (): Promise<void> => {
 
             // Align repeat mode
             status.repeatMode = snap.data.repeat === "one" ? "one" : "list";
-            console.log("[player] Aligned playIndex to", status.playIndex, "repeat:", status.repeatMode);
+            console.log(
+              "[player] Aligned playIndex to",
+              status.playIndex,
+              "repeat:",
+              status.repeatMode,
+            );
 
             // Mark server queue as synchronized to prevent reverse-flush
             markServerQueueSynchronized();
@@ -1280,7 +1299,7 @@ export const restoreLastTrack = async (): Promise<void> => {
         }
       }
 
-      if (meta) return;
+      return;
     } catch (error) {
       console.error("[player] getNowPlaying failed", error);
     } finally {
@@ -1329,4 +1348,3 @@ export const disposePlayer = (): void => {
     unsubscribe = null;
   }
 };
-

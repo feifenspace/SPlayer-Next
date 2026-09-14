@@ -2,7 +2,8 @@
 
 mod direct;
 mod direct_preloader;
-mod diretta_api;
+mod queue_source_resolver;
+pub(crate) mod diretta_api;
 mod fs;
 mod library;
 pub mod player;

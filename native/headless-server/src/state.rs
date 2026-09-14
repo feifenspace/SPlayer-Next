@@ -107,7 +107,7 @@ fn complete_server_play_session(
 }
 
 /// 播放队列重复模式
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QueueRepeat {
     Off,
@@ -118,7 +118,7 @@ pub enum QueueRepeat {
 impl QueueRepeat {
     pub fn parse(value: Option<&str>) -> Self {
         match value.map(str::to_ascii_lowercase).as_deref() {
-            Some("all") => Self::All,
+            Some("all" | "list") => Self::All,
             Some("one") => Self::One,
             _ => Self::Off,
         }
@@ -128,7 +128,7 @@ impl QueueRepeat {
 /// 队列条目：source 与 load API 的取值语义一致（绝对路径/HTTP 直链/cue:// 等）。
 /// track 为前端完整曲目快照（透传字段，服务端不解释）：浏览器存储清空后
 /// 重开页面时前端据此恢复平台身份（id/source/流媒体 serverId/CUE 分段等）
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueueItem {
     pub source: String,
     pub duration_ms: Option<u64>,
@@ -144,7 +144,7 @@ pub struct QueueItem {
 /// 由前端整表推送（PUT /api/v1/player/queue）；服务端在 boundary 提交时
 /// 推进游标（align_by_source 自愈，队列被重排后按 source 重新对齐）。
 /// 未注册队列时无缝预载不工作，回退前端驱动的候选/接力旧链路。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct QueueSnapshot {
     pub items: Vec<QueueItem>,
     /// 播放顺序（shuffle 在注册时物化为本快照内的确定性排列）
@@ -327,6 +327,17 @@ impl AppState {
         }
         let player = Arc::new(Mutex::new(inner_player));
 
+        // 重启后已保存的 Diretta 目标会在播放前自动恢复；提前在后台完成
+        // 一次完整能力查询，避免活动连接建立后首次打开信息面板只能返回简化快照。
+        if let Some(target) = player
+            .lock()
+            .selected_device()
+            .and_then(audio_engine_core::diretta::selector_target)
+            .map(str::to_owned)
+        {
+            crate::api::diretta_api::prime_target_caps(target);
+        }
+
         // 后台自动发现：未记忆 Diretta 目标时扫描局域网，首个在线目标设为
         // 运行时输出（不写 db——db 保留用户显式选择，下次启动仍按本规则判定）。
         // 扫描阻塞（DKS 发现重试），不能卡 AppState::new 主链路
@@ -358,7 +369,14 @@ impl AppState {
         let auto_advance_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fft_subscriber_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_next = Arc::new(Mutex::new(None));
-        let queue: Arc<Mutex<Option<QueueSnapshot>>> = Arc::new(Mutex::new(None));
+        let restored_queue = crate::db::get_server_state(&db.lock(), "playback_queue")
+            .ok().flatten()
+            .and_then(|value| serde_json::from_str::<Option<QueueSnapshot>>(&value).ok())
+            .flatten()
+            .filter(|queue| queue.order.len() == queue.items.len()
+                && queue.order.iter().all(|&index| index < queue.items.len())
+                && (queue.items.is_empty() || queue.pos < queue.order.len()));
+        let queue: Arc<Mutex<Option<QueueSnapshot>>> = Arc::new(Mutex::new(restored_queue));
         let direct_boundary_event: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let server_play_session: Arc<Mutex<Option<ServerPlaySession>>> = Arc::new(Mutex::new(None));
         let server_play_completed: Arc<Mutex<Vec<ServerPlaySession>>> = Arc::new(Mutex::new(Vec::new()));

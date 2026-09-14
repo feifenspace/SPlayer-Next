@@ -24,7 +24,7 @@ use super::{InnerPlayer, PlayerEvent, PlayerState};
 fn direct_parallel_open_enabled() -> bool {
     match std::env::var("SPLAYER_DIRECT_PARALLEL_OPEN") {
         Ok(value) => !matches!(value.as_str(), "0" | "false" | "off" | "OFF"),
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 

@@ -226,6 +226,9 @@ fn copy_with_abort(
             }
             return Ok((written, false));
         }
+        if written == 0 {
+            audio_engine_core::decoder::validate_audio_prefix(&chunk[..n], "HTTP 音频响应")?;
+        }
         writer.write_all(&chunk[..n])?;
         written += n as u64;
         if written > DIRECT_PRELOAD_MAX_BYTES {

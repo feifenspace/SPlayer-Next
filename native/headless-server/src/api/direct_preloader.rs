@@ -28,6 +28,10 @@ use crate::state::{AppState, PendingNext, QueueItem, QueueRepeat, QueueSnapshot}
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1_000_000);
 /// 预载失效令牌：任何新调度/失效操作使在途预载结果作废
 static PRELOAD_TOKEN: AtomicU64 = AtomicU64::new(0);
+/// HTTP 连接池的后台任务必须比单次预载线程存活更久。
+static RESOLVER_RUNTIME: std::sync::LazyLock<Result<tokio::runtime::Runtime, std::io::Error>> =
+    std::sync::LazyLock::new(|| tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2).enable_all().build());
 
 /// 已成功 stage 的下一曲（单槽：同一时刻只有一个 stage 在途/就绪）
 #[derive(Debug, Clone)]
@@ -39,6 +43,37 @@ struct StagedNext {
 }
 
 static STAGED_NEXT: Mutex<Option<StagedNext>> = Mutex::new(None);
+
+/// 与队列更新保持相同锁顺序，避免较旧快照覆盖新队列。
+pub(crate) fn persist_queue(state: &AppState) {
+    let guard = state.queue.lock();
+    if let Ok(value) = serde_json::to_string(&*guard) {
+        if let Err(error) = crate::db::set_server_state(&state.db.lock(), "playback_queue", &value) {
+            warn!(%error, "保存播放队列失败");
+        }
+    }
+}
+
+/// 接力加载失败后刷新临时直链；手动切歌或重排使旧请求失效。
+pub(crate) async fn refresh_failed_source(state: &AppState, source: &str) {
+    let token = PRELOAD_TOKEN.load(Ordering::Acquire);
+    let item = state.queue.lock().as_ref()
+        .and_then(|queue| queue.items.iter().find(|item| item.source == source).cloned());
+    let Some(item) = item.filter(super::queue_source_resolver::can_resolve) else { return; };
+    match super::queue_source_resolver::resolve(state, &item).await {
+        Ok(resolved) => {
+            let mut guard = state.queue.lock();
+            if token != PRELOAD_TOKEN.load(Ordering::Acquire) { return; }
+            if let Some(entry) = guard.as_mut().and_then(|queue| queue.items.iter_mut()
+                .find(|entry| entry.source == source && entry.track == item.track)) {
+                entry.source = resolved;
+            }
+            drop(guard);
+            persist_queue(state);
+        }
+        Err(error) => warn!(%error, "接力直链刷新失败，保留重试状态"),
+    }
+}
 
 /// 最近一次已完成簿记提交的边界代际。边界事件可能重复投递（引擎/回调层
 /// 竞态），小于等于该值的再次投递属于已提交代际的重复边界，直接忽略——
@@ -88,33 +123,23 @@ pub(crate) fn take_staged_for_source(state: &AppState, source: &str) -> Option<u
 pub(crate) fn schedule_next_preload(state: &AppState) {
     invalidate();
 
-    // 仅 Diretta 选择器需要 staging；其他输出走既有链路
-    let is_direct = {
-        let player = state.player.lock();
-        player
-            .selected_device()
-            .is_some_and(|dev| audio_engine_core::diretta::selector_target(&dev).is_some())
-    };
-    if !is_direct {
-        return;
-    }
-
     // 队列对齐 + 下一曲选取（短锁内克隆，锁外使用）
     let current_source = state.player.lock().current_source().map(String::from);
-    let item = {
-        let Some(snapshot) = state.queue.lock().clone() else {
+    let (entry_index, item) = {
+        let mut guard = state.queue.lock();
+        let Some(snapshot) = guard.as_mut() else {
             return; // 未注册队列：保持前端驱动旧链路
         };
-        let mut snapshot = snapshot;
         snapshot.align_by_source(current_source.as_deref());
+        let mut snapshot = snapshot.clone();
         let mut remaining = snapshot.items.len().saturating_sub(1);
         let mut candidate = snapshot.next();
         let item = loop {
             let Some((next_pos, item)) = candidate else {
                 break None;
             };
-            if is_loadable_candidate_source(&item.source) {
-                break Some(item.clone());
+            if is_loadable_candidate_source(&item.source) || super::queue_source_resolver::can_resolve(item) {
+                break Some((snapshot.order[next_pos], item.clone()));
             }
             remaining = remaining.saturating_sub(1);
             if remaining == 0 {
@@ -129,13 +154,14 @@ pub(crate) fn schedule_next_preload(state: &AppState) {
         };
         item
     };
+    persist_queue(state);
 
     let token = PRELOAD_TOKEN.fetch_add(1, Ordering::AcqRel) + 1;
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
     let state_for_worker = state.clone();
     let spawn_result = std::thread::Builder::new()
         .name("direct-preload".into())
-        .spawn(move || stage_next_worker(state_for_worker, token, generation, item));
+        .spawn(move || stage_next_worker(state_for_worker, token, generation, entry_index, item));
     if let Err(error) = spawn_result {
         warn!(error = %error, "无缝预载线程启动失败");
     }
@@ -232,14 +258,108 @@ fn commit_boundary_bookkeeping(
     }
 
     info!(source = %source, generation, "无缝边界已自治提交，调度再下一曲");
+    persist_queue(state);
     schedule_next_preload(state);
+}
+
+/// 曲终时解析队列中的下一首未落定在线曲目。
+///
+/// 预载线程可能正处于平台解析退避窗口，而当前曲目已经 EOF；此时仅靠
+/// 原预载线程不会重新唤醒 watchdog。该入口由 watchdog 在无候选状态下调用，
+/// 所有在线平台共用同一 resolver，成功后写回队列并由下一轮接力加载。
+pub(crate) async fn resolve_next_unresolved_candidate(
+    state: &AppState,
+) -> Result<Option<PendingNext>, String> {
+    let current_source = state.player.lock().current_source().map(String::from);
+    let item = {
+        let mut guard = state.queue.lock();
+        let Some(snapshot) = guard.as_mut() else {
+            return Ok(None);
+        };
+        snapshot.align_by_source(current_source.as_deref());
+        let mut snapshot = snapshot.clone();
+        let mut remaining = snapshot.items.len().saturating_sub(1);
+        let mut next = snapshot.next();
+        let mut found = None;
+        while let Some((next_pos, candidate)) = next {
+            if super::queue_source_resolver::can_resolve(candidate) && !is_loadable_candidate_source(&candidate.source) {
+                found = Some(candidate.clone());
+                break;
+            }
+            remaining = remaining.saturating_sub(1);
+            if remaining == 0 {
+                break;
+            }
+            snapshot.pos = next_pos;
+            next = snapshot.next();
+        }
+        found
+    };
+    let Some(item) = item else {
+        return Ok(None);
+    };
+
+    let resolved = super::queue_source_resolver::resolve(state, &item).await?;
+    let duration_hint = item.duration_ms.map(|ms| ms as f64 / 1000.0);
+    {
+        let mut guard = state.queue.lock();
+        let Some(snapshot) = guard.as_mut() else {
+            return Ok(None);
+        };
+        let Some(entry) = snapshot.items.iter_mut().find(|entry| {
+            entry.source == item.source && entry.track == item.track
+        }) else {
+            return Ok(None);
+        };
+        entry.source = resolved.clone();
+    }
+    persist_queue(state);
+    info!(source = %resolved, "曲终接力现场解析成功");
+    Ok(Some(PendingNext {
+        source: resolved,
+        duration_hint,
+    }))
 }
 
 /// stage 结果处理：成功登记单槽；被拒/跳过则登记曲终接力候选
 /// （跨 wire 格式的下一曲由输出恢复看门狗在曲终全量重连加载，浏览器无关）
-fn stage_next_worker(state: AppState, token: u64, generation: u64, item: QueueItem) {
+fn stage_next_worker(state: AppState, token: u64, generation: u64, entry_index: usize, mut item: QueueItem) {
     if token != PRELOAD_TOKEN.load(Ordering::Acquire) {
         return;
+    }
+    if super::queue_source_resolver::can_resolve(&item) {
+        let runtime = match &*RESOLVER_RUNTIME {
+            Ok(runtime) => runtime,
+            Err(error) => { warn!(%error, "创建队列解析运行时失败"); return; }
+        };
+        let mut attempt = 0u32;
+        loop {
+            if token != PRELOAD_TOKEN.load(Ordering::Acquire) { return; }
+            match runtime.block_on(super::queue_source_resolver::resolve(&state, &item)) {
+                Ok(source) => {
+                    let mut guard = state.queue.lock();
+                    if token != PRELOAD_TOKEN.load(Ordering::Acquire) { return; }
+                    let Some(snapshot) = guard.as_mut() else { return; };
+                    let Some(current) = snapshot.items.get_mut(entry_index)
+                        .filter(|candidate| candidate.track == item.track && candidate.source == item.source) else { return; };
+                    current.source = source.clone();
+                    item.source = source;
+                    drop(guard);
+                    persist_queue(&state);
+                    info!(generation, attempt, "在线队列音源已由服务端解析");
+                    break;
+                }
+                Err(error) => {
+                    attempt = attempt.saturating_add(1);
+                    let delay = (5u64 << attempt.min(4)).min(60);
+                    warn!(%error, attempt, retry_seconds = delay, "在线队列音源解析失败，后台重试");
+                    for _ in 0..delay * 10 {
+                        if token != PRELOAD_TOKEN.load(Ordering::Acquire) { return; }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                }
+            }
+        }
     }
     let duration_secs = item.duration_ms.map_or(0.0, |ms| ms as f64 / 1000.0);
     let track_id = item
@@ -248,6 +368,12 @@ fn stage_next_worker(state: AppState, token: u64, generation: u64, item: QueueIt
         .and_then(|t| t.get("id"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    let is_direct = state.player.lock().selected_device()
+        .is_some_and(|device| audio_engine_core::diretta::selector_target(&device).is_some());
+    if !is_direct {
+        register_relay_candidate(&state, &item);
+        return;
+    }
     let meta = json!({
         "source": item.source.clone(),
         "title": item.title.clone(),
@@ -368,6 +494,7 @@ pub(crate) async fn queue_snapshot_handler(
     );
     let count = snapshot.items.len();
     *state.queue.lock() = Some(snapshot);
+    persist_queue(&state);
     // 快照更新即重新调度无缝预载：前端在下一曲直链解析落定后会重推快照，
     // 此处以最新 source 重 stage（invalidate + 幂等重调度）
     schedule_next_preload(&state);
@@ -414,6 +541,7 @@ pub(crate) async fn get_queue_handler(State(state): State<AppState>) -> Json<Pla
 /// 同时作废无缝预载与旧接力候选（队列权威移除后旧候选不得复活）
 pub(crate) async fn queue_clear_handler(State(state): State<AppState>) -> Json<PlayerResponse> {
     *state.queue.lock() = None;
+    persist_queue(&state);
     invalidate();
     *state.pending_next.lock() = None;
     Json(PlayerResponse::ok(json!({ "registered": false })))
@@ -476,6 +604,16 @@ mod tests {
         // 未知 source 保持原位
         q.align_by_source(Some("/missing"));
         assert_eq!(q.order[q.pos], 2);
+    }
+
+    #[test]
+    fn browser_list_mode_survives_persistence_and_wraps() {
+        let queue = QueueSnapshot::new(vec![item("/a"), item("/b")], 1, QueueRepeat::parse(Some("list")), false);
+        let saved = serde_json::to_string(&Some(queue)).unwrap();
+        let restored: Option<QueueSnapshot> = serde_json::from_str(&saved).unwrap();
+        let restored = restored.unwrap();
+        assert_eq!(restored.current().unwrap().source, "/b");
+        assert_eq!(restored.next().unwrap().1.source, "/a");
     }
 
     #[test]
