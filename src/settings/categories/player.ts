@@ -1,6 +1,9 @@
 import type { SettingCategory } from "@/types/settings-schema";
 import DeviceSelector from "@/components/settings/custom/DeviceSelector.vue";
 import IconLucidePlay from "~icons/lucide/play";
+import { getActiveDeviceId } from "@/core/player";
+import { setDeviceVolume } from "@/services/deviceVolume";
+import { useStatusStore } from "@/stores/status";
 
 const playerCategory: SettingCategory = {
   id: "player",
@@ -162,6 +165,18 @@ const playerCategory: SettingCategory = {
           key: "outputDevice",
           type: "custom",
           component: DeviceSelector,
+        },
+        {
+          key: "rememberDeviceVolume",
+          type: "switch",
+          binding: { store: "settings", path: "player.rememberDeviceVolume" },
+          defaultValue: false,
+          action: (enabled) => {
+            if (enabled) {
+              const activeId = getActiveDeviceId();
+              if (activeId) setDeviceVolume(activeId, useStatusStore().volume);
+            }
+          },
         },
         {
           key: "pauseOnDeviceSwitch",

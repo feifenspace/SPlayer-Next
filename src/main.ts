@@ -80,10 +80,11 @@ const bootstrapPlayback = async (): Promise<void> => {
 router.isReady().then(async () => {
   // 挂载应用
   app.mount("#app");
+  // 启动播放服务
+  void bootstrapPlayback().catch(console.error);
   // 淡出加载动画
   await Promise.all([splashMinElapsed, nextPaintedFrame()]);
   removeSplash();
-  setTimeout(() => bootstrapPlayback().catch(console.error), SPLASH_FADE_MS);
   // 初始化快捷键
   useHotkeyStore()
     .init()

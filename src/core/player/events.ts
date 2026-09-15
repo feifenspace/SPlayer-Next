@@ -1,16 +1,24 @@
 import type { PlayerEvent } from "@shared/types/player";
 import { useMediaStore } from "@/stores/media";
 import { useStatusStore } from "@/stores/status";
+import { useSettingsStore } from "@/stores/settings";
 import { useFavorite } from "@/composables/useFavorite";
 import * as playback from "@/services/playback";
 import * as autoClose from "@/services/autoClose";
 import * as abLoop from "@/services/abLoop";
 import * as cacheScheduler from "@/services/cacheScheduler";
+import { setDeviceVolume } from "@/services/deviceVolume";
 import * as playStats from "./stats";
 import { playerClient } from "@/services/client";
-import { adoptServerAdvancedTrack, maybeRegisterNextCandidate, tryAdoptManualServerLoad } from "./serverAutoAdvance";
+import {
+  adoptServerAdvancedTrack,
+  maybeRegisterNextCandidate,
+  tryAdoptManualServerLoad,
+} from "./serverAutoAdvance";
 import { isServerQueueActive } from "./serverQueue";
 import {
+  applySavedVolumeForActiveDevice,
+  getActiveDeviceId,
   hasReachedSeekTarget,
   insertManyToQueue,
   isSeeking,
@@ -26,11 +34,7 @@ import {
   setRepeatMode,
   setShuffleMode,
 } from "./index";
-import {
-  advanceGaplessBoundary,
-  hasStagedDirectNext,
-  maybeStageDirectNext,
-} from "./gapless";
+import { advanceGaplessBoundary, hasStagedDirectNext, maybeStageDirectNext } from "./gapless";
 
 /** 防止 ended 事件重入 */
 let endedGuard = false;
@@ -78,7 +82,7 @@ const finishCurrentTrack = async (): Promise<void> => {
 export const handleEvent = async (event: PlayerEvent): Promise<void> => {
   const status = useStatusStore();
   switch (event.type) {
-    case "status":
+    case "status": {
       // 歌曲加载中或 loading 事件不更新 UI，保持当前封面/进度/播放状态平滑过渡
       if (event.data.state === "loading" || status.trackLoading) break;
       status.state = event.data.state;
@@ -88,7 +92,14 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
         status.position = playback.setCurrentTime(event.data.position);
       }
       status.duration = event.data.duration;
-      status.volume = event.data.volume;
+      if (status.volume !== event.data.volume) {
+        status.volume = event.data.volume;
+        const settings = useSettingsStore();
+        if (settings.player.rememberDeviceVolume) {
+          const activeId = getActiveDeviceId();
+          if (activeId) setDeviceVolume(activeId, event.data.volume);
+        }
+      }
       if (event.data.speed != null) {
         status.speed = event.data.speed;
         playback.setSpeed(event.data.speed);
@@ -114,6 +125,7 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
         });
       }
       break;
+    }
     case "seek":
       markSeek(event.data.position);
       break;
@@ -161,11 +173,7 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
     }
     case "directTrackBoundary": {
       // 引擎已在音频回调内零间隙切入下一曲，前端推进 queue/media 并 commit
-      await advanceGaplessBoundary(
-        event.data.duration,
-        event.data.generation,
-        event.data.trackId,
-      );
+      await advanceGaplessBoundary(event.data.duration, event.data.generation, event.data.trackId);
       break;
     }
     case "sourceError":
@@ -211,7 +219,15 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
       await useFavorite().toggle(useMediaStore().track);
       break;
     case "deviceChanged": {
-      refreshDevices();
+      const prevActiveId = getActiveDeviceId();
+      await refreshDevices();
+      const settings = useSettingsStore();
+      if (settings.player.outputDevice === null && settings.player.rememberDeviceVolume) {
+        const nextActiveId = getActiveDeviceId();
+        if (nextActiveId && nextActiveId !== prevActiveId) {
+          await applySavedVolumeForActiveDevice();
+        }
+      }
       break;
     }
   }
