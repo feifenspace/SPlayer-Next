@@ -157,17 +157,35 @@ pub struct QueueSnapshot {
 impl QueueSnapshot {
     /// 按 source 反查队列条目的前端曲目 id（接力/边界后随 WS 带回，前端按 id
     /// 采纳新曲）。找不到（手动 load 队列外曲目）返回 None
+    pub fn item_track_id(item: &QueueItem) -> Option<String> {
+        item.track
+            .as_ref()
+            .and_then(|track| track.get("id"))
+            .and_then(|id| id.as_str())
+            .map(String::from)
+    }
+
     pub fn track_id_for_source(&self, source: &str) -> Option<String> {
         self.items
             .iter()
             .find(|item| item.source == source)
-            .and_then(|item| {
-                item.track
-                    .as_ref()
-                    .and_then(|track| track.get("id"))
-                    .and_then(|id| id.as_str())
-                    .map(String::from)
-            })
+            .and_then(Self::item_track_id)
+    }
+
+    /// 稳定曲目 id 优先，临时 URL 或本地 source 作为兜底。
+    pub fn align_by_identity(&mut self, source: Option<&str>, track_id: Option<&str>) -> bool {
+        if let Some(track_id) = track_id.filter(|id| !id.is_empty()) {
+            if let Some(pos) = self.order.iter().position(|&idx| {
+                self.items
+                    .get(idx)
+                    .and_then(Self::item_track_id)
+                    .as_deref() == Some(track_id)
+            }) {
+                self.pos = pos;
+                return true;
+            }
+        }
+        self.align_by_source(source)
     }
 
     pub fn new(items: Vec<QueueItem>, index: usize, repeat: QueueRepeat, shuffle: bool) -> Self {
@@ -224,15 +242,17 @@ impl QueueSnapshot {
 
     /// 按条目 source 把当前播放位置对齐到队列（队列重排/换歌后自愈）。
     /// 找不到时保持原位
-    pub fn align_by_source(&mut self, source: Option<&str>) {
-        let Some(source) = source else { return };
+    pub fn align_by_source(&mut self, source: Option<&str>) -> bool {
+        let Some(source) = source else { return false };
         if let Some(pos) = self
             .order
             .iter()
             .position(|&idx| self.items.get(idx).is_some_and(|it| it.source == source))
         {
             self.pos = pos;
+            return true;
         }
+        false
     }
 }
 
@@ -478,6 +498,19 @@ impl AppState {
                         }
                     }
                     PlayerEvent::Ended => {
+                        // 旧 load 的 EOF 可能在新曲提交后迟到；新曲刚开始时
+                        // position=0，不能把它当成当前曲终。
+                        let valid_current_end = authoritative.position > 0.0
+                            && (authoritative.duration <= 0.0
+                                || authoritative.position + 2.0 >= authoritative.duration);
+                        if !valid_current_end {
+                            tracing::debug!(
+                                position = authoritative.position,
+                                duration = authoritative.duration,
+                                "忽略旧播放代次的迟到 Ended 事件"
+                            );
+                            return;
+                        }
                         complete_server_play_session(
                             &server_play_session,
                             &server_play_completed,
@@ -694,6 +727,8 @@ impl AppState {
     pub fn note_source_change(&self, source: Option<&str>) {
         if let Some(snap) = self.snapshot.write().as_mut() {
             snap.current_source = source.map(String::from);
+            snap.position = 0.0;
+            snap.duration = 0.0;
             snap.is_finished = false;
         }
     }

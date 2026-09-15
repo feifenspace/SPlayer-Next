@@ -44,6 +44,16 @@ struct StagedNext {
 
 static STAGED_NEXT: Mutex<Option<StagedNext>> = Mutex::new(None);
 
+fn current_track_id(state: &AppState) -> Option<String> {
+    state
+        .now_playing
+        .lock()
+        .as_ref()
+        .and_then(|meta| meta.get("track_id"))
+        .and_then(|id| id.as_str())
+        .map(String::from)
+}
+
 /// 与队列更新保持相同锁顺序，避免较旧快照覆盖新队列。
 pub(crate) fn persist_queue(state: &AppState) {
     let guard = state.queue.lock();
@@ -84,6 +94,44 @@ static LAST_COMMITTED_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub(crate) fn invalidate() {
     PRELOAD_TOKEN.fetch_add(1, Ordering::AcqRel);
     *STAGED_NEXT.lock() = None;
+}
+
+/// 开始加载一首新曲时作废旧的自动接力候选。
+///
+/// 仅调用 `invalidate()` 还不够：跨采样率全量重连期间，旧的
+/// `pending_next` 仍可能被 watchdog 读取，旧的 `staged_meta` 也可能在迟到
+/// 的 boundary 中被当作新曲元数据使用。命中同源预载时保留对应 generation
+/// 的 staged_meta，供 handoff 正常完成；其它旧元数据全部清除。
+pub(crate) fn invalidate_for_load(state: &AppState, preserve_generation: Option<u64>) {
+    invalidate();
+    *state.pending_next.lock() = None;
+    let mut staged_meta = state.staged_meta.lock();
+    if let Some(generation) = preserve_generation {
+        if staged_meta
+            .as_ref()
+            .is_some_and(|(stored_generation, _)| *stored_generation != generation)
+        {
+            *staged_meta = None;
+        }
+    } else {
+        *staged_meta = None;
+    }
+}
+
+/// 队列重排/插入时使旧候选彻底失效。
+///
+/// 仅清理 Rust 侧的 STAGED_NEXT 不够：Diretta 引擎可能已经持有旧
+/// stage，迟到的 boundary 仍会把旧曲目推进到输出。因此队列变更必须
+/// 同时取消引擎 stage，并清除 relay/meta 槽位。
+pub(crate) fn invalidate_for_queue_update(state: &AppState) {
+    invalidate_for_load(state, None);
+    if let Some(handle) = state.player.lock().direct_stage_handle() {
+        handle.cancel();
+    }
+    let _ = state.ws_tx.send(json!({
+        "type": "nextCandidateChanged",
+        "data": null,
+    }));
 }
 
 /// v12-3 点播命中预载缓存：source 精确匹配则消费 STAGED_NEXT 并推进边界
@@ -130,7 +178,7 @@ pub(crate) fn schedule_next_preload(state: &AppState) {
         let Some(snapshot) = guard.as_mut() else {
             return; // 未注册队列：保持前端驱动旧链路
         };
-        snapshot.align_by_source(current_source.as_deref());
+        snapshot.align_by_identity(current_source.as_deref(), current_track_id(state).as_deref());
         let mut snapshot = snapshot.clone();
         let mut remaining = snapshot.items.len().saturating_sub(1);
         let mut candidate = snapshot.next();
@@ -253,7 +301,7 @@ fn commit_boundary_bookkeeping(
     {
         let mut guard = state.queue.lock();
         if let Some(snapshot) = guard.as_mut() {
-            snapshot.align_by_source(Some(source));
+            snapshot.align_by_identity(Some(source), current_track_id(state).as_deref());
         }
     }
 
@@ -276,7 +324,7 @@ pub(crate) async fn resolve_next_unresolved_candidate(
         let Some(snapshot) = guard.as_mut() else {
             return Ok(None);
         };
-        snapshot.align_by_source(current_source.as_deref());
+        snapshot.align_by_identity(current_source.as_deref(), current_track_id(state).as_deref());
         let mut snapshot = snapshot.clone();
         let mut remaining = snapshot.items.len().saturating_sub(1);
         let mut next = snapshot.next();
@@ -385,17 +433,47 @@ fn stage_next_worker(state: AppState, token: u64, generation: u64, entry_index: 
         "track_id": track_id,
     });
 
-    let outcome = stage_direct_core(
+    // 全量重连提交后，Diretta runtime 的句柄可能晚于 load 返回几十到几百毫秒
+    // 才重新可用。此时不能把 192k（或其它跨格式下一曲）直接判为不可预载，
+    // 否则候选只能依赖曲终 watchdog，容易在边界窗口丢失。
+    let mut outcome = stage_direct_core(
         &state,
         DirectStageInput {
             source: item.source.clone(),
             duration_secs,
             generation,
-            meta: Some(meta),
+            meta: Some(meta.clone()),
         },
         // 预载失效令牌：被新一轮调度/手动切歌取代时，在途物化下载即时中止
         || token != PRELOAD_TOKEN.load(Ordering::Acquire),
     );
+    if matches!(outcome, Ok(Some("Direct runtime inactive"))) {
+        for retry in 1..=30 {
+            if token != PRELOAD_TOKEN.load(Ordering::Acquire) {
+                return; // 预载已被取代：结果作废
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            outcome = stage_direct_core(
+                &state,
+                DirectStageInput {
+                    source: item.source.clone(),
+                    duration_secs,
+                    generation,
+                    meta: Some(meta.clone()),
+                },
+                || token != PRELOAD_TOKEN.load(Ordering::Acquire),
+            );
+            if !matches!(outcome, Ok(Some("Direct runtime inactive"))) {
+                break;
+            }
+            tracing::debug!(
+                source = %item.source,
+                generation,
+                retry,
+                "Diretta runtime 尚未 active，等待后重试下一曲预载"
+            );
+        }
+    }
 
     if token != PRELOAD_TOKEN.load(Ordering::Acquire) {
         return; // 预载已被取代：结果作废
@@ -486,6 +564,9 @@ pub(crate) async fn queue_snapshot_handler(
         })
         .collect::<Vec<_>>();
     let repeat = QueueRepeat::parse(payload.repeat.as_deref());
+    // 先取消旧的 Diretta stage，再替换队列。否则旧候选可能在新队列
+    // 已写入后仍触发 boundary，跳过刚插入的“下一曲播放”曲目。
+    invalidate_for_queue_update(&state);
     let snapshot = QueueSnapshot::new(
         items,
         payload.index.unwrap_or(0),
@@ -542,8 +623,7 @@ pub(crate) async fn get_queue_handler(State(state): State<AppState>) -> Json<Pla
 pub(crate) async fn queue_clear_handler(State(state): State<AppState>) -> Json<PlayerResponse> {
     *state.queue.lock() = None;
     persist_queue(&state);
-    invalidate();
-    *state.pending_next.lock() = None;
+    invalidate_for_queue_update(&state);
     Json(PlayerResponse::ok(json!({ "registered": false })))
 }
 

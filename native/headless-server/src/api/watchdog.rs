@@ -63,12 +63,18 @@ impl AdvanceBackoff {
 fn auto_advance_candidate(
     queue: Option<QueueSnapshot>,
     current_source: Option<&str>,
+    current_track_id: Option<&str>,
     legacy: Option<PendingNext>,
 ) -> Option<PendingNext> {
     match queue {
         Some(mut snapshot) => {
-            // 队列权威：注册后旧接力候选一律不参与（含队尾/repeat=one 的无候选）
-            snapshot.align_by_source(current_source);
+            // 队列权威：只有当前曲成功对齐到快照时才使用快照游标。
+            // 当前曲可能是队列外点播，或前端刚更新队列但 WS/HTTP 快照尚未
+            // 对齐；此时继续使用旧 pos 会把另一首曲目的下一曲误当成候选。
+            // 已登记的候选才是这类场景的可靠接力来源。
+            if !snapshot.align_by_identity(current_source, current_track_id) {
+                return legacy;
+            }
             // repeat=one：以既有接力重播当前曲（不做无缝预载）。此前返回 None
             // 会在浏览器离场时曲终停播（服务端自治缺口）——现在遥控器不在场
             // 也能正确单曲循环；浏览器在场时其 seek(0)+play 兜底先到先得，
@@ -252,7 +258,19 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                     let queue_snapshot = state.queue.lock().clone();
                     let legacy = state.pending_next.lock().take();
                     let current_source = state.player.lock().current_source().map(String::from);
-                    auto_advance_candidate(queue_snapshot, current_source.as_deref(), legacy)
+                    let current_track_id = state
+                        .now_playing
+                        .lock()
+                        .as_ref()
+                        .and_then(|meta| meta.get("track_id"))
+                        .and_then(|id| id.as_str())
+                        .map(String::from);
+                    auto_advance_candidate(
+                        queue_snapshot,
+                        current_source.as_deref(),
+                        current_track_id.as_deref(),
+                        legacy,
+                    )
                 } else {
                     // 用户已在曲终后手动接管（换曲/重播/暂停）：放弃自动接续
                     advance_backoff = None;
@@ -506,7 +524,17 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                     // 与曲终自动连播同源：队列注册时按队列权威推导（当前曲的下一曲）
                     let queue_snapshot = state.queue.lock().clone();
                     let legacy = state.pending_next.lock().take();
-                    auto_advance_candidate(queue_snapshot, Some(&source), legacy)
+                    auto_advance_candidate(
+                        queue_snapshot,
+                        Some(&source),
+                        state
+                            .now_playing
+                            .lock()
+                            .as_ref()
+                            .and_then(|meta| meta.get("track_id"))
+                            .and_then(|id| id.as_str()),
+                        legacy,
+                    )
                 } else {
                     None
                 };
@@ -559,7 +587,7 @@ mod tests {
     fn unresolved_online_track_waits_instead_of_skipping() {
         let mut queue = queue_of(&["/a", "", "https://example.test/later.flac"]);
         queue.items[1].track = Some(serde_json::json!({"id":"song", "source":"qqmusic"}));
-        assert!(auto_advance_candidate(Some(queue), Some("/a"), None).is_none());
+        assert!(auto_advance_candidate(Some(queue), Some("/a"), None, None).is_none());
     }
     use super::auto_advance_candidate;
     use crate::state::{PendingNext, QueueItem, QueueRepeat, QueueSnapshot};
@@ -597,6 +625,7 @@ mod tests {
         let got = auto_advance_candidate(
             Some(queue_of(&["/a", "/b", "/c"])),
             Some("/b"),
+            None,
             legacy("/stale"),
         );
         assert_eq!(got.unwrap().source, "/c");
@@ -605,7 +634,7 @@ mod tests {
     #[test]
     fn queue_end_with_repeat_off_yields_none_even_with_legacy() {
         let got =
-            auto_advance_candidate(Some(queue_of(&["/a", "/b"])), Some("/b"), legacy("/stale"));
+            auto_advance_candidate(Some(queue_of(&["/a", "/b"])), Some("/b"), None, legacy("/stale"));
         assert!(got.is_none());
     }
 
@@ -615,7 +644,7 @@ mod tests {
         // 在场时前端 seek(0)+play 先到先得，看门狗检测到状态离开曲终即放弃）
         let mut q = queue_of(&["/a", "/b"]);
         q.repeat = QueueRepeat::One;
-        let got = auto_advance_candidate(Some(q), Some("/a"), None);
+        let got = auto_advance_candidate(Some(q), Some("/a"), None, None);
         assert_eq!(got.unwrap().source, "/a");
     }
 
@@ -624,15 +653,15 @@ mod tests {
         // 切歌后按 source 对齐：当前曲是 /c 时（repeat=all）下一曲回卷到 /a
         let mut q = queue_of(&["/a", "/b", "/c"]);
         q.repeat = QueueRepeat::All;
-        let got = auto_advance_candidate(Some(q), Some("/c"), None);
+        let got = auto_advance_candidate(Some(q), Some("/c"), None, None);
         assert_eq!(got.unwrap().source, "/a");
     }
 
     #[test]
     fn no_queue_falls_back_to_legacy_candidate() {
-        let got = auto_advance_candidate(None, Some("/x"), legacy("/legacy-next"));
+        let got = auto_advance_candidate(None, Some("/x"), None, legacy("/legacy-next"));
         assert_eq!(got.unwrap().source, "/legacy-next");
-        assert!(auto_advance_candidate(None, None, None).is_none());
+        assert!(auto_advance_candidate(None, None, None, None).is_none());
     }
 
     #[test]
@@ -640,6 +669,7 @@ mod tests {
         let got = auto_advance_candidate(
             Some(queue_of(&["/a", "", "https://example.test/next.flac"])),
             Some("/a"),
+            None,
             None,
         );
         assert_eq!(got.unwrap().source, "https://example.test/next.flac");

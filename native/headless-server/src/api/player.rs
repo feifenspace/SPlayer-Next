@@ -292,6 +292,9 @@ pub(crate) async fn queue_next_candidate_handler(
             Err(e) => return Err(ApiError::internal(format!("cue:// 候选查库失败: {e}"))),
         }
     }
+    // 旧版前端只调用 next-candidate 时也必须取消已经 stage 的旧曲目，
+    // 否则旧 boundary 会抢先于新候选生效。
+    super::direct_preloader::invalidate_for_queue_update(&state);
     *state.pending_next.lock() = Some(crate::state::PendingNext {
         source: payload.source.clone(),
         duration_hint: payload.duration_hint,
@@ -564,6 +567,10 @@ pub(crate) async fn load_handler(
     // 命中则注册直通代数并保留引擎 staged（reserve 跳过 cancel），
     // handoff 排空窗口内直接接力预载候选，跳过并行开源
     let prestaged_generation = super::direct_preloader::take_staged_for_source(&state, &source);
+    // 自动接力和跨采样率全量重连期间，旧预载 worker 可能迟到完成。
+    // 先推进预载失效屏障并清空旧 relay/meta，避免 watchdog 在新曲加载窗口
+    // 重新取到上一队列的候选；命中同源预载时保留其 generation 元数据。
+    super::direct_preloader::invalidate_for_load(&state, prestaged_generation);
     audio_engine_core::player::register_prestaged_handoff(prestaged_generation);
     let reservation = reserve_player_for_load(
         &state,
