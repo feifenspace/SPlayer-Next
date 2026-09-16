@@ -44,6 +44,27 @@ struct StagedNext {
 
 static STAGED_NEXT: Mutex<Option<StagedNext>> = Mutex::new(None);
 
+#[derive(Debug, Clone)]
+struct ActivePreload {
+    token: u64,
+    source: String,
+}
+
+static ACTIVE_PRELOAD: Mutex<Option<ActivePreload>> = Mutex::new(None);
+
+struct ActivePreloadGuard {
+    token: u64,
+}
+
+impl Drop for ActivePreloadGuard {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_PRELOAD.lock();
+        if active.as_ref().is_some_and(|entry| entry.token == self.token) {
+            *active = None;
+        }
+    }
+}
+
 fn current_track_id(state: &AppState) -> Option<String> {
     state
         .now_playing
@@ -169,8 +190,6 @@ pub(crate) fn take_staged_for_source(state: &AppState, source: &str) -> Option<u
 /// 队列对齐 → 下一曲选取 → 专用线程上解析/物化/stage。
 /// 在 Direct load 提交成功与 boundary 自治提交后调用
 pub(crate) fn schedule_next_preload(state: &AppState) {
-    invalidate();
-
     // 队列对齐 + 下一曲选取（短锁内克隆，锁外使用）
     let current_source = state.player.lock().current_source().map(String::from);
     let (entry_index, item) = {
@@ -197,6 +216,9 @@ pub(crate) fn schedule_next_preload(state: &AppState) {
             candidate = snapshot.next();
         };
         let Some(item) = item else {
+            // 队列已到尾部时清理旧的 stage；否则旧候选可能在迟到
+            // boundary 中再次被消费。
+            invalidate();
             info!("无缝预载：队列无有效下一曲（repeat/队尾），跳过");
             return;
         };
@@ -204,13 +226,45 @@ pub(crate) fn schedule_next_preload(state: &AppState) {
     };
     persist_queue(state);
 
+    // schedule_next_preload 可能由“当前曲提交”“队列更新”和 watchdog
+    // 在很短时间内重复触发。相同候选已经就绪或正在物化时保持原任务，
+    // 避免旧任务尚未退出又启动第二个 stage，导致 generation 交错和
+    // 手动/自动切歌偶发回退。
+    if STAGED_NEXT
+        .lock()
+        .as_ref()
+        .is_some_and(|staged| staged.source == item.source)
+    {
+        debug!(source = %item.source, "无缝预载已就绪，跳过重复调度");
+        return;
+    }
+    if ACTIVE_PRELOAD
+        .lock()
+        .as_ref()
+        .is_some_and(|active| active.source == item.source)
+    {
+        debug!(source = %item.source, "无缝预载进行中，跳过重复调度");
+        return;
+    }
+
+    // 候选确实发生变化时才推进失效令牌；这会使之前的物化/解析
+    // 尽快退出，但不会重复清空同一首候选的 stage。
+    invalidate();
     let token = PRELOAD_TOKEN.fetch_add(1, Ordering::AcqRel) + 1;
     let generation = NEXT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    *ACTIVE_PRELOAD.lock() = Some(ActivePreload {
+        token,
+        source: item.source.clone(),
+    });
     let state_for_worker = state.clone();
     let spawn_result = std::thread::Builder::new()
         .name("direct-preload".into())
         .spawn(move || stage_next_worker(state_for_worker, token, generation, entry_index, item));
     if let Err(error) = spawn_result {
+        let mut active = ACTIVE_PRELOAD.lock();
+        if active.as_ref().is_some_and(|entry| entry.token == token) {
+            *active = None;
+        }
         warn!(error = %error, "无缝预载线程启动失败");
     }
 }
@@ -375,6 +429,9 @@ fn stage_next_worker(state: AppState, token: u64, generation: u64, entry_index: 
     if token != PRELOAD_TOKEN.load(Ordering::Acquire) {
         return;
     }
+    // 无论解析、物化、stage 还是取消从哪条路径返回，都释放活动槽，
+    // 使下一次真正变化的候选能够重新调度。
+    let _active_guard = ActivePreloadGuard { token };
     if super::queue_source_resolver::can_resolve(&item) {
         let runtime = match &*RESOLVER_RUNTIME {
             Ok(runtime) => runtime,
