@@ -212,6 +212,26 @@ export const installWebPolyfill = (): void => {
     },
     library: createSafeProxy("library", {
       getTracks: async () => playerClient.getLibraryTracks(),
+      getFolders: async () => playerClient.getLibraryFolders(),
+      getFolderTracksPage: async (path: string, limit?: number, offset?: number) =>
+        playerClient.getLibraryFolderTracksPage(path, limit, offset),
+      getTracksByIds: async (ids: string[]) => playerClient.getLibraryTracksByIds(ids),
+      getTracksPage: async (
+        limit?: number,
+        offset?: number,
+        query?: string,
+        options?: {
+          cursor?: string;
+          sort?: string;
+          order?: "asc" | "desc";
+          codec?: string;
+          sampleRate?: number;
+        },
+      ) => playerClient.getLibraryTracksPage(limit, offset, query, options),
+      getAlbumsPage: async (limit?: number, offset?: number, query?: string, cursor?: string) =>
+        playerClient.getLibraryAlbumsPage(limit, offset, query, cursor),
+      getArtistsPage: async (limit?: number, offset?: number, query?: string, cursor?: string) =>
+        playerClient.getLibraryArtistsPage(limit, offset, query, cursor),
       getScanDirs: async () => playerClient.getLibraryScanDirs(),
       addScanDir: async (dirPath?: string) => {
         if (!dirPath) return { success: false, error: "Path required" };
@@ -249,6 +269,7 @@ export const installWebPolyfill = (): void => {
       cancelScan: async () => playerClient.cancelLibraryScan(),
       onScanProgress: (callback: (event: any) => void) => playerClient.onScanProgress(callback),
       deleteTracks: async () => ({ success: true, data: { deleted: 0, failed: 0 } }),
+      clearLibrary: async () => playerClient.clearLibrary(),
     }),
     playlist: createWebPlaylistApi(playerClient),
     plugins: createSafeProxy("plugins", {

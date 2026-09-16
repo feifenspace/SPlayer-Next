@@ -129,12 +129,40 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::get(library_tracks_handler),
         )
         .route(
+            "/api/v1/library/folders",
+            axum::routing::get(library_folders_handler),
+        )
+        .route(
+            "/api/v1/library/folders/tracks",
+            axum::routing::get(library_folder_tracks_handler),
+        )
+        .route(
+            "/api/v1/library/tracks/page",
+            axum::routing::get(library_tracks_page_handler),
+        )
+        .route(
+            "/api/v1/library/tracks/by-ids",
+            axum::routing::post(library_tracks_by_ids_handler),
+        )
+        .route(
+            "/api/v1/library/clear",
+            axum::routing::post(library_clear_handler),
+        )
+        .route(
             "/api/v1/library/albums",
             axum::routing::get(library_albums_handler),
         )
         .route(
+            "/api/v1/library/albums/page",
+            axum::routing::get(library_albums_page_handler),
+        )
+        .route(
             "/api/v1/library/artists",
             axum::routing::get(library_artists_handler),
+        )
+        .route(
+            "/api/v1/library/artists/page",
+            axum::routing::get(library_artists_page_handler),
         )
         .route(
             "/api/v1/library/albums/{name}/tracks",

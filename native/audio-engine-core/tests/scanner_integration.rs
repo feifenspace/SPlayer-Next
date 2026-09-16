@@ -118,8 +118,10 @@ fn scan_cancelled_during_walk_phase_stops_early() {
 
     let _ = fs::remove_dir_all(&dir);
 
-    // 取消发生在文件收集阶段，直接返回且不发任何事件
-    assert!(sink.take_events().is_empty());
+    // 取消发生在文件收集阶段也必须发送 Done，服务端才能清理扫描状态。
+    let events = sink.take_events();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], ScanEvent::Done { .. }));
 }
 
 #[test]

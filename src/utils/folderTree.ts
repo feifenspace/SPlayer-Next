@@ -119,3 +119,35 @@ export const countFolders = (tree: readonly FolderNode[]): number => {
   walk(tree);
   return count;
 };
+
+/** 把服务端目录摘要组装成轻量目录树，不携带曲目数组。 */
+export const buildFolderSummaryTree = (
+  summaries: readonly { name: string; path: string; trackCount: number }[],
+): FolderNode[] => {
+  const byPath = new Map<string, FolderNode>();
+  for (const item of summaries) {
+    byPath.set(item.path, {
+      name: item.name,
+      path: item.path,
+      children: [],
+      tracks: [],
+      trackCount: item.trackCount,
+    });
+  }
+  const roots: FolderNode[] = [];
+  for (const node of byPath.values()) {
+    const normalized = node.path.replace(/\\/g, "/").replace(/\/$/, "");
+    const slash = normalized.lastIndexOf("/");
+    const parentPath = slash > 0 ? normalized.slice(0, slash) : "";
+    const parent = byPath.get(parentPath);
+    if (parent && parent !== node) parent.children.push(node);
+    else roots.push(node);
+  }
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+  const sort = (nodes: FolderNode[]): void => {
+    nodes.sort((a, b) => collator.compare(a.name, b.name));
+    for (const node of nodes) sort(node.children);
+  };
+  sort(roots);
+  return roots;
+};

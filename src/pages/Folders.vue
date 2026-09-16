@@ -2,13 +2,16 @@
 defineOptions({ name: "Folders" });
 
 import type { Track } from "@shared/types/player";
+import type { FolderSummary } from "@shared/types/library";
 import type { FolderNode } from "@/types/folder";
 import type { DropdownMenuItem } from "@/components/ui/SDropdownMenu.vue";
-import { useLibraryStore } from "@/stores/library";
 import { usePlaylistStore } from "@/stores/playlist";
 import { toast } from "@/composables/useToast";
 import SongList from "@/components/list/SongList.vue";
 import * as player from "@/core/player";
+import * as queue from "@/stores/queue";
+import { useStatusStore } from "@/stores/status";
+import { buildFolderSummaryTree } from "@/utils/folderTree";
 import IconLucideFolder from "~icons/lucide/folder";
 import IconLucideFolderOpen from "~icons/lucide/folder-open";
 import IconLucideMusic from "~icons/lucide/music";
@@ -20,11 +23,29 @@ import IconLucideEllipsis from "~icons/lucide/ellipsis";
 
 const { t } = useI18n();
 const router = useRouter();
-const libraryStore = useLibraryStore();
 const playlistStore = usePlaylistStore();
-const { tracks, initialized, folderTree, folderCount } = storeToRefs(libraryStore);
-
-const trackCount = computed(() => tracks.value.filter((tr) => !!tr.path).length);
+const folderTree = ref<FolderNode[]>([]);
+const folderCount = computed(() => {
+  let count = 0;
+  const walk = (nodes: FolderNode[]): void => {
+    for (const node of nodes) {
+      count++;
+      walk(node.children);
+    }
+  };
+  walk(folderTree.value);
+  return count;
+});
+const trackCount = computed(() =>
+  folderTree.value.reduce((sum, node) => sum + (node.trackCount ?? 0), 0),
+);
+const selectedTracks = shallowRef<Track[]>([]);
+const selectedTotal = ref(0);
+const selectedHasMore = ref(false);
+const selectedLoading = ref(false);
+const selectedOffset = ref(0);
+const FOLDER_PAGE_SIZE = 200;
+let folderRequestId = 0;
 
 const expanded = ref<string[]>([]);
 const selectedFolder = shallowRef<FolderNode | null>(null);
@@ -59,45 +80,105 @@ const findFolder = (nodes: FolderNode[], path: string): FolderNode | null => {
   return null;
 };
 
+const loadFolderTracks = async (reset = true): Promise<void> => {
+  const folder = selectedFolder.value;
+  const api = window.api.library.getFolderTracksPage;
+  if (!folder || !api) return;
+  const requestId = ++folderRequestId;
+  if (reset) {
+    selectedOffset.value = 0;
+    selectedTracks.value = [];
+    selectedHasMore.value = false;
+  }
+  selectedLoading.value = true;
+  try {
+    const res = await api(folder.path, FOLDER_PAGE_SIZE, selectedOffset.value);
+    if (requestId !== folderRequestId || !res.success || !res.data) return;
+    selectedTotal.value = res.data.total;
+    selectedOffset.value += res.data.items.length;
+    selectedHasMore.value = res.data.hasMore;
+    selectedTracks.value = reset ? res.data.items : [...selectedTracks.value, ...res.data.items];
+  } finally {
+    if (requestId === folderRequestId) selectedLoading.value = false;
+  }
+};
+
+const loadMoreFolderTracks = (): void => {
+  if (!selectedLoading.value && selectedHasMore.value) void loadFolderTracks(false);
+};
+
 watch(
-  [folderTree, initialized],
-  ([current, init]) => {
-    if (current.length === 0) {
-      selectedFolder.value = null;
-      defaultsApplied = false;
-      return;
-    }
-    if (!defaultsApplied && init) {
-      expanded.value = current.map((root) => root.path);
-      selectedFolder.value = current[0];
-      defaultsApplied = true;
-      return;
-    }
-    /** 树结构变了，按 path 重新定位选中项 */
-    if (selectedFolder.value) {
-      const same = findFolder(current, selectedFolder.value.path);
-      if (!same) selectedFolder.value = current[0];
-      else if (same !== selectedFolder.value) selectedFolder.value = same;
-    } else if (init) {
-      selectedFolder.value = current[0];
-    }
-  },
-  { immediate: true },
+  () => selectedFolder.value?.path,
+  () => void loadFolderTracks(true),
 );
 
-const selectedTracks = computed<Track[]>(() => {
-  const folder = selectedFolder.value;
-  return folder ? toRaw(folder.tracks) : [];
-});
+const loadFolders = async (): Promise<void> => {
+  const api = window.api.library.getFolders;
+  if (!api) return;
+  const res = await api();
+  if (!res.success || !res.data) return;
+  folderTree.value = buildFolderSummaryTree(res.data as FolderSummary[]);
+  if (!defaultsApplied && folderTree.value.length > 0) {
+    expanded.value = folderTree.value.map((root) => root.path);
+    selectedFolder.value = folderTree.value[0];
+    defaultsApplied = true;
+  } else if (selectedFolder.value) {
+    selectedFolder.value =
+      findFolder(folderTree.value, selectedFolder.value.path) ?? folderTree.value[0] ?? null;
+  }
+};
 
-const handlePlayAll = (): void => {
+const loadAllSelectedTracks = async (): Promise<Track[]> => {
+  const folder = selectedFolder.value;
+  const api = window.api.library.getFolderTracksPage;
+  if (!folder || !api) return [...selectedTracks.value];
+  let offset = selectedTracks.value.length;
+  let all = [...selectedTracks.value];
+  while (selectedHasMore.value) {
+    const res = await api(folder.path, FOLDER_PAGE_SIZE, offset);
+    if (!res.success || !res.data || res.data.items.length === 0) break;
+    all = [...all, ...res.data.items];
+    offset += res.data.items.length;
+    selectedHasMore.value = res.data.hasMore;
+  }
+  selectedTracks.value = all;
+  selectedTotal.value = all.length;
+  return all;
+};
+
+const handlePlayAll = async (): Promise<void> => {
   if (selectedTracks.value.length === 0) return;
+  const folder = selectedFolder.value;
+  const api = window.api.library.getFolderTracksPage;
+  if (!folder || !api) {
+    player.playFrom(selectedTracks.value, 0);
+    return;
+  }
+  let cursorOffset = selectedTracks.value.length;
+  if (useStatusStore().shuffleMode === "on") {
+    const all = await loadAllSelectedTracks();
+    player.playFrom(all, 0);
+    return;
+  }
   player.playFrom(selectedTracks.value, 0);
+  player.setLazyQueueLoader(async () => {
+    if (!selectedHasMore.value) return false;
+    const res = await api(folder.path, FOLDER_PAGE_SIZE, cursorOffset);
+    if (!res.success || !res.data || res.data.items.length === 0) {
+      selectedHasMore.value = false;
+      return false;
+    }
+    cursorOffset += res.data.items.length;
+    selectedHasMore.value = res.data.hasMore;
+    queue.appendToQueue(res.data.items);
+    return true;
+  });
 };
 
 /** 文件夹创建为本地歌单 */
 const handleCreated = async (playlistId: string): Promise<void> => {
-  const count = await playlistStore.addTracks(playlistId, selectedTracks.value);
+  const tracks = await loadAllSelectedTracks();
+  const count = await playlistStore.addTracks(playlistId, tracks);
   toast.success(t("collection.tracksAdded", { count }));
 };
 
@@ -105,8 +186,8 @@ const getKey = (node: FolderNode): string => node.path;
 const getChildren = (node: FolderNode): FolderNode[] | undefined =>
   node.children.length > 0 ? node.children : undefined;
 
-onMounted(async () => {
-  if (!initialized.value) await libraryStore.load();
+onMounted(() => {
+  void loadFolders();
 });
 </script>
 
@@ -156,7 +237,7 @@ onMounted(async () => {
             />
             <span class="flex-1 min-w-0 truncate text-sm">{{ node.name }}</span>
             <span class="shrink-0 text-xs text-on-surface-variant/50 tabular-nums">
-              {{ node.tracks.length }}
+              {{ node.trackCount ?? node.tracks.length }}
             </span>
           </template>
         </STree>
@@ -169,7 +250,9 @@ onMounted(async () => {
           :items="selectedTracks"
           show-album
           show-duration
-          enable-sort
+          :has-more="selectedHasMore"
+          :loading-more="selectedLoading"
+          @reach-bottom="loadMoreFolderTracks"
         >
           <template #topInfo>
             <div
@@ -208,7 +291,7 @@ onMounted(async () => {
               </div>
               <span class="shrink-0 flex items-center gap-1 text-xs text-on-surface-variant/60">
                 <IconLucideMusic class="size-3.5" />
-                {{ t("common.totalSongs", { count: selectedTracks.length }) }}
+                {{ t("common.totalSongs", { count: selectedTotal }) }}
               </span>
             </div>
           </template>

@@ -19,6 +19,8 @@ export const useLibraryStore = defineStore("library", () => {
   const scanning = ref(false);
   /** 扫描进度 */
   const scanProgress = ref<ScanProgress | null>(null);
+  /** 最近一次扫描统计，扫描结束后保留，便于确认增量扫描结果 */
+  const lastScanStats = ref<ScanProgress | null>(null);
   /** 是否已初始化 */
   const initialized = ref(false);
   /** 歌手头像缓存 */
@@ -81,11 +83,10 @@ export const useLibraryStore = defineStore("library", () => {
   };
 
   /** 批量预取头像 */
-  const loadArtistAvatars = async (): Promise<void> => {
-    const list = await getArtistList();
-    const names = list
-      .filter((item) => !artistAvatars.value[normalizeArtistName(item.name)])
-      .map((item) => item.name);
+  const loadArtistAvatars = async (artistNames?: string[]): Promise<void> => {
+    const names = (artistNames ?? (await getArtistList()).map((item) => item.name)).filter(
+      (name) => !artistAvatars.value[normalizeArtistName(name)],
+    );
     if (!names.length) return;
     const res = await window.api.library.prefetchArtistAvatars(names);
     if (!res.success || !res.data) return;
@@ -104,10 +105,10 @@ export const useLibraryStore = defineStore("library", () => {
   };
 
   /** 加载曲目和目录列表 */
-  const load = async (): Promise<void> => {
+  const load = async (includeTracks = false): Promise<void> => {
     // 先从 IndexedDB 读缓存，立即渲染
     const [cached, likedCached] = await Promise.all([
-      trackDb.getItem<Track[]>("tracks").catch(() => null),
+      includeTracks ? trackDb.getItem<Track[]>("tracks").catch(() => null) : Promise.resolve(null),
       trackDb.getItem<string[]>(LIKED_IDS_KEY).catch(() => null),
     ]);
     if (cached?.length) tracks.value = cached;
@@ -117,10 +118,12 @@ export const useLibraryStore = defineStore("library", () => {
     }
     // 拿最新数据并回写缓存
     const [tracksRes, dirsRes] = await Promise.all([
-      window.api.library.getTracks(),
+      includeTracks
+        ? window.api.library.getTracks()
+        : Promise.resolve({ success: true, data: undefined }),
       window.api.library.getScanDirs(),
     ]);
-    if (tracksRes.success && tracksRes.data) {
+    if (includeTracks && tracksRes.success && tracksRes.data) {
       tracks.value = tracksRes.data;
       cacheTracks(tracksRes.data);
     }
@@ -130,7 +133,9 @@ export const useLibraryStore = defineStore("library", () => {
     try {
       const scanStatus = await window.api.library.isScanning();
       if (scanStatus.success && scanStatus.data) {
-        const isCurrentlyScanning = Boolean((scanStatus.data as any).is_scanning ?? scanStatus.data);
+        const isCurrentlyScanning = Boolean(
+          (scanStatus.data as any).is_scanning ?? scanStatus.data,
+        );
         scanning.value = isCurrentlyScanning;
         if (!isCurrentlyScanning) scanProgress.value = null;
       } else {
@@ -142,7 +147,6 @@ export const useLibraryStore = defineStore("library", () => {
       scanProgress.value = null;
     }
     // 预取歌手头像
-    loadArtistAvatars();
   };
 
   /** 开始扫描 */
@@ -195,7 +199,7 @@ export const useLibraryStore = defineStore("library", () => {
   };
 
   /** 移除扫描目录 */
-  const removeScanDir = async (dir: string): Promise<void> => {
+  const removeScanDir = async (dir: string, refreshTracks = false): Promise<void> => {
     await window.api.library.removeScanDir(dir);
     scanDirs.value = scanDirs.value.filter((d) => d !== dir);
     // 移除目录取消正在进行的扫描
@@ -203,40 +207,60 @@ export const useLibraryStore = defineStore("library", () => {
       scanning.value = false;
       scanProgress.value = null;
     }
-    const res = await window.api.library.getTracks();
-    if (res.success && res.data) {
-      tracks.value = res.data;
-      cacheTracks(res.data);
-      loadArtistAvatars();
+    if (refreshTracks) {
+      const res = await window.api.library.getTracks();
+      if (res.success && res.data) {
+        tracks.value = res.data;
+        cacheTracks(res.data);
+        loadArtistAvatars();
+      }
     }
   };
 
   let unsubscribe: (() => void) | null = null;
 
   /** 监听扫描进度 */
-  const subscribeScanProgress = (): void => {
+  const subscribeScanProgress = (
+    options: { refreshTracks?: boolean; onDone?: () => void } = {},
+  ): void => {
     unsubscribe?.();
     unsubscribe = window.api.library.onScanProgress((raw: any) => {
       if (!raw) return;
-      const phase = raw.phase || (raw.type === "done" ? "done" : raw.type === "error" ? "error" : "scanning");
+      const phase =
+        raw.phase || (raw.type === "done" ? "done" : raw.type === "error" ? "error" : "scanning");
       const normalized: ScanProgress = {
         phase,
         scanned: raw.scanned ?? 0,
         total: raw.total ?? 0,
         current: raw.current,
+        succeeded: raw.succeeded,
+        failed: raw.failed,
+        removed: raw.removed,
+        cue_files: raw.cue_files,
+        iso_files: raw.iso_files,
         error: raw.error,
       };
       scanProgress.value = normalized;
+      if (
+        normalized.succeeded !== undefined ||
+        normalized.failed !== undefined ||
+        normalized.removed !== undefined
+      ) {
+        lastScanStats.value = normalized;
+      }
       if (phase === "done") {
         scanning.value = false;
         scanProgress.value = null;
-        window.api.library.getTracks().then((res) => {
-          if (res.success && res.data) {
-            tracks.value = res.data;
-            cacheTracks(res.data);
-            loadArtistAvatars();
-          }
-        });
+        if (options.refreshTracks === true) {
+          window.api.library.getTracks().then((res) => {
+            if (res.success && res.data) {
+              tracks.value = res.data;
+              cacheTracks(res.data);
+              loadArtistAvatars();
+            }
+          });
+        }
+        options.onDone?.();
       } else if (phase === "error") {
         scanning.value = false;
         scanProgress.value = null;
@@ -370,6 +394,7 @@ export const useLibraryStore = defineStore("library", () => {
     scanDirs,
     scanning,
     scanProgress,
+    lastScanStats,
     initialized,
     artistAvatars,
     likedOrderedIds,

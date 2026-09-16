@@ -196,6 +196,16 @@ pub fn init_db(db_path: &Path) -> Result<Connection> {
             PRIMARY KEY (playlist_id, track_id)
         );
         CREATE INDEX IF NOT EXISTS idx_playlist_tracks_pos ON playlist_tracks(playlist_id, position);
+        CREATE INDEX IF NOT EXISTS idx_playlist_tracks_track ON playlist_tracks(track_id);
+        CREATE INDEX IF NOT EXISTS idx_tracks_title_sort ON tracks(title, id);
+        CREATE INDEX IF NOT EXISTS idx_tracks_artist_sort ON tracks(artist, title, id);
+        CREATE INDEX IF NOT EXISTS idx_tracks_album_sort ON tracks(album, title, id);
+        CREATE INDEX IF NOT EXISTS idx_tracks_sample_rate ON tracks(sample_rate);
+        CREATE INDEX IF NOT EXISTS idx_tracks_codec ON tracks(codec);
+        CREATE INDEX IF NOT EXISTS idx_tracks_album ON tracks(album);
+        CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist);
+        CREATE INDEX IF NOT EXISTS idx_tracks_cue_path ON tracks(cue_path);
+        CREATE INDEX IF NOT EXISTS idx_tracks_cue_audio_path ON tracks(cue_audio_path);
 
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -339,7 +349,15 @@ pub fn remove_scan_dir(conn: &Connection, path: &str) -> Result<()> {
         .replace('_', "\\_");
     let pattern = format!("{escaped}%");
     conn.execute(
-        "DELETE FROM tracks WHERE path LIKE ?1 ESCAPE '\\' OR path = ?2",
+        "DELETE FROM playlist_tracks WHERE track_id IN (
+             SELECT id FROM tracks
+             WHERE path LIKE ?1 ESCAPE '\\' OR path = ?2 OR cue_path LIKE ?1 ESCAPE '\\'
+         )",
+        params![pattern, path],
+    )?;
+    conn.execute(
+        "DELETE FROM tracks
+         WHERE path LIKE ?1 ESCAPE '\\' OR path = ?2 OR cue_path LIKE ?1 ESCAPE '\\'",
         params![pattern, path],
     )?;
     Ok(())
@@ -347,7 +365,12 @@ pub fn remove_scan_dir(conn: &Connection, path: &str) -> Result<()> {
 
 /// 获取增量对比所需的已有文件记录
 pub fn get_file_records(conn: &Connection) -> Result<Vec<FileRecord>> {
-    let mut stmt = conn.prepare("SELECT path, file_mtime, file_size, cover FROM tracks")?;
+    let mut stmt = conn.prepare(
+        "SELECT path, file_mtime, file_size, cover FROM tracks
+         WHERE cue_path IS NULL
+           AND path NOT LIKE 'cue://%'
+           AND path NOT LIKE '%.iso|%'",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok(FileRecord {
             path: row.get(0)?,
@@ -359,6 +382,31 @@ pub fn get_file_records(conn: &Connection) -> Result<Vec<FileRecord>> {
 
     let mut records = Vec::new();
     for row in rows {
+        records.push(row?);
+    }
+
+    // CUE/ISO 是容器源文件，虚拟分轨记录中的 mtime 代表容器本身。
+    // 把源文件加入增量索引，避免每次扫描都重新解析整张 CUE/ISO。
+    let mut container_stmt = conn.prepare(
+        "SELECT cue_path, MAX(file_mtime), 0, NULL
+         FROM tracks
+         WHERE cue_path IS NOT NULL
+         GROUP BY cue_path
+         UNION
+         SELECT substr(path, 1, instr(path, '|') - 1), MAX(file_mtime), 0, NULL
+         FROM tracks
+         WHERE path LIKE '%.iso|%'
+         GROUP BY substr(path, 1, instr(path, '|') - 1)",
+    )?;
+    let container_rows = container_stmt.query_map([], |row| {
+        Ok(FileRecord {
+            path: row.get(0)?,
+            mtime: row.get::<_, Option<u64>>(1)?.unwrap_or(0),
+            size: 0,
+            cover_path: None,
+        })
+    })?;
+    for row in container_rows {
         records.push(row?);
     }
     Ok(records)
@@ -454,16 +502,46 @@ pub fn upsert_scanned_tracks(conn: &mut Connection, tracks: &[ScannedTrack]) -> 
 }
 
 /// 删除指定路径列表的曲目
+pub fn clear_library_tracks(conn: &mut Connection) -> Result<u64> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM playlist_tracks", [])?;
+    let deleted = tx.execute("DELETE FROM tracks", [])? as u64;
+    tx.execute(
+        "DELETE FROM settings WHERE key IN ('library.folder_index_cache', 'library.scan_checkpoint')",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(deleted)
+}
+
 pub fn delete_tracks_by_paths(conn: &mut Connection, paths: &[String]) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
     let tx = conn.transaction()?;
     {
-        let mut stmt = tx.prepare_cached("DELETE FROM tracks WHERE path = ?1")?;
+        let mut links = tx.prepare_cached(
+            "DELETE FROM playlist_tracks
+             WHERE track_id IN (
+                 SELECT id FROM tracks
+                 WHERE path = ?1 OR cue_path = ?1 OR path LIKE ?2
+             )",
+        )?;
+        let mut tracks_stmt = tx.prepare_cached(
+            "DELETE FROM tracks
+             WHERE path = ?1 OR cue_path = ?1 OR path LIKE ?2",
+        )?;
         for p in paths {
-            stmt.execute(params![p])?;
+            let iso_pattern = format!("{p}|%");
+            links.execute(params![p, iso_pattern])?;
+            tracks_stmt.execute(params![p, iso_pattern])?;
         }
+        tx.execute(
+            "DELETE FROM playlist_tracks
+             WHERE track_id NOT IN (SELECT id FROM tracks)
+                OR playlist_id NOT IN (SELECT id FROM playlists)",
+            [],
+        )?;
     }
     tx.commit()?;
     Ok(())
@@ -567,6 +645,11 @@ pub fn sync_cue_tracks(
                 }
             };
 
+            // 只有在 CUE 成功解析后才删除旧分轨，避免临时解析失败导致媒体库丢失旧数据。
+            // 保留 playlist_tracks 关系：相同虚拟曲目 id 重新写入后仍应留在用户歌单中；
+            // 已被 CUE 删除的曲目关系在本事务结束前统一清理。
+            tx.execute("DELETE FROM tracks WHERE cue_path = ?1", params![cue_file])?;
+
             let (cue_mtime, cue_ctime) = audio_engine_core::scanner::file_stat(cue_path_obj)
                 .map(|(m, c, _)| (m, c))
                 .unwrap_or((now, now));
@@ -583,6 +666,14 @@ pub fn sync_cue_tracks(
 
             for cue_track in &cue_sheet.tracks {
                 let physical_str = cue_track.physical_path.to_string_lossy().to_string();
+                if !Path::new(&physical_str).is_file() {
+                    tracing::warn!(
+                        cue = %cue_file,
+                        audio = %physical_str,
+                        "跳过引用缺失音频的 CUE 分轨"
+                    );
+                    continue;
+                }
 
                 // 查库获取母版音频参数
                 let parent_meta: Option<(u64, Option<String>, Option<String>, Option<u32>, Option<i64>, Option<u32>, Option<u32>, u64)> = tx
@@ -682,7 +773,7 @@ pub fn sync_cue_tracks(
                             .map(String::from)
                     });
 
-                let _ = insert_stmt.execute(params![
+                insert_stmt.execute(params![
                     id,
                     track_virtual_path,
                     title,
@@ -704,12 +795,18 @@ pub fn sync_cue_tracks(
                     Some(physical_str),
                     Some(cue_start_ms),
                     Some(cue_end_ms),
-                ]);
+                ])?;
 
                 total_synced += 1;
             }
         }
     }
+    tx.execute(
+        "DELETE FROM playlist_tracks
+         WHERE track_id NOT IN (SELECT id FROM tracks)
+            OR playlist_id NOT IN (SELECT id FROM playlists)",
+        [],
+    )?;
     tx.commit()?;
     tracing::info!("成功同步 CUE 分轨数: {}", total_synced);
     Ok(total_synced)
@@ -861,6 +958,412 @@ pub fn get_all_tracks(conn: &Connection) -> Result<Vec<DbTrack>> {
         list.push(row?);
     }
     Ok(list)
+}
+
+/// 分页查询媒体库曲目。旧 get_all_tracks 保留给兼容接口，
+/// 新调用方应使用此方法，避免一次性把大曲库加载进内存。
+pub fn get_tracks_page(
+    conn: &Connection,
+    query: Option<&str>,
+    limit: u32,
+    offset: u64,
+) -> Result<(Vec<DbTrack>, u64)> {
+    let q = query.unwrap_or("").trim();
+    let total: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM tracks
+         WHERE path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+           AND (?1 = '' OR title LIKE '%' || ?1 || '%'
+                OR artist LIKE '%' || ?1 || '%'
+                OR album LIKE '%' || ?1 || '%')",
+        params![q],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT
+            id, path, title, track, artist, album, duration,
+            cover, codec, sample_rate, bit_rate, channels,
+            bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+            cue_path, cue_audio_path, cue_start_ms, cue_end_ms
+         FROM tracks
+         WHERE path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+           AND (?1 = '' OR title LIKE '%' || ?1 || '%'
+                OR artist LIKE '%' || ?1 || '%'
+                OR album LIKE '%' || ?1 || '%')
+         ORDER BY album ASC, CAST(track AS INTEGER) ASC, cue_start_ms ASC, path ASC, id ASC
+         LIMIT ?2 OFFSET ?3",
+    )?;
+    let rows = stmt.query_map(params![q, limit, offset], row_to_track)?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row?);
+    }
+    Ok((items, total))
+}
+
+
+/// 带筛选、排序和可选 id cursor 的曲目分页查询。
+pub fn get_tracks_page_advanced(
+    conn: &Connection,
+    query: Option<&str>,
+    codec: Option<&str>,
+    sample_rate: Option<u32>,
+    limit: u32,
+    offset: u64,
+    sort: Option<&str>,
+    order: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<(Vec<DbTrack>, u64, Option<String>)> {
+    #[derive(Serialize, Deserialize)]
+    struct TrackPageCursor {
+        key: String,
+        id: String,
+    }
+
+    let q = query.unwrap_or("").trim();
+    let codec = codec.unwrap_or("").trim();
+    let sort_column = match sort.unwrap_or("album") {
+        "id" => "id",
+        "title" => "title",
+        "artist" => "artist",
+        "album" => "album",
+        "codec" => "codec",
+        "sampleRate" | "sample_rate" => "sample_rate",
+        _ => "album",
+    };
+    let descending = matches!(order.unwrap_or("asc"), "desc" | "DESC");
+    let direction = if descending { "DESC" } else { "ASC" };
+    let comparison = if descending { "<" } else { ">" };
+
+    let decoded_cursor = cursor
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| -> Result<TrackPageCursor> {
+            let decoded = urlencoding::decode(value)
+                .map_err(|error| anyhow::anyhow!("invalid track cursor: {error}"))?;
+            Ok(serde_json::from_str(decoded.as_ref())?)
+        })
+        .transpose()?;
+
+    let base_where = "path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+         AND (?1 = '' OR title LIKE '%' || ?1 || '%' OR artist LIKE '%' || ?1 || '%' OR album LIKE '%' || ?1 || '%')
+         AND (?2 = '' OR codec = ?2)
+         AND (?3 IS NULL OR sample_rate = ?3)";
+    let total: u64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM tracks WHERE {base_where}"),
+        params![q, codec, sample_rate],
+        |row| row.get(0),
+    )?;
+
+    let order_sql = if sort_column == "sample_rate" {
+        format!("COALESCE(sample_rate, 0) {direction}, id {direction}")
+    } else {
+        format!("COALESCE({sort_column}, '') {direction}, id {direction}")
+    };
+
+    let fetch_limit = limit.saturating_add(1);
+    let mut items = Vec::new();
+    if let Some(ref page_cursor) = decoded_cursor {
+        let cursor_condition = if sort_column == "sample_rate" {
+            format!(
+                " AND (COALESCE(sample_rate, 0) {comparison} ?4
+                   OR (COALESCE(sample_rate, 0) = ?4 AND id {comparison} ?5))"
+            )
+        } else {
+            format!(
+                " AND (COALESCE({sort_column}, '') {comparison} ?4
+                   OR (COALESCE({sort_column}, '') = ?4 AND id {comparison} ?5))"
+            )
+        };
+        let sql = format!(
+            "SELECT id, path, title, track, artist, album, duration,
+                    cover, codec, sample_rate, bit_rate, channels,
+                    bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+                    cue_path, cue_audio_path, cue_start_ms, cue_end_ms
+             FROM tracks
+             WHERE {base_where}{cursor_condition}
+             ORDER BY {order_sql}
+             LIMIT ?6 OFFSET ?7"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = if sort_column == "sample_rate" {
+            let key = page_cursor.key.parse::<i64>().unwrap_or(0);
+            stmt.query_map(
+                params![q, codec, sample_rate, key, page_cursor.id, fetch_limit, offset],
+                row_to_track,
+            )?
+        } else {
+            stmt.query_map(
+                params![q, codec, sample_rate, page_cursor.key, page_cursor.id, fetch_limit, offset],
+                row_to_track,
+            )?
+        };
+        for row in rows {
+            items.push(row?);
+        }
+    } else {
+        let sql = format!(
+            "SELECT id, path, title, track, artist, album, duration,
+                    cover, codec, sample_rate, bit_rate, channels,
+                    bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+                    cue_path, cue_audio_path, cue_start_ms, cue_end_ms
+             FROM tracks
+             WHERE {base_where}
+             ORDER BY {order_sql}
+             LIMIT ?4 OFFSET ?5"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![q, codec, sample_rate, fetch_limit, offset], row_to_track)?;
+        for row in rows {
+            items.push(row?);
+        }
+    }
+
+    let has_more = items.len() as u32 > limit;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        items.last().map(|item| {
+            let key = match sort_column {
+                "sample_rate" => item.sample_rate.unwrap_or(0).to_string(),
+                "title" => item.title.clone(),
+                "artist" => item.artist.clone().unwrap_or_default(),
+                "album" => item.album.as_ref().map(|album| album.name.clone()).unwrap_or_default(),
+                "codec" => item.codec.clone().unwrap_or_default(),
+                _ => item.id.clone(),
+            };
+            let payload = TrackPageCursor {
+                key,
+                id: item.id.clone(),
+            };
+            urlencoding::encode(&serde_json::to_string(&payload).unwrap_or_default()).into_owned()
+        })
+    } else {
+        None
+    };
+    Ok((items, total, next_cursor))
+}
+
+/// 使用名称游标分页获取专辑，避免大 offset 扫描。
+pub fn get_album_page_cursor(
+    conn: &Connection, query: Option<&str>, limit: u32, cursor: Option<&str>,
+) -> Result<(Vec<AlbumSummary>, u64, Option<String>)> {
+    let q = query.unwrap_or("").trim();
+    let base = "album IS NOT NULL AND TRIM(album) != '' AND path NOT IN
+        (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+        AND (?1 = '' OR album LIKE '%' || ?1 || '%')";
+    let total: u64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM (SELECT album FROM tracks WHERE {base} GROUP BY album)"),
+        params![q], |row| row.get(0))?;
+    let condition = if cursor.is_some() { " AND album > ?2" } else { "" };
+    let limit_param = if cursor.is_some() { "?3" } else { "?2" };
+    let sql = format!("SELECT album, MAX(cover), MAX(artist), COUNT(*) FROM tracks WHERE {base}{condition} GROUP BY album ORDER BY album ASC LIMIT {limit_param}");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut items = Vec::new();
+    if let Some(c) = cursor {
+        let rows = stmt.query_map(params![q, c, limit], |row| Ok(AlbumSummary {
+            name: row.get(0)?, cover: normalize_cover_url(row.get(1)?), artist: row.get(2)?, track_count: row.get(3)?,
+        }))?;
+        for row in rows { items.push(row?); }
+    } else {
+        let rows = stmt.query_map(params![q, limit], |row| Ok(AlbumSummary {
+            name: row.get(0)?, cover: normalize_cover_url(row.get(1)?), artist: row.get(2)?, track_count: row.get(3)?,
+        }))?;
+        for row in rows { items.push(row?); }
+    }
+    let has_more = items.len() as u32 > limit; if has_more { items.truncate(limit as usize); }
+    let next = if has_more { items.last().map(|v| v.name.clone()) } else { None };
+    Ok((items, total, next))
+}
+
+/// 使用名称游标分页获取歌手，避免大 offset 扫描。
+pub fn get_artist_page_cursor(
+    conn: &Connection, query: Option<&str>, limit: u32, cursor: Option<&str>,
+) -> Result<(Vec<ArtistSummary>, u64, Option<String>)> {
+    let q = query.unwrap_or("").trim();
+    let base = "artist IS NOT NULL AND TRIM(artist) != '' AND path NOT IN
+        (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+        AND (?1 = '' OR artist LIKE '%' || ?1 || '%')";
+    let total: u64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM (SELECT artist FROM tracks WHERE {base} GROUP BY artist)"),
+        params![q], |row| row.get(0))?;
+    let condition = if cursor.is_some() { " AND artist > ?2" } else { "" };
+    let limit_param = if cursor.is_some() { "?3" } else { "?2" };
+    let sql = format!("SELECT artist, COUNT(*) FROM tracks WHERE {base}{condition} GROUP BY artist ORDER BY artist ASC LIMIT {limit_param}");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut items = Vec::new();
+    if let Some(c) = cursor {
+        let rows = stmt.query_map(params![q, c, limit], |row| Ok(ArtistSummary {
+            name: row.get(0)?, track_count: row.get(1)?,
+        }))?;
+        for row in rows { items.push(row?); }
+    } else {
+        let rows = stmt.query_map(params![q, limit], |row| Ok(ArtistSummary {
+            name: row.get(0)?, track_count: row.get(1)?,
+        }))?;
+        for row in rows { items.push(row?); }
+    }
+    let has_more = items.len() as u32 > limit; if has_more { items.truncate(limit as usize); }
+    let next = if has_more { items.last().map(|v| v.name.clone()) } else { None };
+    Ok((items, total, next))
+}
+
+/// 分页获取专辑聚合。
+pub fn get_album_page(
+    conn: &Connection,
+    query: Option<&str>,
+    limit: u32,
+    offset: u64,
+) -> Result<(Vec<AlbumSummary>, u64)> {
+    let q = query.unwrap_or("").trim();
+    let where_sql = "album IS NOT NULL AND TRIM(album) != '' AND path NOT IN
+        (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+        AND (?1 = '' OR album LIKE '%' || ?1 || '%')";
+    let total: u64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM (SELECT album FROM tracks WHERE {} GROUP BY album)", where_sql),
+        params![q],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT album, MAX(cover), MAX(artist), COUNT(*)
+         FROM tracks WHERE {} GROUP BY album ORDER BY album ASC LIMIT ?2 OFFSET ?3",
+        where_sql
+    ))?;
+    let rows = stmt.query_map(params![q, limit, offset], |row| {
+        Ok(AlbumSummary {
+            name: row.get(0)?,
+            cover: normalize_cover_url(row.get(1)?),
+            artist: row.get(2)?,
+            track_count: row.get(3)?,
+        })
+    })?;
+    let mut items = Vec::new();
+    for row in rows { items.push(row?); }
+    Ok((items, total))
+}
+
+/// 分页获取歌手聚合。
+pub fn get_artist_page(
+    conn: &Connection,
+    query: Option<&str>,
+    limit: u32,
+    offset: u64,
+) -> Result<(Vec<ArtistSummary>, u64)> {
+    let q = query.unwrap_or("").trim();
+    let where_sql = "artist IS NOT NULL AND TRIM(artist) != '' AND path NOT IN
+        (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)
+        AND (?1 = '' OR artist LIKE '%' || ?1 || '%')";
+    let total: u64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM (SELECT artist FROM tracks WHERE {} GROUP BY artist)", where_sql),
+        params![q],
+        |row| row.get(0),
+    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT artist, COUNT(*)
+         FROM tracks WHERE {} GROUP BY artist ORDER BY artist ASC LIMIT ?2 OFFSET ?3",
+        where_sql
+    ))?;
+    let rows = stmt.query_map(params![q, limit, offset], |row| {
+        Ok(ArtistSummary { name: row.get(0)?, track_count: row.get(1)? })
+    })?;
+    let mut items = Vec::new();
+    for row in rows { items.push(row?); }
+    Ok((items, total))
+}
+
+/// 按 ID 批量获取曲目，结果顺序由调用方按请求 ID 重建。
+pub fn get_tracks_by_ids(conn: &Connection, ids: &[String]) -> Result<Vec<DbTrack>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT id, path, title, track, artist, album, duration,
+                cover, codec, sample_rate, bit_rate, channels,
+                bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+                cue_path, cue_audio_path, cue_start_ms, cue_end_ms
+         FROM tracks WHERE id IN ({placeholders})"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let values: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), row_to_track)?;
+    let mut tracks = Vec::new();
+    for row in rows { tracks.push(row?); }
+    Ok(tracks)
+}
+
+/// 按目录分页读取曲目，包含目录下的子目录。
+pub fn get_folder_tracks_page(
+    conn: &Connection,
+    folder: &str,
+    limit: u32,
+    offset: u64,
+) -> Result<(Vec<DbTrack>, u64)> {
+    let prefix = format!("{}/%", folder.trim_end_matches('/').replace('\\', "/"));
+    let where_sql = "COALESCE(REPLACE(cue_audio_path, '\\', '/'), REPLACE(path, '\\', '/')) LIKE ?1
+        AND path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)";
+    let total: u64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM tracks WHERE {where_sql}"),
+        rusqlite::params![prefix],
+        |row| row.get(0),
+    )?;
+    let sql = format!(
+        "SELECT id, path, title, track, artist, album, duration,
+                cover, codec, sample_rate, bit_rate, channels,
+                bits_per_sample, file_size, file_mtime, file_ctime, scanned_at,
+                cue_path, cue_audio_path, cue_start_ms, cue_end_ms
+         FROM tracks WHERE {where_sql}
+         ORDER BY COALESCE(album, ''), COALESCE(track, 0), title, id
+         LIMIT ?2 OFFSET ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![prefix, limit, offset], row_to_track)?;
+    let mut items = Vec::new();
+    for row in rows { items.push(row?); }
+    Ok((items, total))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LibraryFolderSummary {
+    pub name: String,
+    pub path: String,
+    pub track_count: u64,
+}
+
+/// 目录索引版本：扫描时间、文件时间或记录数变化都会使缓存失效。
+pub fn get_folder_index_version(conn: &Connection) -> Result<u64> {
+    let version: u64 = conn.query_row(
+        "SELECT COUNT(*) + COALESCE(MAX(scanned_at), 0) + COALESCE(MAX(file_mtime), 0) FROM tracks",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(version)
+}
+
+/// 返回轻量目录索引；曲目详情仍通过分页接口按目录读取。
+pub fn get_folder_summaries(conn: &Connection) -> Result<Vec<LibraryFolderSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(cue_audio_path, path)
+         FROM tracks
+         WHERE path NOT IN (SELECT cue_audio_path FROM tracks WHERE cue_audio_path IS NOT NULL)"
+    )?;
+    let paths = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut counts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for path in paths {
+        let path = path?;
+        let normalized = path.replace('\\', "/");
+        let mut current = normalized.rsplit_once('/').map(|(parent, _)| parent.to_string());
+        while let Some(folder) = current {
+            *counts.entry(folder.clone()).or_default() += 1;
+            current = folder.rsplit_once('/').map(|(parent, _)| parent.to_string());
+        }
+    }
+    let mut result = counts.into_iter().map(|(path, track_count)| {
+        let name = path.rsplit('/').next().filter(|v| !v.is_empty()).unwrap_or(&path).to_string();
+        LibraryFolderSummary { name, path, track_count }
+    }).collect::<Vec<_>>();
+    result.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(result)
 }
 
 /// 按专辑获取曲目（自动排除容器整轨）
@@ -1208,6 +1711,13 @@ pub fn add_playlist_tracks(
 
     let tx = conn.transaction()?;
     {
+        if tx.query_row(
+            "SELECT 1 FROM playlists WHERE id = ?1",
+            params![playlist_id],
+            |_| Ok(()),
+        ).optional()?.is_none() {
+            return Err(anyhow::anyhow!("playlist not found: {playlist_id}"));
+        }
         // 查找当前最大 position
         let mut max_pos: u32 = tx
             .query_row(
@@ -1224,7 +1734,25 @@ pub fn add_playlist_tracks(
             "#,
         )?;
 
+        let mut seen = std::collections::HashSet::new();
         for tid in track_ids {
+            if !seen.insert(tid) {
+                continue;
+            }
+            let exists: Option<String> = tx
+                .query_row("SELECT id FROM tracks WHERE id = ?1", params![tid], |row| row.get(0))
+                .optional()?;
+            if exists.is_none() {
+                return Err(anyhow::anyhow!("track not found: {tid}"));
+            }
+            let already: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM playlist_tracks WHERE playlist_id = ?1 AND track_id = ?2)",
+                params![playlist_id, tid],
+                |row| row.get(0),
+            )?;
+            if already {
+                continue;
+            }
             max_pos += 1;
             stmt.execute(params![playlist_id, tid, max_pos, now])?;
         }

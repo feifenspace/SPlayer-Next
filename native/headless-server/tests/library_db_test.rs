@@ -7,6 +7,7 @@ use headless_server::config::Config;
 use headless_server::db;
 use headless_server::state::AppState;
 use serde_json::Value;
+use rusqlite::params;
 use tower::ServiceExt;
 
 /// 创建带临时 DB 的测试用 AppState
@@ -121,6 +122,27 @@ async fn test_db_tracks_upsert_and_queries() {
     let all_tracks = db::get_all_tracks(&conn).unwrap();
     assert_eq!(all_tracks.len(), 3);
 
+    // 分页和文本过滤必须稳定工作，避免调用方一次性加载整个曲库。
+    let (page, total) = db::get_tracks_page(&conn, None, 2, 0).unwrap();
+    assert_eq!(total, 3);
+    assert_eq!(page.len(), 2);
+    let (filtered, filtered_total) = db::get_tracks_page(&conn, Some("Song Two"), 10, 0).unwrap();
+    assert_eq!(filtered_total, 1);
+    assert_eq!(filtered[0].title, "Song Two");
+
+    // id cursor、编码筛选和采样率筛选必须能在真实 SQL 中工作。
+    let (first, _, cursor) = db::get_tracks_page_advanced(
+        &conn, None, Some("flac"), Some(44100), 1, 0, Some("id"), Some("asc"), None,
+    )
+    .unwrap();
+    assert_eq!(first.len(), 1);
+    let cursor = cursor.expect("first page should return a cursor");
+    let (second, _, _) = db::get_tracks_page_advanced(
+        &conn, None, Some("flac"), Some(44100), 1, 0, Some("id"), Some("asc"), Some(&cursor),
+    )
+    .unwrap();
+    assert!(second.is_empty() || second[0].id > first[0].id);
+
     // 查询专辑聚合
     let albums = db::get_album_list(&conn).unwrap();
     assert_eq!(albums.len(), 2);
@@ -197,7 +219,24 @@ async fn test_library_rest_endpoints() {
     assert_eq!(body["data"].as_array().unwrap().len(), 1);
     assert_eq!(body["data"][0]["title"], "Track 1");
 
-    // 2. GET /api/v1/library/albums
+    // 2. GET /api/v1/library/tracks/page
+    let req = Request::builder()
+        .uri("/api/v1/library/tracks/page?limit=1&offset=0&q=Track")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(body["success"].as_bool().unwrap());
+    assert_eq!(body["data"]["total"], 1);
+    assert_eq!(body["data"]["items"].as_array().unwrap().len(), 1);
+    assert!(!body["data"]["hasMore"].as_bool().unwrap());
+
+    // 3. GET /api/v1/library/albums
     let req = Request::builder()
         .uri("/api/v1/library/albums")
         .method("GET")
@@ -376,4 +415,39 @@ fn schema_preflight_rejects_newer_database() {
         error.contains("99") && error.contains("拒绝"),
         "应拒绝高版本库并给出版本信息: {error}"
     );
+}
+
+
+/// 手工压测用：确认十万条曲目下分页查询仍只读取一页数据。
+/// 默认忽略，避免每次普通 CI 都重复构造大型临时数据库。
+#[tokio::test]
+#[ignore]
+async fn test_library_page_scales_to_100k_tracks() {
+    let (state, _temp) = create_test_library_app_state().await;
+    let mut conn = state.db.lock();
+    let tx = conn.transaction().unwrap();
+    for i in 0..100_000u32 {
+        let id = format!("stress-{i:06}");
+        let path = format!("/stress/{i:06}.flac");
+        tx.execute(
+            "INSERT INTO tracks
+             (id, path, title, track, artist, album, duration, cover, codec,
+              sample_rate, bit_rate, channels, bits_per_sample, file_size,
+              file_mtime, file_ctime, scanned_at)
+             VALUES (?1, ?2, ?3, 1, 'Stress Artist', 'Stress Album', 240,
+                     NULL, 'flac', 44100, 1000000, 2, 16, 1000, 1, 1, 1)",
+            params![id, path, format!("Track {i:06}")],
+        ).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let started = std::time::Instant::now();
+    let (page, total, next) = db::get_tracks_page_advanced(
+        &conn, None, Some("flac"), Some(44100), 200, 0,
+        Some("title"), Some("asc"), None,
+    ).unwrap();
+    assert_eq!(page.len(), 200);
+    assert_eq!(total, 100_000);
+    assert!(next.is_some());
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }

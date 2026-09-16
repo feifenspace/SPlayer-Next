@@ -88,6 +88,21 @@ async fn test_db_playlist_lifecycle() {
     // 2. 添加歌曲
     db::add_playlist_tracks(&mut conn, "pl-test-1", &[t1_id.clone(), t2_id.clone()]).unwrap();
 
+    // 重复添加不应制造 position 空洞，也不应重复出现在歌单中。
+    db::add_playlist_tracks(&mut conn, "pl-test-1", &[t1_id.clone(), t2_id.clone()]).unwrap();
+    let detail_after_duplicate = db::get_playlist_detail(&conn, "pl-test-1")
+        .unwrap()
+        .expect("Playlist not found");
+    assert_eq!(detail_after_duplicate.tracks.len(), 2);
+
+    // 不存在的曲目必须被拒绝，避免产生悬空歌单关系。
+    assert!(db::add_playlist_tracks(
+        &mut conn,
+        "pl-test-1",
+        &[String::from("missing-track")],
+    )
+    .is_err());
+
     // 3. 查询详情
     let detail = db::get_playlist_detail(&conn, "pl-test-1")
         .unwrap()

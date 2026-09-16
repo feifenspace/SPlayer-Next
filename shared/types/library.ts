@@ -10,6 +10,12 @@ export interface AlbumSummary {
 }
 
 /** 歌手聚合项 */
+export interface FolderSummary {
+  name: string;
+  path: string;
+  trackCount: number;
+}
+
 export interface ArtistSummary {
   name: string;
   trackCount: number;
@@ -26,6 +32,16 @@ export interface ScanProgress {
   scanned: number;
   /** 当前正在处理的文件名 */
   current?: string;
+  /** 成功探测并写入的曲目数 */
+  succeeded?: number;
+  /** 探测失败或跳过的文件数 */
+  failed?: number;
+  /** 删除的记录数 */
+  removed?: number;
+  /** 本轮变化的 CUE 文件数 */
+  cue_files?: number;
+  /** 本轮变化的 SACD ISO 文件数 */
+  iso_files?: number;
   /** 错误信息（仅 error 阶段） */
   error?: string;
 }
@@ -41,10 +57,64 @@ export interface LibraryApi {
   cancelScan: () => Promise<IpcResponse>;
   /** 获取全部曲目 */
   getTracks: () => Promise<IpcResponse<Track[]>>;
+  /** 分页获取曲目（Web/headless 模式，优先使用 cursor） */
+  getTracksPage?: (
+    limit?: number,
+    offset?: number,
+    query?: string,
+    options?: {
+      cursor?: string;
+      sort?: string;
+      order?: "asc" | "desc";
+      codec?: string;
+      sampleRate?: number;
+    },
+  ) => Promise<
+    IpcResponse<{
+      items: Track[];
+      total: number;
+      limit: number;
+      offset: number;
+      nextCursor?: string | null;
+      hasMore: boolean;
+    }>
+  >;
   /** 获取专辑聚合列表 */
   getAlbums: () => Promise<IpcResponse<AlbumSummary[]>>;
+  /** 分页获取专辑聚合列表（Web/headless 模式） */
+  getAlbumsPage?: (
+    limit?: number,
+    offset?: number,
+    query?: string,
+    cursor?: string,
+  ) => Promise<
+    IpcResponse<{
+      items: AlbumSummary[];
+      total: number;
+      limit: number;
+      offset: number;
+      nextCursor?: string | null;
+      hasMore: boolean;
+    }>
+  >;
   /** 获取歌手聚合列表 */
   getArtists: () => Promise<IpcResponse<ArtistSummary[]>>;
+  /** 分页获取歌手聚合列表（Web/headless 模式） */
+  getArtistsPage?: (
+    limit?: number,
+    offset?: number,
+    query?: string,
+    cursor?: string,
+  ) => Promise<
+    IpcResponse<{
+      items: ArtistSummary[];
+      total: number;
+      limit: number;
+      offset: number;
+      nextCursor?: string | null;
+      hasMore: boolean;
+    }>
+  >;
   /** 获取某专辑下的全部曲目 */
   getAlbumTracks: (albumName: string) => Promise<IpcResponse<Track[]>>;
   /** 获取某歌手的全部曲目 */
@@ -65,10 +135,21 @@ export interface LibraryApi {
   addScanDir: (dirPath?: string) => Promise<IpcResponse<string>>;
   /** 移除扫描目录及其下曲目 */
   removeScanDir: (dir: string) => Promise<IpcResponse>;
+  /** 获取轻量目录索引 */
+  getFolders?: () => Promise<IpcResponse<FolderSummary[]>>;
+  /** 分页获取目录下曲目 */
+  getFolderTracksPage?: (
+    path: string,
+    limit?: number,
+    offset?: number,
+  ) => Promise<
+    IpcResponse<{ items: Track[]; total: number; limit: number; offset: number; hasMore: boolean }>
+  >;
   /** 获取已配置的扫描目录 */
   getScanDirs: () => Promise<IpcResponse<string[]>>;
   /** 删除曲目文件并从数据库移除 */
   deleteTracks: (paths: string[]) => Promise<IpcResponse<{ deleted: number; failed: number }>>;
+  clearLibrary?: () => Promise<IpcResponse<{ deleted: number }>>;
   /** 读取本地文件的可编辑标签 */
   readTags: (path: string) => Promise<IpcResponse<TrackTags>>;
   /** 批量写入文件标签 */

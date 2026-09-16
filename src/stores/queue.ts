@@ -68,6 +68,15 @@ export const setQueue = (items: readonly Track[], context?: PlaybackContext): vo
   save();
 };
 
+/** 追加一批曲目，供媒体库大曲库播放时按页建立队列。 */
+export const appendToQueue = (items: readonly Track[], context?: PlaybackContext): void => {
+  if (items.length === 0) return;
+  const entries = items.map((track) => createQueueItem(track, context));
+  queueEntries.value = [...queueEntries.value, ...entries];
+  if (originalQueue.value) originalQueue.value = [...originalQueue.value, ...entries];
+  save();
+};
+
 /**
  * 在指定位置插入一首歌，同时同步到 originalQueue
  * @param item - 要插入的歌曲
@@ -310,8 +319,7 @@ export const findTrackIndexByServerSource = (serverSource: string): number => {
     const trackNum = seg[3];
     const cueMatch = queueEntries.value.findIndex(
       (item) =>
-        (item.track.cueAudioPath ?? "") === master &&
-        String(item.track.track ?? "") === trackNum,
+        (item.track.cueAudioPath ?? "") === master && String(item.track.track ?? "") === trackNum,
     );
     if (cueMatch !== -1) return cueMatch;
   }

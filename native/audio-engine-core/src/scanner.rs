@@ -23,7 +23,7 @@ const AUDIO_EXTENSIONS: &[&str] = &[
 ];
 
 /// 每批回调的文件数
-const BATCH_SIZE: usize = 20;
+const BATCH_SIZE: usize = 256;
 
 /// 已有文件记录，用于增量扫描比对
 pub struct FileRecord {
@@ -59,6 +59,8 @@ pub enum ScanEvent {
         scanned: u32,
         total: u32,
         current: Option<String>,
+        skipped: u32,
+        failed: u32,
         tracks: Vec<ScannedTrack>,
     },
     /// 扫描完成
@@ -374,6 +376,25 @@ struct WorkerBatch {
     tracks: Vec<ScannedTrack>,
 }
 
+fn cue_references_changed(
+    cue_path: &str,
+    existing: &HashMap<&str, (u64, u64, Option<&str>)>,
+) -> bool {
+    let Ok(cue) = crate::cue::CueSheet::parse_file(cue_path) else {
+        return true;
+    };
+    cue.tracks.iter().any(|track| {
+        let path = track.physical_path.to_string_lossy();
+        let Some((mtime, _, size)) = file_stat(Path::new(path.as_ref())) else {
+            return true;
+        };
+        match existing.get(path.as_ref()) {
+            Some((old_mtime, old_size, _)) => *old_mtime != mtime || *old_size != size,
+            None => true,
+        }
+    })
+}
+
 pub fn scan_directories(
     dirs: &[String],
     cover_cache_dir: Option<&str>,
@@ -409,6 +430,14 @@ pub fn scan_directories(
     for dir in dirs {
         if cancel.load(Ordering::Relaxed) {
             info!("扫描已取消（文件收集阶段）");
+            callback(ScanEvent::Done {
+                scanned: 0,
+                total: 0,
+                removed_paths: Vec::new(),
+                cue_files: Vec::new(),
+                iso_files: Vec::new(),
+                unavailable_dirs,
+            });
             return;
         }
         let dir_path = Path::new(dir);
@@ -431,12 +460,24 @@ pub fn scan_directories(
             if !entry.file_type().is_file() {
                 continue;
             }
-            if is_cue_file(path) {
-                cue_files.push(path.to_string_lossy().into_owned());
-                continue;
-            }
-            if is_iso_file(path) {
-                iso_files.push(path.to_string_lossy().into_owned());
+            if is_cue_file(path) || is_iso_file(path) {
+                let path_str = path.to_string_lossy().into_owned();
+                scanned_paths.push(path_str.clone());
+                let changed = match (existing.get(path_str.as_str()), file_stat(path)) {
+                    (Some((old_mtime, _, _)), Some((mtime, _, _))) => {
+                        *old_mtime != mtime
+                            || (is_cue_file(path)
+                                && cue_references_changed(&path_str, &existing))
+                    }
+                    _ => true,
+                };
+                if changed {
+                    if is_cue_file(path) {
+                        cue_files.push(path_str);
+                    } else {
+                        iso_files.push(path_str);
+                    }
+                }
                 continue;
             }
             if !is_audio_file(path) {
@@ -454,6 +495,15 @@ pub fn scan_directories(
     }
 
     let total = audio_items.len() as u32;
+    // 目录遍历完成后立即发布一次总数，避免前端在首批探测完成前一直显示 0/0。
+    callback(ScanEvent::Progress {
+        scanned: 0,
+        total,
+        current: None,
+        skipped: 0,
+        failed: 0,
+        tracks: Vec::new(),
+    });
     let walk_elapsed = walk_start.elapsed();
     info!(
         "目录遍历完成: 发现 {} 个音频文件，耗时 {:.2?}",
@@ -551,20 +601,27 @@ pub fn scan_directories(
                 .map(|n| n.to_string_lossy().into_owned())
         });
         batch.extend(tracks);
-        if batch.len() >= BATCH_SIZE {
-            callback(ScanEvent::Progress {
-                scanned,
-                total,
-                current,
-                tracks: std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE)),
-            });
-        }
+        let flushed_tracks = if batch.len() >= BATCH_SIZE {
+            std::mem::replace(&mut batch, Vec::with_capacity(BATCH_SIZE))
+        } else {
+            Vec::new()
+        };
+        callback(ScanEvent::Progress {
+            scanned,
+            total,
+            current,
+            skipped,
+            failed: stat_failed.len() as u32,
+            tracks: flushed_tracks,
+        });
     }
     if !batch.is_empty() {
         callback(ScanEvent::Progress {
             scanned,
             total,
             current: None,
+            skipped: 0,
+            failed: 0,
             tracks: std::mem::take(&mut batch),
         });
     }

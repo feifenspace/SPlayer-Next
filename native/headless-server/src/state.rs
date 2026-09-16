@@ -65,6 +65,11 @@ pub struct ScanProgressMessage {
     pub scanned: u32,
     pub total: u32,
     pub current: Option<String>,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub removed: u32,
+    pub cue_files: u32,
+    pub iso_files: u32,
 }
 
 /// 下一曲自动连播候选（B 层单槽：后写覆盖，曲终加载后即消费）

@@ -27,8 +27,41 @@ pub struct ScanRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct TrackIdsRequest {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ScanDirRequest {
     pub path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LibraryTracksPageQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u64>,
+    pub cursor: Option<String>,
+    pub q: Option<String>,
+    pub codec: Option<String>,
+    #[serde(rename = "sampleRate")]
+    pub sample_rate: Option<u32>,
+    pub sort: Option<String>,
+    pub order: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LibraryAggregatePageQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u64>,
+    pub cursor: Option<String>,
+    pub q: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LibraryFolderTracksQuery {
+    pub path: String,
+    pub limit: Option<u32>,
+    pub offset: Option<u64>,
 }
 
 /// 单文件快速探测
@@ -70,6 +103,122 @@ pub(crate) async fn library_tracks_handler(
     Ok(Json(PlayerResponse::ok(
         serde_json::to_value(tracks).unwrap_or_default(),
     )))
+}
+
+/// 按 ID 批量读取曲目，供收藏和已保存队列按需加载。
+pub(crate) async fn library_tracks_by_ids_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<TrackIdsRequest>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let ids: Vec<String> = payload.ids.into_iter().filter(|id| !id.is_empty()).take(10_000).collect();
+    let conn = state.db.lock();
+    let tracks = crate::db::get_tracks_by_ids(&conn, &ids)?;
+    Ok(Json(PlayerResponse::ok(serde_json::to_value(tracks).unwrap_or_default())))
+}
+
+/// 获取目录下的分页曲目。
+pub(crate) async fn library_folder_tracks_handler(
+    State(state): State<AppState>,
+    Query(query): Query<LibraryFolderTracksQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0);
+    let conn = state.db.lock();
+    let (items, total) = crate::db::get_folder_tracks_page(&conn, &query.path, limit, offset)?;
+    Ok(Json(PlayerResponse::ok(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "hasMore": offset.saturating_add(items.len() as u64) < total,
+    }))))
+}
+
+/// 获取轻量目录索引，避免前端为构建目录树加载全部曲目。
+pub(crate) async fn library_folders_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let conn = state.db.lock();
+    let version = crate::db::get_folder_index_version(&conn)?;
+    if let Ok(Some(cached)) = crate::db::get_setting(&conn, "library.folder_index_cache") {
+        if cached.get("version").and_then(|v| v.as_u64()) == Some(version) {
+            if let Some(items) = cached.get("items") {
+                if let Ok(folders) = serde_json::from_value::<Vec<crate::db::LibraryFolderSummary>>(items.clone()) {
+                    return Ok(Json(PlayerResponse::ok(json!(folders))));
+                }
+            }
+        }
+    }
+    let folders = crate::db::get_folder_summaries(&conn)?;
+    let cache = json!({ "version": version, "items": folders });
+    if let Err(error) = crate::db::set_setting(&conn, "library.folder_index_cache", &cache) {
+        tracing::debug!(%error, "写入目录索引缓存失败");
+    }
+    let items = cache.get("items").cloned().unwrap_or_else(|| json!([]));
+    Ok(Json(PlayerResponse::ok(items)))
+}
+
+/// 分页查询音乐库曲目；兼容接口 /library/tracks 仍保留。
+pub(crate) async fn library_tracks_page_handler(
+    State(state): State<AppState>,
+    Query(query): Query<LibraryTracksPageQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0);
+    let conn = state.db.lock();
+    let (items, total, next_cursor) = crate::db::get_tracks_page_advanced(
+        &conn,
+        query.q.as_deref(),
+        query.codec.as_deref(),
+        query.sample_rate,
+        limit,
+        offset,
+        query.sort.as_deref(),
+        query.order.as_deref(),
+        query.cursor.as_deref(),
+    )?;
+    Ok(Json(PlayerResponse::ok(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "nextCursor": next_cursor,
+        "hasMore": next_cursor.is_some(),
+    }))))
+}
+
+/// 分页获取专辑聚合。
+pub(crate) async fn library_albums_page_handler(
+    State(state): State<AppState>,
+    Query(query): Query<LibraryAggregatePageQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0);
+    let conn = state.db.lock();
+    if query.cursor.is_some() {
+        let (items, total, next_cursor) = crate::db::get_album_page_cursor(&conn, query.q.as_deref(), limit, query.cursor.as_deref())?;
+        return Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": next_cursor, "hasMore": next_cursor.is_some() }))));
+    }
+    let (items, total) = crate::db::get_album_page(&conn, query.q.as_deref(), limit, offset)?;
+    let item_count = items.len() as u64;
+    Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": null, "hasMore": offset.saturating_add(item_count) < total }))))
+}
+
+/// 分页获取歌手聚合。
+pub(crate) async fn library_artists_page_handler(
+    State(state): State<AppState>,
+    Query(query): Query<LibraryAggregatePageQuery>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let offset = query.offset.unwrap_or(0);
+    let conn = state.db.lock();
+    if query.cursor.is_some() {
+        let (items, total, next_cursor) = crate::db::get_artist_page_cursor(&conn, query.q.as_deref(), limit, query.cursor.as_deref())?;
+        return Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": next_cursor, "hasMore": next_cursor.is_some() }))));
+    }
+    let (items, total) = crate::db::get_artist_page(&conn, query.q.as_deref(), limit, offset)?;
+    let item_count = items.len() as u64;
+    Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": null, "hasMore": offset.saturating_add(item_count) < total }))))
 }
 
 /// 获取音乐库全部专辑聚合
@@ -119,6 +268,14 @@ pub(crate) async fn library_artist_tracks_handler(
 }
 
 /// 获取已配置的扫描目录列表
+pub(crate) async fn library_clear_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let mut conn = state.db.lock();
+    let deleted = crate::db::clear_library_tracks(&mut conn)?;
+    Ok(Json(PlayerResponse::ok(json!({ "deleted": deleted }))))
+}
+
 pub(crate) async fn library_scan_dirs_get_handler(
     State(state): State<AppState>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
@@ -186,8 +343,29 @@ pub(crate) async fn library_scan_handler(
                 scanned: 0,
                 total: 0,
                 current: None,
+                succeeded: 0,
+                failed: 0,
+                removed: 0,
+                cue_files: 0,
+                iso_files: 0,
             });
             return;
+        }
+
+        {
+            let conn = state_clone.db.lock();
+            let checkpoint = json!({
+                "phase": "running",
+                "incremental": incremental,
+                "directories": dirs,
+                "scanned": 0,
+                "total": 0,
+                "succeeded": 0,
+                "failed": 0,
+            });
+            if let Err(error) = crate::db::set_setting(&conn, "library.scan_checkpoint", &checkpoint) {
+                tracing::warn!(%error, "写入媒体库扫描检查点失败");
+            }
         }
 
         let file_records = if incremental {
@@ -200,6 +378,10 @@ pub(crate) async fn library_scan_handler(
         let cover_dir = state_clone.config.resolved_cover_cache_dir();
         let cover_dir_str = cover_dir.to_str();
         let state_for_cb = state_clone.clone();
+        let succeeded_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let failed_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let succeeded_for_cb = succeeded_count.clone();
+        let failed_for_cb = failed_count.clone();
 
         audio_engine_core::scanner::scan_directories(
             &dirs,
@@ -211,11 +393,38 @@ pub(crate) async fn library_scan_handler(
                     scanned,
                     total,
                     current,
+                    skipped,
+                    failed: batch_failed,
                     tracks,
                 } => {
+                    let batch_succeeded = skipped + tracks.len() as u32;
+                    let succeeded = succeeded_for_cb.fetch_add(
+                        batch_succeeded,
+                        std::sync::atomic::Ordering::SeqCst,
+                    ) + batch_succeeded;
+                    let failed = failed_for_cb.fetch_add(
+                        batch_failed,
+                        std::sync::atomic::Ordering::SeqCst,
+                    ) + batch_failed;
                     if !tracks.is_empty() {
                         let mut conn = state_for_cb.db.lock();
-                        let _ = crate::db::upsert_scanned_tracks(&mut conn, &tracks);
+                        if let Err(error) = crate::db::upsert_scanned_tracks(&mut conn, &tracks) {
+                            tracing::error!(%error, "写入扫描到的媒体库记录失败");
+                        }
+                    }
+                    {
+                        let conn = state_for_cb.db.lock();
+                        let checkpoint = json!({
+                            "phase": "running",
+                            "incremental": incremental,
+                            "scanned": scanned,
+                            "total": total,
+                            "succeeded": succeeded,
+                            "failed": failed,
+                        });
+                        if let Err(error) = crate::db::set_setting(&conn, "library.scan_checkpoint", &checkpoint) {
+                            tracing::debug!(%error, "更新媒体库扫描检查点失败");
+                        }
                     }
                     let _ = state_for_cb
                         .scan_tx
@@ -225,6 +434,11 @@ pub(crate) async fn library_scan_handler(
                             scanned,
                             total,
                             current,
+                            succeeded,
+                            failed,
+                            removed: 0,
+                            cue_files: 0,
+                            iso_files: 0,
                         });
                 }
                 audio_engine_core::scanner::ScanEvent::Done {
@@ -235,26 +449,55 @@ pub(crate) async fn library_scan_handler(
                     iso_files,
                     ..
                 } => {
+                    let succeeded = succeeded_for_cb.load(
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    let failed = failed_for_cb.load(
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
                     {
                         let mut conn = state_for_cb.db.lock();
                         if !removed_paths.is_empty() {
-                            let _ = crate::db::delete_tracks_by_paths(&mut conn, &removed_paths);
+                            if let Err(error) = crate::db::delete_tracks_by_paths(&mut conn, &removed_paths) {
+                                tracing::error!(%error, "删除媒体库失效记录失败");
+                            }
                         }
                         if !cue_files.is_empty() {
                             let cover_cache_dir = state_for_cb.config.resolved_cover_cache_dir();
-                            let _ = crate::db::sync_cue_tracks(
+                            if let Err(error) = crate::db::sync_cue_tracks(
                                 &mut conn,
                                 &cue_files,
                                 Some(&cover_cache_dir),
-                            );
+                            ) {
+                                tracing::error!(%error, "同步 CUE 虚拟分轨失败");
+                            }
                         }
                         if !iso_files.is_empty() {
                             let cover_cache_dir = state_for_cb.config.resolved_cover_cache_dir();
-                            let _ = crate::db::sync_sacd_tracks(
+                            if let Err(error) = crate::db::sync_sacd_tracks(
                                 &mut conn,
                                 &iso_files,
                                 Some(&cover_cache_dir),
-                            );
+                            ) {
+                                tracing::error!(%error, "同步 SACD ISO 虚拟分轨失败");
+                            }
+                        }
+                    }
+                    {
+                        let conn = state_for_cb.db.lock();
+                        let checkpoint = json!({
+                            "phase": "done",
+                            "incremental": incremental,
+                            "scanned": scanned,
+                            "total": total,
+                            "succeeded": succeeded,
+                            "failed": failed,
+                            "removed": removed_paths.len(),
+                            "cue_files": cue_files.len(),
+                            "iso_files": iso_files.len(),
+                        });
+                        if let Err(error) = crate::db::set_setting(&conn, "library.scan_checkpoint", &checkpoint) {
+                            tracing::debug!(%error, "保存媒体库扫描检查点失败");
                         }
                     }
                     let _ = state_for_cb
@@ -265,6 +508,11 @@ pub(crate) async fn library_scan_handler(
                             scanned,
                             total,
                             current: None,
+                            succeeded,
+                            failed,
+                            removed: removed_paths.len() as u32,
+                            cue_files: cue_files.len() as u32,
+                            iso_files: iso_files.len() as u32,
                         });
                 }
             },
@@ -288,10 +536,8 @@ pub(crate) async fn library_cancel_scan_handler(
     state
         .scan_cancel
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    state
-        .is_scanning
-        .store(false, std::sync::atomic::Ordering::SeqCst);
-    Json(PlayerResponse::ok(json!({ "status": "scan_cancelled" })))
+    // 保持 is_scanning 直到后台扫描线程真正退出。
+    Json(PlayerResponse::ok(json!({ "status": "scan_cancel_requested" })))
 }
 
 /// 获取当前扫描状态

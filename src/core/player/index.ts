@@ -73,6 +73,12 @@ type LoadSourceResult =
 let loadToken = 0;
 /** loadTrack 竞态 token */
 let trackToken = 0;
+let lazyQueueLoader: (() => Promise<boolean>) | null = null;
+
+/** 设置按页补充播放队列的加载器；传 null 关闭。 */
+export const setLazyQueueLoader = (loader: (() => Promise<boolean>) | null): void => {
+  lazyQueueLoader = loader;
+};
 /** 连续加载失败计数，成功时重置 */
 let consecutiveFailures = 0;
 /** 连续失败硬上限 */
@@ -704,6 +710,7 @@ export const playFrom = async (
   status.fmMode = false;
   const idx = Math.max(0, Math.min(startIndex, items.length - 1));
   const isSameTrack = media.track?.id === items[idx]?.id;
+  lazyQueueLoader = null;
   queue.setQueue(items, context);
   status.playIndex = idx;
   if (status.shuffleMode === "on") {
@@ -839,6 +846,21 @@ export const nextTrack = async (): Promise<void> => {
     return;
   }
   if (queue.queueLength.value === 0) return;
+  // 到末尾时先尝试按页补充媒体库队列，避免一次性加载十万首曲目。
+  if (
+    status.playIndex >= queue.queueLength.value - 1 &&
+    lazyQueueLoader &&
+    status.shuffleMode !== "on"
+  ) {
+    const oldLength = queue.queueLength.value;
+    const appended = await lazyQueueLoader();
+    if (appended && queue.queueLength.value > oldLength) {
+      status.playIndex = oldLength;
+      await loadTrack(status.currentTrack, status.currentPlaybackContext);
+      return;
+    }
+    lazyQueueLoader = null;
+  }
   // 到末尾了
   if (status.playIndex >= queue.queueLength.value - 1) {
     if (status.shuffleMode === "on" && queue.queueLength.value > 1) {

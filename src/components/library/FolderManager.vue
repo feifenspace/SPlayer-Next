@@ -8,6 +8,9 @@ import IconLucideFolderSearch from "~icons/lucide/folder-search";
 import IconLucideTrash2 from "~icons/lucide/trash-2";
 
 const { t } = useI18n();
+const props = withDefaults(defineProps<{ loadLibrary?: boolean }>(), {
+  loadLibrary: true,
+});
 const libraryStore = useLibraryStore();
 const { scanDirs } = storeToRefs(libraryStore);
 
@@ -58,14 +61,14 @@ const confirmRemove = (dir: string): void => {
 const handleRemove = async (): Promise<void> => {
   const dir = removingDir.value;
   if (!dir) return;
-  await libraryStore.removeScanDir(dir);
+  await libraryStore.removeScanDir(dir, false);
   removeConfirmOpen.value = false;
   emit("removed", dir);
 };
 
 /** 进入时确保已同步后端目录列表 */
 onMounted(() => {
-  if (!libraryStore.initialized) libraryStore.load();
+  if (props.loadLibrary && !libraryStore.initialized) libraryStore.load();
 });
 </script>
 
@@ -94,12 +97,7 @@ onMounted(() => {
     <!-- 浏览与添加操作区域 -->
     <div class="mt-2 flex flex-col gap-2">
       <!-- 浏览选择服务器文件夹主按钮 -->
-      <SButton
-        type="primary"
-        variant="secondary"
-        block
-        @click="serverPickerOpen = true"
-      >
+      <SButton type="primary" variant="secondary" block @click="serverPickerOpen = true">
         <template #icon><IconLucideFolderSearch /></template>
         浏览并选择服务端目录
       </SButton>
@@ -125,10 +123,7 @@ onMounted(() => {
     </div>
 
     <!-- 服务端目录浏览器弹窗 -->
-    <ServerDirPicker
-      v-model:open="serverPickerOpen"
-      @select="onServerDirSelected"
-    />
+    <ServerDirPicker v-model:open="serverPickerOpen" @select="onServerDirSelected" />
 
     <!-- 移除确认对话框 -->
     <SDialog v-model:open="removeConfirmOpen" :title="t('library.removeFolder')">

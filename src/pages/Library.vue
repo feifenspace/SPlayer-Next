@@ -1,7 +1,7 @@
 <script setup lang="ts">
 defineOptions({ name: "Library" });
 
-import type { PlaybackContext } from "@shared/types/player";
+import type { PlaybackContext, Track } from "@shared/types/player";
 import type { DropdownMenuItem } from "@/components/ui/SDropdownMenu.vue";
 import { useLibraryStore } from "@/stores/library";
 import SongList from "@/components/list/SongList.vue";
@@ -10,11 +10,23 @@ import IconFolderOpen from "~icons/lucide/folder-open";
 import IconRefreshCw from "~icons/lucide/refresh-cw";
 import IconLucideListChecks from "~icons/lucide/list-checks";
 import IconLucideX from "~icons/lucide/x";
+import IconLucideTrash2 from "~icons/lucide/trash-2";
 import * as player from "@/core/player";
+import * as queue from "@/stores/queue";
+import { useStatusStore } from "@/stores/status";
+import { dialog } from "@/composables/useDialog";
 
 const { t } = useI18n();
 const libraryStore = useLibraryStore();
-const { tracks, scanDirs, scanning, scanProgress, initialized } = storeToRefs(libraryStore);
+const { scanDirs, scanning, scanProgress } = storeToRefs(libraryStore);
+const pageTracks = shallowRef<Track[]>([]);
+const pageTotal = ref(0);
+const pageHasMore = ref(false);
+const pageLoading = ref(false);
+const pageOffset = ref(0);
+const pageCursor = ref<string | null>(null);
+const PAGE_SIZE = 200;
+let pageRequestId = 0;
 
 const playbackContext = computed<PlaybackContext>(() => ({
   originId: "library",
@@ -24,16 +36,48 @@ const playbackContext = computed<PlaybackContext>(() => ({
 
 /** 搜索关键词 */
 const searchQuery = ref("");
-
-/** 多选模式 */
 const songListRef = shallowRef<InstanceType<typeof SongList> | null>(null);
 
-/** 所有歌曲的总文件大小 */
 const totalSize = computed(() => {
-  const bytes = tracks.value.reduce((sum, track) => sum + (track.fileSize ?? 0), 0);
+  const bytes = pageTracks.value.reduce((sum, track) => sum + (track.fileSize ?? 0), 0);
   return bytes > 0 ? formatFileSize(bytes) : "";
 });
 
+const loadPage = async (reset = false, query = searchQuery.value): Promise<void> => {
+  const requestId = ++pageRequestId;
+  if (reset) {
+    pageOffset.value = 0;
+    pageCursor.value = null;
+    pageHasMore.value = false;
+    pageTracks.value = [];
+  }
+  pageLoading.value = true;
+  try {
+    const api = window.api.library.getTracksPage;
+    if (!api) return;
+    const res = await api(PAGE_SIZE, pageOffset.value, query, {
+      cursor: pageCursor.value ?? undefined,
+      sort: "album",
+      order: "asc",
+    });
+    if (requestId !== pageRequestId || !res.success || !res.data) return;
+    pageTotal.value = res.data.total;
+    pageOffset.value += res.data.items.length;
+    pageCursor.value = res.data.nextCursor ?? null;
+    pageHasMore.value = Boolean(res.data.hasMore && res.data.nextCursor);
+    pageTracks.value = reset ? res.data.items : [...pageTracks.value, ...res.data.items];
+  } finally {
+    if (requestId === pageRequestId) pageLoading.value = false;
+  }
+};
+const loadMore = (): void => {
+  if (!pageLoading.value && pageHasMore.value) void loadPage(false);
+};
+let searchTimer: ReturnType<typeof setTimeout> | undefined;
+watch(searchQuery, (query) => {
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => void loadPage(true, query), 250);
+});
 /** 新增目录（手动触发扫描，避免抢占播放资源） */
 const handleFolderAdded = (): void => {
   // 添加后不自动扫描，由用户按需点击扫描
@@ -43,10 +87,40 @@ const handleQuickAddFolder = (): void => {
   folderDialogOpen.value = true;
 };
 
-// 播放全部
-const handlePlayAll = (): void => {
-  if (tracks.value.length === 0) return;
-  player.playFrom(tracks.value, 0, playbackContext.value);
+// 播放全部：顺序模式在曲目结束时按页补充队列。
+const handlePlayAll = async (): Promise<void> => {
+  if (pageTracks.value.length === 0) return;
+  let cursor = pageCursor.value;
+  if (useStatusStore().shuffleMode === "on") {
+    const all = [...pageTracks.value];
+    const api = window.api.library.getTracksPage;
+    while (cursor && api) {
+      const res = await api(PAGE_SIZE, 0, searchQuery.value, {
+        cursor,
+        sort: "album",
+        order: "asc",
+      });
+      if (!res.success || !res.data) break;
+      all.push(...res.data.items);
+      cursor = res.data.nextCursor ?? null;
+    }
+    player.playFrom(all, 0, playbackContext.value);
+    return;
+  }
+  player.playFrom(pageTracks.value, 0, playbackContext.value);
+  player.setLazyQueueLoader(async () => {
+    if (!cursor) return false;
+    const api = window.api.library.getTracksPage;
+    if (!api) return false;
+    const res = await api(PAGE_SIZE, 0, searchQuery.value, { cursor, sort: "album", order: "asc" });
+    if (!res.success || !res.data || res.data.items.length === 0) {
+      cursor = null;
+      return false;
+    }
+    cursor = res.data.nextCursor ?? null;
+    queue.appendToQueue(res.data.items, playbackContext.value);
+    return true;
+  });
 };
 
 // 扫描进度百分比
@@ -84,9 +158,36 @@ const moreMenuItems = computed<DropdownMenuItem[]>(() => {
         disabled: scanDirs.value.length === 0,
       },
     );
+    if (scanDirs.value.length === 0 && pageTotal.value > 0) {
+      items.push({
+        key: "clearLibrary",
+        label: "清理媒体库记录（不删文件）",
+        icon: IconLucideTrash2,
+        separator: true,
+      });
+    }
   }
   return items;
 });
+
+const clearLibraryRecords = async (): Promise<void> => {
+  const clearLibrary = window.api.library.clearLibrary;
+  if (!clearLibrary) return;
+  const confirmed = await dialog.confirm({
+    title: "清理媒体库记录",
+    content: "将清空数据库中的曲目记录和播放列表曲目关联，但不会删除磁盘上的音乐文件。确定继续吗？",
+    type: "warning",
+  });
+  if (!confirmed) return;
+  const res = await clearLibrary();
+  if (!res.success) return;
+  pageTracks.value = [];
+  pageTotal.value = 0;
+  pageHasMore.value = false;
+  pageOffset.value = 0;
+  pageCursor.value = null;
+  await loadPage(true);
+};
 
 // 更多菜单
 const handleMoreMenu = (key: string): void => {
@@ -111,15 +212,19 @@ const handleMoreMenu = (key: string): void => {
     case "cancelScan":
       libraryStore.cancelScan();
       break;
+    case "clearLibrary":
+      void clearLibraryRecords();
+      break;
   }
 };
 
 // 进入页面时初始化（仅加载数据，绝不自动触发扫描）
-onMounted(async () => {
-  libraryStore.subscribeScanProgress();
-  if (!initialized.value) {
-    await libraryStore.load();
-  }
+onMounted(() => {
+  libraryStore.subscribeScanProgress({ refreshTracks: false, onDone: () => void loadPage(true) });
+  void (async () => {
+    if (!libraryStore.initialized) await libraryStore.load(false);
+    await loadPage(true);
+  })();
 });
 
 onUnmounted(() => {
@@ -144,10 +249,12 @@ onUnmounted(() => {
               <SLoading class="size-3.5 text-primary shrink-0" />
               <span class="tabular-nums">
                 {{
-                  t("library.scanProgress", {
-                    scanned: scanProgress.scanned,
-                    total: scanProgress.total,
-                  })
+                  scanProgress.total > 0
+                    ? t("library.scanProgress", {
+                        scanned: scanProgress.scanned,
+                        total: scanProgress.total,
+                      })
+                    : "正在准备扫描"
                 }}
               </span>
               <span class="text-on-surface-variant/40 font-mono">{{ scanPercent }}%</span>
@@ -160,15 +267,15 @@ onUnmounted(() => {
               </button>
             </div>
             <div
-              v-else-if="tracks.length > 0"
+              v-else-if="pageTotal > 0"
               key="stats"
               class="flex items-center gap-3 text-sm text-on-surface-variant/50"
             >
               <span class="flex items-center gap-1">
                 <IconLucideMusic class="size-3.5" />
-                {{ t("common.totalSongs", { count: tracks.length }) }}
+                {{ t("common.totalSongs", { count: pageTotal }) }}
               </span>
-              <span v-if="totalSize" class="flex items-center gap-1">
+              <span v-if="!pageHasMore && totalSize" class="flex items-center gap-1">
                 <IconLucideHardDrive class="size-3.5" />
                 {{ totalSize }}
               </span>
@@ -183,7 +290,7 @@ onUnmounted(() => {
             type="primary"
             variant="secondary"
             round
-            :disabled="tracks.length === 0"
+            :disabled="pageTracks.length === 0"
             @click="handlePlayAll"
           >
             <template #icon>
@@ -241,14 +348,16 @@ onUnmounted(() => {
       </div>
     </div>
     <!-- 曲目列表 -->
-    <div v-if="tracks.length > 0" class="flex-1 min-h-0">
+    <div v-if="pageTracks.length > 0" class="flex-1 min-h-0">
       <SongList
         ref="songListRef"
-        :items="tracks"
-        :search-query="searchQuery"
+        :items="pageTracks"
+        search-query=""
         :playback-context="playbackContext"
-        enable-sort
         show-size
+        :has-more="pageHasMore"
+        :loading-more="pageLoading"
+        @reach-bottom="loadMore"
       />
     </div>
     <!-- 空状态：无目录或无歌曲 -->
@@ -270,7 +379,7 @@ onUnmounted(() => {
       :description="t('library.foldersDescription')"
       width="480px"
     >
-      <FolderManager @added="handleFolderAdded" />
+      <FolderManager :load-library="false" @added="handleFolderAdded" />
     </SDialog>
   </div>
 </template>

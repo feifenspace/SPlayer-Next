@@ -33,6 +33,13 @@ const sortOptions = computed<SSelectOption[]>(() => [
 ]);
 
 const source = shallowRef<ArtistSummary[] | AlbumSummary[]>([]);
+const total = ref(0);
+const hasMore = ref(false);
+const loadingMore = ref(false);
+const offset = ref(0);
+const cursor = ref<string | null>(null);
+const PAGE_SIZE = 200;
+let requestId = 0;
 
 /** 组装最终列表 */
 const items = computed<CoverItem[]>(() => {
@@ -65,7 +72,7 @@ const config = computed(() =>
     ? {
         title: t("artist.label"),
         countIcon: IconLucideUsers,
-        countLabel: t("artist.totalArtists", { count: items.value.length }),
+        countLabel: t("artist.totalArtists", { count: total.value }),
         emptyIcon: IconLucideUserRound,
         coverType: "artist" as const,
         minSize: 120,
@@ -74,7 +81,7 @@ const config = computed(() =>
     : {
         title: t("album.label"),
         countIcon: IconLucideDisc3,
-        countLabel: t("common.totalAlbums", { count: items.value.length }),
+        countLabel: t("common.totalAlbums", { count: total.value }),
         emptyIcon: IconLucideDisc3,
         coverType: "default" as const,
         minSize: 140,
@@ -87,12 +94,47 @@ const handleClick = (item: CoverItem): void => {
   else navigateToAlbum(item.title);
 };
 
-onMounted(async () => {
-  source.value =
-    mode === "artist" ? await libraryStore.getArtistList() : await libraryStore.getAlbumList();
-  // 拉取当前列表中尚未缓存的歌手头像
-  if (mode === "artist") libraryStore.loadArtistAvatars();
-});
+const loadPage = async (reset = false): Promise<void> => {
+  const id = ++requestId;
+  if (reset) {
+    offset.value = 0;
+    cursor.value = null;
+    source.value = [];
+    hasMore.value = false;
+  }
+  loadingMore.value = true;
+  try {
+    const pageApi =
+      mode === "artist" ? window.api.library.getArtistsPage : window.api.library.getAlbumsPage;
+    if (!pageApi) {
+      const all =
+        mode === "artist" ? await libraryStore.getArtistList() : await libraryStore.getAlbumList();
+      if (id !== requestId) return;
+      source.value = all;
+      total.value = all.length;
+      hasMore.value = false;
+      return;
+    }
+    const res = await pageApi(PAGE_SIZE, offset.value, "", cursor.value ?? undefined);
+    if (id !== requestId || !res.success || !res.data) return;
+    total.value = res.data.total;
+    offset.value += res.data.items.length;
+    cursor.value = res.data.nextCursor ?? null;
+    hasMore.value = Boolean(res.data.hasMore && res.data.nextCursor);
+    source.value = reset ? res.data.items : [...source.value, ...res.data.items];
+    if (mode === "artist") {
+      libraryStore.loadArtistAvatars(res.data.items.map((item) => item.name));
+    }
+  } finally {
+    if (id === requestId) loadingMore.value = false;
+  }
+};
+
+const loadMore = (): void => {
+  if (!loadingMore.value && hasMore.value) void loadPage(false);
+};
+
+onMounted(() => void loadPage(true));
 </script>
 
 <template>
@@ -129,7 +171,10 @@ onMounted(async () => {
         :min-size="config.minSize"
         :padding-x="20"
         :padding-bottom="24"
+        :has-more="hasMore"
+        :loading-more="loadingMore"
         @click="handleClick"
+        @reach-bottom="loadMore"
       />
       <div v-else class="h-full flex items-center justify-center">
         <div class="text-center text-on-surface-variant/50">

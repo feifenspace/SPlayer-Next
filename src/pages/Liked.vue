@@ -29,17 +29,10 @@ const tabs = computed(() => [
 ]);
 
 const searchQuery = ref("");
+const likedLocalTracks = shallowRef<Track[]>([]);
 
-/** 本地喜欢列表 */
-const localTracks = computed<Track[]>(() => {
-  const byId = new Map<string, Track>(library.tracks.map((track) => [track.id, track]));
-  const list: Track[] = [];
-  for (const id of library.likedOrderedIds) {
-    const track = byId.get(id);
-    if (track) list.push(track);
-  }
-  return list;
-});
+/** 本地喜欢列表：按收藏 ID 查询，避免加载整个媒体库。 */
+const localTracks = computed<Track[]>(() => likedLocalTracks.value);
 
 watch(
   () => [tab.value, user.isLoggedIn, user.likedPlaylistId] as const,
@@ -77,8 +70,20 @@ const handlePlayAll = (): void => {
   player.playFrom(currentTracks.value, 0, playbackContext.value);
 };
 
-onMounted(() => {
-  if (!library.initialized) library.load();
+onMounted(async () => {
+  try {
+    const res = await window.api.library.getTracksByIds([...library.likedOrderedIds]);
+    if (res.success && res.data) {
+      const byId = new Map(res.data.map((track) => [track.id, track]));
+      likedLocalTracks.value = library.likedOrderedIds
+        .map((id) => byId.get(id))
+        .filter((track): track is Track => Boolean(track));
+      return;
+    }
+  } catch {
+    // 旧版桌面端没有按 ID 接口时回退到兼容路径。
+  }
+  if (!library.initialized) await library.load();
 });
 
 const songListRef = shallowRef<InstanceType<typeof SongList> | null>(null);

@@ -442,6 +442,116 @@ export class HttpPlayerClient implements IPlayerClient {
     return { success: true, data: (res as any).data ?? [] };
   }
 
+  async getLibraryFolders(): Promise<IpcResponse<any[]>> {
+    const res = await this.request<any[]>("/api/v1/library/folders");
+    return res.success
+      ? { success: true, data: (res as any).data ?? [] }
+      : { success: false, data: [] };
+  }
+
+  async getLibraryFolderTracksPage(
+    path: string,
+    limit = 200,
+    offset = 0,
+  ): Promise<
+    IpcResponse<{ items: any[]; total: number; limit: number; offset: number; hasMore: boolean }>
+  > {
+    const params = new URLSearchParams({ path, limit: String(limit), offset: String(offset) });
+    const res = await this.request<any>("/api/v1/library/folders/tracks?" + params.toString());
+    return res.success
+      ? { success: true, data: res.data }
+      : { success: false, data: { items: [], total: 0, limit, offset, hasMore: false } };
+  }
+
+  async getLibraryTracksByIds(ids: string[]): Promise<IpcResponse<any[]>> {
+    if (ids.length === 0) return { success: true, data: [] };
+    const res = await this.request<any[]>("/api/v1/library/tracks/by-ids", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids }),
+    });
+    return res.success
+      ? { success: true, data: (res as any).data ?? [] }
+      : { success: false, data: [] };
+  }
+
+  async clearLibrary(): Promise<IpcResponse<{ deleted: number }>> {
+    const res = await this.request<{ deleted: number }>("/api/v1/library/clear", {
+      method: "POST",
+    });
+    return res.success
+      ? { success: true, data: res.data ?? { deleted: 0 } }
+      : { success: false, data: { deleted: 0 } };
+  }
+
+  async getLibraryTracksPage(
+    limit = 200,
+    offset = 0,
+    query = "",
+    options: {
+      cursor?: string;
+      sort?: string;
+      order?: "asc" | "desc";
+      codec?: string;
+      sampleRate?: number;
+    } = {},
+  ): Promise<
+    IpcResponse<{
+      items: any[];
+      total: number;
+      limit: number;
+      offset: number;
+      nextCursor?: string | null;
+      hasMore: boolean;
+    }>
+  > {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (query.trim()) params.set("q", query.trim());
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.sort) params.set("sort", options.sort);
+    if (options.order) params.set("order", options.order);
+    if (options.codec) params.set("codec", options.codec);
+    if (options.sampleRate !== undefined) params.set("sampleRate", String(options.sampleRate));
+    const res = await this.request<any>(`/api/v1/library/tracks/page?${params.toString()}`);
+    if (!res.success) {
+      return {
+        success: false,
+        data: { items: [], total: 0, limit, offset, nextCursor: null, hasMore: false },
+      };
+    }
+    return { success: true, data: res.data };
+  }
+
+  async getLibraryAlbumsPage(
+    limit = 200,
+    offset = 0,
+    query = "",
+    cursor?: string,
+  ): Promise<IpcResponse<any>> {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (query.trim()) params.set("q", query.trim());
+    if (cursor) params.set("cursor", cursor);
+    const res = await this.request<any>("/api/v1/library/albums/page?" + params.toString());
+    return res.success
+      ? { success: true, data: res.data }
+      : { success: false, data: { items: [], total: 0, limit, offset, hasMore: false } };
+  }
+
+  async getLibraryArtistsPage(
+    limit = 200,
+    offset = 0,
+    query = "",
+    cursor?: string,
+  ): Promise<IpcResponse<any>> {
+    const params = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (query.trim()) params.set("q", query.trim());
+    if (cursor) params.set("cursor", cursor);
+    const res = await this.request<any>("/api/v1/library/artists/page?" + params.toString());
+    return res.success
+      ? { success: true, data: res.data }
+      : { success: false, data: { items: [], total: 0, limit, offset, hasMore: false } };
+  }
+
   async getLibraryAlbums(): Promise<IpcResponse<any[]>> {
     const res = await this.request<any[]>("/api/v1/library/albums");
     if (!res.success) return { success: false, data: [] };
@@ -780,15 +890,21 @@ export class HttpPlayerClient implements IPlayerClient {
         ) {
           const nowPlaying = await this.getNowPlaying();
           const metadata = nowPlaying.success ? (nowPlaying.data as any)?.metadata : null;
-          const quality = metadata ? {
-            sampleRate: metadata.original_sample_rate || metadata.sample_rate || 0,
-            channels: metadata.channels || 0,
-            bitsPerSample: metadata.bits_per_sample || 0,
-            bitRate: metadata.bit_rate || 0,
-            codec: metadata.codec || "unknown",
-          } : options?.meta?.quality ?? {
-            sampleRate: 0, channels: 0, bitsPerSample: 0, bitRate: 0, codec: "unknown",
-          };
+          const quality = metadata
+            ? {
+                sampleRate: metadata.original_sample_rate || metadata.sample_rate || 0,
+                channels: metadata.channels || 0,
+                bitsPerSample: metadata.bits_per_sample || 0,
+                bitRate: metadata.bit_rate || 0,
+                codec: metadata.codec || "unknown",
+              }
+            : (options?.meta?.quality ?? {
+                sampleRate: 0,
+                channels: 0,
+                bitsPerSample: 0,
+                bitRate: 0,
+                codec: "unknown",
+              });
           return {
             success: true,
             data: {
