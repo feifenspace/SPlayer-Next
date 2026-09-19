@@ -74,6 +74,10 @@ export type OnlineResolveResult =
       isTrial: boolean;
       provider: "official" | "plugin" | "trial";
       pluginId?: string;
+      /** 实际音质低于请求档位（QQ 静默降级）；为 true 时不应写入歌曲缓存 */
+      isFallback?: boolean;
+      /** 实际命中的音质档位（QQ 主进程 song_url 返回的 level） */
+      actualLevel?: string;
     }
   | { ok: false; errorCode: ErrorCode };
 
@@ -195,7 +199,14 @@ const resolveOnlineUrl = async (
     try {
       const resolved = await resolveQQMusicUrl(track, songLevel);
       if (resolved.available) {
-        return { ok: true, url: resolved.url, isTrial: false, provider: "official" };
+        return {
+          ok: true,
+          url: resolved.url,
+          isTrial: false,
+          provider: "official",
+          isFallback: resolved.isFallback === true,
+          actualLevel: resolved.actualLevel,
+        };
       }
       officialErrorCode = resolved.errorCode;
     } catch (err) {
@@ -344,10 +355,17 @@ export const resolveTrackSource = async (
         provider: resolved.provider,
         pluginId: resolved.pluginId,
       };
-      if (cacheEnabled && !resolved.isTrial) {
+      // QQ 静默降级（如 hi-res→lossless）时不写缓存：缓存键不含实际音质，
+      // 降级文件一旦固化，后续播放将永远命中低码率版本。跳过后下次播放
+      // 会重新协商，有机会重新拿到首选档位。
+      if (cacheEnabled && !resolved.isTrial && !resolved.isFallback) {
         result.cacheRequest = async () => {
           void window.api.cache.song.fetch(cacheKey, track.source, url);
         };
+      } else if (cacheEnabled && resolved.isFallback) {
+        console.warn(
+          `[cache] 跳过缓存降级音质: ${track.id} 请求 ${songLevel}，实际 ${resolved.actualLevel ?? "unknown"}`,
+        );
       }
       return result;
     } catch (err) {
