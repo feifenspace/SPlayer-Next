@@ -23,7 +23,7 @@ const NETEASE_LEVEL: Record<QualityLevel, string> = {
   sq: "higher",
   hq: "exhigh",
   lossless: "lossless",
-  "hi-res": "hires",
+  "hi-res": "jymaster",
 };
 
 export type NeteasePlayUrlResult =
