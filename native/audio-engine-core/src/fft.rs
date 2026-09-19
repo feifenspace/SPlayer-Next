@@ -71,7 +71,11 @@ mod real {
         }
 
         pub fn push_interleaved_samples(&self, interleaved: &[f32]) {
-            let mut buffer = self.sample_buffer.lock();
+            let Some(mut buffer) = self.sample_buffer.try_lock() else {
+                // FFT 只是可选的可视化支路，不能阻塞音频输出回调；分析线程
+                // 正在取快照时跳过这一批样本即可，下一批会继续填充环形缓冲。
+                return;
+            };
             for pair in interleaved.chunks_exact(2) {
                 let write_pos = buffer.write_pos;
                 buffer.left[write_pos] = pair[0];

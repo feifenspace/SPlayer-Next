@@ -6,7 +6,7 @@ use crate::direct_dsd::{DirectDsdFormat, DirectDsdMonitor};
 use crate::direct_pcm::{DirectPcmFormat, DirectPcmMonitor};
 
 #[cfg(feature = "diretta")]
-use crate::direct_dsd::DirectDsdStageHandle;
+use crate::direct_dsd::{DirectDsdReader, DirectDsdStageHandle};
 #[cfg(feature = "diretta")]
 use crate::direct_pcm::DirectPcmStageHandle;
 
@@ -1169,6 +1169,54 @@ impl DirectPlayback {
                 Err(error)
             }
         }
+    }
+
+    /// 以已经物化到 memfd 的 DSF/DFF Reader 打开 Native DSD，并复用同一套
+    /// 首块消费验证。Reader 路径不依赖 `/proc/self/fd/...` 的扩展名，避免
+    /// 内存文件被 `open_local` 误判为 PCM。
+    #[cfg(feature = "diretta")]
+    pub fn open_dsd_reader_verified(
+        selector: &str,
+        source: &str,
+        reader: DirectDsdReader,
+        duration_secs: f64,
+        auto_play: bool,
+        load_token: &std::sync::atomic::AtomicU64,
+        token: u64,
+    ) -> Result<Self> {
+        let (connection, actual_position) =
+            DirettaDirectDsdConnection::open_reader_at(selector, reader, 0.0, 0.0)?;
+        let dsd_duration = connection.monitor().duration();
+        let final_duration = if duration_secs > 0.0 {
+            duration_secs
+        } else {
+            dsd_duration
+        };
+        let mut playback = Self {
+            duration: final_duration,
+            seek_base: actual_position,
+            seek_transition_count: 0,
+            start_offset: 0.0,
+            selector: selector.to_owned(),
+            source: source.to_owned(),
+            transport: DirectTransport::Dsd(connection),
+        };
+        if auto_play {
+            playback.resume_soft();
+            playback.play()?;
+            match playback.wait_for_direct_start(load_token, token) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = playback.pause();
+                    bail!("[Device] Diretta Native DSD 连接未开始消费音频");
+                }
+                Err(error) => {
+                    let _ = playback.pause();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(playback)
     }
 
     /// fake 传输的换源：仅更新时长，返回 fake PCM 格式（供 player 层 handoff 单测使用）

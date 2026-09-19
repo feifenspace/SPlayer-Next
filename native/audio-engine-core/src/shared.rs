@@ -134,9 +134,10 @@ impl Shared {
     /// 归还播放样本缓冲；池满时直接释放以保持内存有界
     pub fn recycle_player_buffer(&self, mut buffer: Vec<f32>) {
         buffer.clear();
-        let mut pool = self.player_buffer_pool.lock();
-        if pool.len() < BUFFER_POOL_CAPACITY {
-            pool.push(buffer);
+        if let Some(mut pool) = self.player_buffer_pool.try_lock() {
+            if pool.len() < BUFFER_POOL_CAPACITY {
+                pool.push(buffer);
+            }
         }
     }
 
@@ -148,9 +149,10 @@ impl Shared {
     /// 归还 FFT 样本缓冲；池满时直接释放以保持内存有界
     pub fn recycle_fft_buffer(&self, mut buffer: Vec<f32>) {
         buffer.clear();
-        let mut pool = self.fft_buffer_pool.lock();
-        if pool.len() < BUFFER_POOL_CAPACITY {
-            pool.push(buffer);
+        if let Some(mut pool) = self.fft_buffer_pool.try_lock() {
+            if pool.len() < BUFFER_POOL_CAPACITY {
+                pool.push(buffer);
+            }
         }
     }
 
@@ -265,7 +267,11 @@ impl Shared {
 
     /// 非阻塞弹出数据块，供实时输出线程避免在音频回调链路里等待解码线程
     pub fn try_pop(&self) -> PopResult {
-        let mut buffer = self.output_buffer.lock();
+        let Some(mut buffer) = self.output_buffer.try_lock() else {
+            // 输出回调绝不能等待解码/DSP 线程释放锁；短暂竞争按欠载处理，
+            // 上层会交付短静音垫，下一次回调继续尝试。
+            return PopResult::Pending;
+        };
         if let Some(chunk) = buffer.pop_front() {
             self.output_condvar.notify_one();
             return PopResult::Chunk(chunk);

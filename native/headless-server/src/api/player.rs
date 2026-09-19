@@ -27,7 +27,6 @@ use audio_engine_core::direct_runtime::{
 };
 use audio_engine_core::ram_buffer::RamTrackBuffer;
 use audio_engine_core::LoadSuperseded;
-use std::io::Read as _;
 
 /// 查询参数占位：历史上承载可选 cancel_handle_id，现为空结构（保留以兼容既有请求）
 #[derive(Debug, Deserialize)]
@@ -78,6 +77,26 @@ pub struct LoadMeta {
 /// 服务端控制协议版本（A2.6）：客户端启动时校验 range，不兼容报结构化错误。
 /// 语义化破坏时 +1；v2 为当前版本（v1 裸格式兼容层退役后唯一版本）
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// 只有普通 DSF/DFF 才能安全地把源物化为匿名内存文件后交给 Native DSD。
+/// SACD ISO 需要虚拟轨道索引，CUE 需要保留轨内起点，两者继续走原始路径。
+fn is_memory_safe_native_dsd_source(source: &str) -> bool {
+    if audio_engine_core::sacd::parse_sacd_virtual_path(source).is_some()
+        || audio_engine_core::cue::parse_cue_virtual_path(source).is_some()
+    {
+        return false;
+    }
+    std::path::Path::new(source)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "dsf" | "dff" | "dsdiff"
+            )
+        })
+        .unwrap_or(false)
+}
 
 /// 健康/状态查询
 pub(crate) async fn status_handler(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -319,36 +338,6 @@ pub(crate) async fn queue_next_candidate_cancel_handler(
         "data": null,
     }));
     Json(PlayerResponse::ok(json!({ "registered": false })))
-}
-
-/// 加载音轨（完整三段式异步 IO 闭环）
-/// 整曲物化进 mlock RAM 缓冲（L2 纯内存播放，蓝图 §3.1）。
-/// `Ok(None)` = 超出上限或空文件，调用方回退路径模式（带日志，非静默）
-fn materialize_ram_buffer(path: &str, max_bytes: usize) -> anyhow::Result<Option<RamTrackBuffer>> {
-    let file = std::fs::File::open(path).with_context(|| format!("打开待物化文件失败: {path}"))?;
-    let len = file.metadata()?.len() as usize;
-    if len == 0 || len > max_bytes {
-        tracing::info!(path, len, max_bytes, "曲目超出 RAM 物化上限，回退路径模式");
-        return Ok(None);
-    }
-    let buf = RamTrackBuffer::with_capacity(len, max_bytes);
-    let mut reader = std::io::BufReader::with_capacity(512 * 1024, file);
-    let mut chunk = vec![0u8; 512 * 1024];
-    loop {
-        let n = reader.read(&mut chunk)?;
-        if n == 0 {
-            break;
-        }
-        let written = buf.append(&chunk[..n]);
-        if written != n {
-            anyhow::bail!("RAM 物化写入不完整（{written}/{n}），文件在读取期间增长?");
-        }
-    }
-    buf.mark_fully_loaded();
-    // mlock 失败（EPERM）降级为普通内存，lock_memory 内部已带 warn 日志
-    let _ = buf.lock_memory();
-    tracing::info!(path, len, "曲目已物化进 RAM，播放期零磁盘 IO");
-    Ok(Some(buf))
 }
 
 /// CUE 虚拟轨必须先经曲库解析为物理分段格式。查库失败/缺母版路径直接报错，
@@ -753,7 +742,8 @@ fn probe_direct_source(
     // ENOENT（ram_preload 开启时 CUE 轨加载直接 500，已实测复现）；超上限
     // /物化失败回退路径模式。设备无 swap，memfd 页面即常驻 RAM
     let mut local_preload: Option<DirectInput> = None;
-    if ram.is_none() && !is_http && !is_dsd && ram_preload {
+    let can_preload_dsd = is_dsd && is_memory_safe_native_dsd_source(source_for_direct);
+    if ram.is_none() && !is_http && (!is_dsd || can_preload_dsd) && ram_preload {
         let preload_physical = audio_engine_core::cue::parse_cue_virtual_path(source_for_direct)
             .map(|cue| cue.physical_path)
             .unwrap_or_else(|| source_for_direct.to_owned());
@@ -1079,6 +1069,27 @@ fn full_reconnect_load(
             load_token,
             token,
         )?
+    } else if is_native_dsd_source(source_for_direct)
+        && matches!(physical_source.as_ref(), Some(DirectInput::Memfd { .. }))
+    {
+        // 本地和在线 DSF/DFF 的 memfd 物化都通过 Native DSD Reader 打开；
+        // 不能把没有扩展名的 /proc/self/fd/N 交给 open_local，否则会被误判为 PCM。
+        let fd_path = match physical_source.as_ref().expect("分支已匹配 Memfd") {
+            DirectInput::Memfd { path, .. } => path.clone(),
+            _ => unreachable!("matches! 已收窄"),
+        };
+        let file = std::fs::File::open(&fd_path)
+            .with_context(|| format!("重开 DSD memfd 物化产物失败: {fd_path}"))?;
+        let reader = audio_engine_core::direct_dsd::DirectDsdReader::open_reader(file)?;
+        audio_engine_core::direct_runtime::DirectPlayback::open_dsd_reader_verified(
+            selector,
+            source_for_direct,
+            reader,
+            metadata.duration_secs,
+            auto_play,
+            load_token,
+            token,
+        )?
     } else if !is_http_source && matches!(physical_source.as_ref(), Some(DirectInput::Memfd { .. }))
     {
         // 本地 memfd 物化：经路径重新打开（全新 fd，读位置从 0 开始；try_clone
@@ -1345,6 +1356,7 @@ fn regular_load_worker(
     cover_dir: Option<String>,
     handle: audio_engine_core::HttpCancelHandle,
     ram_preload: bool,
+    online_preload: bool,
     ram_max_bytes: usize,
     load_token: Arc<std::sync::atomic::AtomicU64>,
     token: u64,
@@ -1371,22 +1383,49 @@ fn regular_load_worker(
             let _ = h.join();
         }
     }
-    // L2 纯内存播放：本地 PCM/CUE 源整曲物化进 RAM 后交解码器
-    // （SACD ISO 虚拟轨与在线源维持既有通道；超上限回退路径模式）
+    // L2 纯内存播放：本地 PCM/CUE 或 preload 模式的在线源先物化，再交给解码器。
+    // 用户选择 stream 时保留边下边播；超上限或物化失败回退原路径。
     let is_http =
         source_for_decoder.starts_with("http://") || source_for_decoder.starts_with("https://");
     let is_sacd_virtual =
         audio_engine_core::sacd::parse_sacd_virtual_path(&source_for_decoder).is_some();
-    let prepared = if ram_preload && !is_http && !is_sacd_virtual {
-        let physical = audio_engine_core::cue::parse_cue_virtual_path(&source_for_decoder)
-            .map(|cue| cue.physical_path)
-            .unwrap_or_else(|| source_for_decoder.clone());
-        match materialize_ram_buffer(&physical, ram_max_bytes)? {
-            Some(ram) => audio_engine_core::decoder::prepare_decode_from_ram(
-                ram,
-                &source_for_decoder,
-                cover_dir.as_deref(),
-            )?,
+    let prepared = if ram_preload && (!is_http || online_preload) && !is_sacd_virtual {
+        let materialized = if is_http {
+            match materialize_direct_input(&source_for_decoder, &handle, || {
+                load_token.load(std::sync::atomic::Ordering::Acquire) != token
+            }) {
+                Ok(input) => Some(input),
+                Err(error) => {
+                    if load_token.load(std::sync::atomic::Ordering::Acquire) != token {
+                        anyhow::bail!(LoadSuperseded);
+                    }
+                    tracing::warn!(
+                        source = %source_for_decoder,
+                        %error,
+                        "在线音源无法完成内存物化，回退流式解码"
+                    );
+                    None
+                }
+            }
+        } else {
+            let physical = audio_engine_core::cue::parse_cue_virtual_path(&source_for_decoder)
+                .map(|cue| cue.physical_path)
+                .unwrap_or_else(|| source_for_decoder.clone());
+            materialize_local_to_ram(&physical, ram_max_bytes as u64, || {
+                load_token.load(std::sync::atomic::Ordering::Acquire) != token
+            })?
+        };
+        match materialized {
+            Some(ram_input) => {
+                let open_path = ram_input.path().to_owned();
+                let file = std::fs::File::open(&open_path)
+                    .with_context(|| format!("打开 RAM 音源失败: {open_path}"))?;
+                audio_engine_core::decoder::prepare_decode_from_reader(
+                    file,
+                    &source_for_decoder,
+                    cover_dir.as_deref(),
+                )?
+            }
             None => audio_engine_core::decoder::prepare_decode(
                 &source_for_decoder,
                 cover_dir.as_deref(),
@@ -1565,6 +1604,7 @@ async fn finish_regular_load(
         ..
     } = reservation;
     let ram_preload = state.config.playback.ram_preload;
+    let online_preload = online_source_mode(state) != "stream";
     let ram_max_bytes = state.config.resolved_ram_preload_max_bytes();
 
     let result = spawn_isolated_blocking("player-load-worker", move || {
@@ -1573,6 +1613,7 @@ async fn finish_regular_load(
             cover_dir,
             handle,
             ram_preload,
+            online_preload,
             ram_max_bytes,
             load_token,
             token,

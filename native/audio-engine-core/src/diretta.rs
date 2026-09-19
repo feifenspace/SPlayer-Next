@@ -8,7 +8,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 
 #[cfg(any(feature = "diretta", test))]
-use crate::direct_dsd::DirectDsdFormat;
+use crate::direct_dsd::{DirectDsdFormat, DirectDsdReader};
 #[cfg(any(feature = "diretta", test))]
 use crate::direct_pcm::DirectPcmFormat;
 
@@ -595,6 +595,56 @@ mod imp {
             let target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
             let (mut source, actual_position) =
                 DirectDsdSource::open_local_at(path, position_secs)?;
+            let format = source.format();
+            let source_lsb_first = format.bit_order == DirectDsdBitOrder::LsbFirst;
+            let mut wire_lsb_first = source_lsb_first;
+            let raw = unsafe {
+                splayer_diretta_open_dsd_direct(
+                    target.as_ptr(),
+                    format.bit_rate,
+                    format.channels,
+                    source_lsb_first,
+                    &mut wire_lsb_first,
+                    source.callback_context(),
+                    direct_dsd_next_block,
+                    direct_dsd_release_block,
+                )
+            };
+            let raw = NonNull::new(raw)
+                .ok_or_else(|| last_error("failed to open Diretta Native DSD target"))?;
+            let wire_bit_order = if wire_lsb_first {
+                DirectDsdBitOrder::LsbFirst
+            } else {
+                DirectDsdBitOrder::MsbFirst
+            };
+            if wire_bit_order != format.bit_order {
+                if let Err(error) =
+                    source.set_wire_bit_order_while_paused(wire_bit_order, actual_position)
+                {
+                    unsafe { splayer_diretta_close(raw.as_ptr()) };
+                    return Err(anyhow!(
+                        "failed to adapt Native DSD wire bit order: {error}"
+                    ));
+                }
+            }
+            let connection = Self { raw, source };
+            connection.configure_drain_after_open(&format);
+            Ok((connection, actual_position))
+        }
+
+        /// 从已打开的 DSF/DFF Reader 建立 Native DSD 连接。Reader 入口用于
+        /// memfd 物化，避免依赖匿名 fd 的路径扩展名判断格式。
+        pub fn open_reader_at(
+            selector: &str,
+            reader: DirectDsdReader,
+            position_secs: f64,
+            _stop_file_secs: f64,
+        ) -> Result<(Self, f64)> {
+            let target = selector_target(selector)
+                .ok_or_else(|| anyhow!("invalid Diretta output selector"))?;
+            let target = CString::new(target).map_err(|_| anyhow!("invalid Diretta target id"))?;
+            let (mut source, actual_position) =
+                DirectDsdSource::open_reader_at(reader, position_secs)?;
             let format = source.format();
             let source_lsb_first = format.bit_order == DirectDsdBitOrder::LsbFirst;
             let mut wire_lsb_first = source_lsb_first;

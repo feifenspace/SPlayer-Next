@@ -55,7 +55,7 @@ const loadPage = async (reset = false, query = searchQuery.value): Promise<void>
   try {
     const api = window.api.library.getTracksPage;
     if (!api) return;
-    const res = await api(PAGE_SIZE, pageOffset.value, query, {
+    const res = await api(PAGE_SIZE, pageCursor.value ? 0 : pageOffset.value, query, {
       cursor: pageCursor.value ?? undefined,
       sort: "album",
       order: "asc",

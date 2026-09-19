@@ -244,12 +244,25 @@ pub fn prepare_decode_from_ram(
     source: &str,
     cover_cache_dir: Option<&str>,
 ) -> Result<PreparedDecoder> {
-    let mut reader = AudioReader::new(ram).context("打开 RAM 物化音源失败")?;
+    prepare_decode_from_reader(ram, source, cover_cache_dir)
+}
+
+/// 从已经打开的可定位内存源准备解码，供 Headless 的 memfd/内存缓存路径复用。
+/// `source` 只用于 CUE 定位、标签和封面解析，实际音频读取由传入的 Reader 完成。
+pub fn prepare_decode_from_reader<R>(
+    reader: R,
+    source: &str,
+    cover_cache_dir: Option<&str>,
+) -> Result<PreparedDecoder>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let mut reader = AudioReader::new(reader).context("打开内存音源失败")?;
     if let Some(cue) = crate::cue::parse_cue_virtual_path(source) {
         if cue.start_time > 0.0 {
             reader
                 .seek(Duration::from_secs_f64(cue.start_time), SeekMode::Accurate)
-                .with_context(|| format!("RAM 音源 CUE 定位失败: {source}"))?;
+                .with_context(|| format!("内存音源 CUE 定位失败: {source}"))?;
         }
     }
     prepare_from_opened(reader, None, source, cover_cache_dir)

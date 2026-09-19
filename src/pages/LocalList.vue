@@ -115,7 +115,12 @@ const loadPage = async (reset = false): Promise<void> => {
       hasMore.value = false;
       return;
     }
-    const res = await pageApi(PAGE_SIZE, offset.value, "", cursor.value ?? undefined);
+    const res = await pageApi(
+      PAGE_SIZE,
+      cursor.value ? 0 : offset.value,
+      "",
+      cursor.value ?? undefined,
+    );
     if (id !== requestId || !res.success || !res.data) return;
     total.value = res.data.total;
     offset.value += res.data.items.length;

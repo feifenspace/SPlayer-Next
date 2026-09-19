@@ -253,6 +253,11 @@ fn write_loop(
     let mut diag_last = std::time::Instant::now();
     let mut diag_writes: u64 = 0;
     let mut diag_frames: u64 = 0;
+    // 配置只在输出线程启动时读取一次；实时写循环内不做环境变量查询和字符串解析。
+    let watermark_ms = std::env::var("SPLAYER_ALSAMMAP_WATERMARK_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(HW_HIGH_WATERMARK_MS);
 
     // 暂停/停止时送数字静音：f32 静音帧（写入时按格式转换）
     macro_rules! fill_frame {
@@ -366,10 +371,6 @@ fn write_loop(
             let (buf, _per) = pcm.get_params()?;
             buf
         };
-        let watermark_ms = std::env::var("SPLAYER_ALSAMMAP_WATERMARK_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(HW_HIGH_WATERMARK_MS);
         let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
         let filled = buffer_frames.saturating_sub(avail as u64);
         let allowed = watermark_frames.saturating_sub(filled) as usize;
@@ -686,6 +687,10 @@ fn dsd_write_loop(
     let mut xrun_count: u64 = 0;
     // 源侧缓冲：read_block 输出进 staging，MMAP 写从 staging 消费
     let mut staging: Vec<u8> = Vec::with_capacity(DSD_WIRE_BUF_BYTES);
+    // 复用解码读取块，避免 DSD 写循环每次补充 staging 都重新分配 256 KiB。
+    // 该线程持续运行整个曲目，循环内分配会造成 allocator 抖动并增加长时间播放的
+    // 内存峰值；read_block 本身只写入前 n 字节，因此复用不会携带旧数据。
+    let mut read_chunk = vec![0u8; 256 * 1024];
     let mut staging_pos: usize = 0;
     let mut eof_signaled = false;
     // 位序适配：目标线序 MSB-first（kernel quirk bitrev=0）
@@ -694,6 +699,11 @@ fn dsd_write_loop(
         Ok("off") | Ok("0") => false,
         _ => reader.format().bit_order == crate::direct_dsd::DirectDsdBitOrder::LsbFirst,
     };
+    // 与 PCM 写循环一致，只在启动时读取一次水位配置。
+    let watermark_ms = std::env::var("SPLAYER_ALSAMMAP_WATERMARK_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(HW_HIGH_WATERMARK_MS);
     info!(need_bitrev, "ALSA DSD 位序适配（目标线序 MSB-first）");
 
     loop {
@@ -750,10 +760,6 @@ fn dsd_write_loop(
             let (buf, _per) = pcm.get_params()?;
             buf
         };
-        let watermark_ms = std::env::var("SPLAYER_ALSAMMAP_WATERMARK_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(HW_HIGH_WATERMARK_MS);
         let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
         let filled = buffer_frames.saturating_sub(avail as u64);
         let allowed = watermark_frames.saturating_sub(filled) as usize;
@@ -778,15 +784,14 @@ fn dsd_write_loop(
             staging.extend(std::iter::repeat(0x69).take(gap));
         }
         while staging.len() - staging_pos < need_bytes && !eof_signaled {
-            let mut chunk = vec![0u8; 256 * 1024];
-            match reader.read_block(&mut chunk) {
+            match reader.read_block(&mut read_chunk) {
                 Ok(Some(n)) => {
                     if need_bitrev {
-                        for byte in &mut chunk[..n] {
+                        for byte in &mut read_chunk[..n] {
                             *byte = byte.reverse_bits();
                         }
                     }
-                    staging.extend_from_slice(&chunk[..n]);
+                    staging.extend_from_slice(&read_chunk[..n]);
                 }
                 Ok(None) => {
                     eof_signaled = true;

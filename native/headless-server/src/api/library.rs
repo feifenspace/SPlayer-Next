@@ -195,13 +195,17 @@ pub(crate) async fn library_albums_page_handler(
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let offset = query.offset.unwrap_or(0);
     let conn = state.db.lock();
-    if query.cursor.is_some() {
-        let (items, total, next_cursor) = crate::db::get_album_page_cursor(&conn, query.q.as_deref(), limit, query.cursor.as_deref())?;
-        return Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": next_cursor, "hasMore": next_cursor.is_some() }))));
-    }
-    let (items, total) = crate::db::get_album_page(&conn, query.q.as_deref(), limit, offset)?;
-    let item_count = items.len() as u64;
-    Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": null, "hasMore": offset.saturating_add(item_count) < total }))))
+    // 游标分页作为唯一分页协议；首请求 cursor 为空，后续请求使用上一页游标。
+    let (items, total, next_cursor) =
+        crate::db::get_album_page_cursor(&conn, query.q.as_deref(), limit, query.cursor.as_deref())?;
+    Ok(Json(PlayerResponse::ok(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "nextCursor": next_cursor,
+        "hasMore": next_cursor.is_some(),
+    }))))
 }
 
 /// 分页获取歌手聚合。
@@ -212,13 +216,17 @@ pub(crate) async fn library_artists_page_handler(
     let limit = query.limit.unwrap_or(200).clamp(1, 1000);
     let offset = query.offset.unwrap_or(0);
     let conn = state.db.lock();
-    if query.cursor.is_some() {
-        let (items, total, next_cursor) = crate::db::get_artist_page_cursor(&conn, query.q.as_deref(), limit, query.cursor.as_deref())?;
-        return Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": next_cursor, "hasMore": next_cursor.is_some() }))));
-    }
-    let (items, total) = crate::db::get_artist_page(&conn, query.q.as_deref(), limit, offset)?;
-    let item_count = items.len() as u64;
-    Ok(Json(PlayerResponse::ok(json!({ "items": items, "total": total, "limit": limit, "offset": offset, "nextCursor": null, "hasMore": offset.saturating_add(item_count) < total }))))
+    // 与专辑列表保持一致，游标是唯一分页位置。
+    let (items, total, next_cursor) =
+        crate::db::get_artist_page_cursor(&conn, query.q.as_deref(), limit, query.cursor.as_deref())?;
+    Ok(Json(PlayerResponse::ok(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "nextCursor": next_cursor,
+        "hasMore": next_cursor.is_some(),
+    }))))
 }
 
 /// 获取音乐库全部专辑聚合

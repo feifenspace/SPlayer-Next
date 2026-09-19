@@ -1087,12 +1087,12 @@ pub fn get_tracks_page_advanced(
         let rows = if sort_column == "sample_rate" {
             let key = page_cursor.key.parse::<i64>().unwrap_or(0);
             stmt.query_map(
-                params![q, codec, sample_rate, key, page_cursor.id, fetch_limit, offset],
+                params![q, codec, sample_rate, key, page_cursor.id, fetch_limit, 0],
                 row_to_track,
             )?
         } else {
             stmt.query_map(
-                params![q, codec, sample_rate, page_cursor.key, page_cursor.id, fetch_limit, offset],
+                params![q, codec, sample_rate, page_cursor.key, page_cursor.id, fetch_limit, 0],
                 row_to_track,
             )?
         };
@@ -1155,17 +1155,18 @@ pub fn get_album_page_cursor(
         &format!("SELECT COUNT(*) FROM (SELECT album FROM tracks WHERE {base} GROUP BY album)"),
         params![q], |row| row.get(0))?;
     let condition = if cursor.is_some() { " AND album > ?2" } else { "" };
+    let fetch_limit = limit.saturating_add(1);
     let limit_param = if cursor.is_some() { "?3" } else { "?2" };
     let sql = format!("SELECT album, MAX(cover), MAX(artist), COUNT(*) FROM tracks WHERE {base}{condition} GROUP BY album ORDER BY album ASC LIMIT {limit_param}");
     let mut stmt = conn.prepare(&sql)?;
     let mut items = Vec::new();
     if let Some(c) = cursor {
-        let rows = stmt.query_map(params![q, c, limit], |row| Ok(AlbumSummary {
+        let rows = stmt.query_map(params![q, c, fetch_limit], |row| Ok(AlbumSummary {
             name: row.get(0)?, cover: normalize_cover_url(row.get(1)?), artist: row.get(2)?, track_count: row.get(3)?,
         }))?;
         for row in rows { items.push(row?); }
     } else {
-        let rows = stmt.query_map(params![q, limit], |row| Ok(AlbumSummary {
+        let rows = stmt.query_map(params![q, fetch_limit], |row| Ok(AlbumSummary {
             name: row.get(0)?, cover: normalize_cover_url(row.get(1)?), artist: row.get(2)?, track_count: row.get(3)?,
         }))?;
         for row in rows { items.push(row?); }
@@ -1187,17 +1188,18 @@ pub fn get_artist_page_cursor(
         &format!("SELECT COUNT(*) FROM (SELECT artist FROM tracks WHERE {base} GROUP BY artist)"),
         params![q], |row| row.get(0))?;
     let condition = if cursor.is_some() { " AND artist > ?2" } else { "" };
+    let fetch_limit = limit.saturating_add(1);
     let limit_param = if cursor.is_some() { "?3" } else { "?2" };
     let sql = format!("SELECT artist, COUNT(*) FROM tracks WHERE {base}{condition} GROUP BY artist ORDER BY artist ASC LIMIT {limit_param}");
     let mut stmt = conn.prepare(&sql)?;
     let mut items = Vec::new();
     if let Some(c) = cursor {
-        let rows = stmt.query_map(params![q, c, limit], |row| Ok(ArtistSummary {
+        let rows = stmt.query_map(params![q, c, fetch_limit], |row| Ok(ArtistSummary {
             name: row.get(0)?, track_count: row.get(1)?,
         }))?;
         for row in rows { items.push(row?); }
     } else {
-        let rows = stmt.query_map(params![q, limit], |row| Ok(ArtistSummary {
+        let rows = stmt.query_map(params![q, fetch_limit], |row| Ok(ArtistSummary {
             name: row.get(0)?, track_count: row.get(1)?,
         }))?;
         for row in rows { items.push(row?); }

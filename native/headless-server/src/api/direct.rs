@@ -4,8 +4,11 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{extract::State, Json};
 use serde::Deserialize;
@@ -105,6 +108,97 @@ impl DirectInput {
             Self::Path(path) => path,
         }
     }
+
+    /// 为缓存中的物化源创建一个新的 fd 锚点，避免播放方与缓存方共享读指针。
+    fn duplicate_anchor(&self) -> anyhow::Result<Self> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Memfd { file, path } => {
+                // try_clone() 共享 open-file description 的偏移；缓存源可能
+                // 停在写入后的 EOF，取出时必须显式回到文件起点。
+                let mut cloned = file.try_clone()?;
+                cloned.seek(SeekFrom::Start(0))?;
+                Ok(Self::Memfd {
+                    file: cloned,
+                    path: path.clone(),
+                })
+            },
+            Self::Path(path) => Ok(Self::Path(path.clone())),
+        }
+    }
+}
+
+struct CachedDirectInput {
+    input: DirectInput,
+    bytes: u64,
+    last_used: u64,
+}
+
+static MATERIALIZED_INPUT_CACHE: OnceLock<Mutex<HashMap<String, CachedDirectInput>>> =
+    OnceLock::new();
+static MATERIALIZED_INPUT_CACHE_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+fn materialized_input_cache() -> &'static Mutex<HashMap<String, CachedDirectInput>> {
+    MATERIALIZED_INPUT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_input(key: &str) -> anyhow::Result<Option<DirectInput>> {
+    let mut cache = materialized_input_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("物化音源缓存锁已中毒"))?;
+    let entry = cache.get_mut(key);
+    entry
+        .map(|entry| {
+            let bytes = entry.bytes;
+            entry.last_used = MATERIALIZED_INPUT_CACHE_CLOCK
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let input = entry.input.duplicate_anchor();
+            if input.is_ok() {
+                tracing::debug!(bytes, "物化音源缓存命中");
+            }
+            input
+        })
+        .transpose()
+}
+
+fn cache_input(key: String, input: &DirectInput, bytes: u64) -> anyhow::Result<()> {
+    // 复用缓存只保留有限的物化源，避免后台缓存绕过播放配置的内存约束。
+    const CACHE_MAX_BYTES: u64 = DIRECT_PRELOAD_MAX_BYTES;
+    let mut cache = materialized_input_cache()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("物化音源缓存锁已中毒"))?;
+    if bytes > CACHE_MAX_BYTES {
+        return Ok(());
+    }
+    if let Some(previous) = cache.remove(&key) {
+        drop(previous);
+    }
+    cache.insert(
+        key,
+        CachedDirectInput {
+            input: input.duplicate_anchor()?,
+            bytes,
+            last_used: MATERIALIZED_INPUT_CACHE_CLOCK
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1),
+        },
+    );
+    let mut total_bytes: u64 = cache.values().map(|entry| entry.bytes).sum();
+    while cache.len() > 2 || total_bytes > CACHE_MAX_BYTES {
+        let victim = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone());
+        if let Some(victim) = victim {
+            if let Some(entry) = cache.remove(&victim) {
+                total_bytes = total_bytes.saturating_sub(entry.bytes);
+            }
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// 本地音源整曲物化进 memfd 纯内存缓存（L2 纯内存：handoff/stage/full-reconnect
@@ -128,6 +222,19 @@ pub(crate) fn materialize_local_to_ram(
         return Ok(None);
     }
 
+    let modified = source
+        .metadata()?
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let cache_key = format!("local:{path}:{len}:{modified}:{max_bytes}");
+    if let Some(input) = cached_input(&cache_key)? {
+        tracing::debug!(path, len, "复用已物化的本地内存音源");
+        return Ok(Some(input));
+    }
+
     #[cfg(target_os = "linux")]
     match create_memfd_file() {
         Ok((mut file, fd_path)) => {
@@ -143,6 +250,16 @@ pub(crate) fn materialize_local_to_ram(
                 file.write_all(&chunk[..n])?;
             }
             file.flush()?;
+            if let Err(error) = cache_input(
+                cache_key,
+                &DirectInput::Memfd {
+                    file: file.try_clone()?,
+                    path: fd_path.clone(),
+                },
+                len,
+            ) {
+                tracing::warn!(path, %error, "本地音源缓存登记失败，继续使用当前物化源");
+            }
             tracing::info!(path, len, fd_path = %fd_path, "本地音源已物化进 memfd 纯内存缓存");
             return Ok(Some(DirectInput::Memfd { file, path: fd_path }));
         }
@@ -257,6 +374,11 @@ pub(crate) fn materialize_direct_input(
     clean_old_stream_cache(&cache_dir);
 
     let hash = format!("{:x}", md5::compute(url.as_bytes()));
+    let cache_key = format!("url:{url}:{DIRECT_PRELOAD_MAX_BYTES}");
+    if let Some(input) = cached_input(&cache_key)? {
+        tracing::debug!(url = %url, "复用已物化的在线内存音源");
+        return Ok(input);
+    }
     let mut ext = if url.contains(".flac") {
         "flac"
     } else if url.contains(".mp3") {
@@ -280,7 +402,16 @@ pub(crate) fn materialize_direct_input(
                 .map(|m| m.len() > 0)
                 .unwrap_or(false)
         {
-            return Ok(DirectInput::Path(target_file.to_string_lossy().to_string()));
+            let cached_path = target_file.to_string_lossy().to_string();
+            if let Some(input) = materialize_local_to_ram(
+                &cached_path,
+                DIRECT_PRELOAD_MAX_BYTES,
+                || abort(),
+            )? {
+                tracing::debug!(path = %cached_path, "在线磁盘缓存已转入 memfd 纯内存播放");
+                return Ok(input);
+            }
+            return Ok(DirectInput::Path(cached_path));
         }
     }
 
@@ -351,7 +482,16 @@ pub(crate) fn materialize_direct_input(
             .map(|m| m.len() > 0)
             .unwrap_or(false)
     {
-        return Ok(DirectInput::Path(target_file.to_string_lossy().to_string()));
+        let cached_path = target_file.to_string_lossy().to_string();
+        if let Some(input) = materialize_local_to_ram(
+            &cached_path,
+            DIRECT_PRELOAD_MAX_BYTES,
+            || abort(),
+        )? {
+            tracing::debug!(path = %cached_path, "在线磁盘缓存已转入 memfd 纯内存播放");
+            return Ok(input);
+        }
+        return Ok(DirectInput::Path(cached_path));
     }
 
     // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO）。仅 memfd
@@ -367,6 +507,16 @@ pub(crate) fn materialize_direct_input(
                     anyhow::bail!("在线音源超过 preload 大小上限 {DIRECT_PRELOAD_MAX_BYTES} 字节");
                 }
                 file.flush()?;
+                if let Err(error) = cache_input(
+                    cache_key,
+                    &DirectInput::Memfd {
+                        file: file.try_clone()?,
+                        path: path.clone(),
+                    },
+                    written,
+                ) {
+                    tracing::warn!(url = %url, %error, "在线音源缓存登记失败，继续使用当前物化源");
+                }
                 tracing::info!(url = %url, path = %path, written, "在线音源已下载至 memfd 纯内存缓存");
                 return Ok(DirectInput::Memfd { file, path });
             }

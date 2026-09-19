@@ -81,7 +81,13 @@ impl DirectDsdReader {
             bail!("SACD ISO 需经曲库虚拟轨播放，不支持裸路径: {path_str}");
         }
 
-        let mut file = File::open(path).context("打开 Source Direct DSD 文件失败")?;
+        let file = File::open(path).context("打开 Source Direct DSD 文件失败")?;
+        Self::open_reader(file)
+    }
+
+    /// 从已经打开的可定位文件读取 DSF/DFF，供 memfd 等内存文件入口复用。
+    /// SACD ISO 仍必须通过 `open_local`，因为它需要虚拟轨道索引和 ISO 路径。
+    pub fn open_reader(mut file: File) -> Result<Self> {
         let file_len = usize::try_from(file.metadata()?.len()).context("DSD 文件过大")?;
         let mut magic = [0_u8; 4];
         file.read_exact(&mut magic).context("读取 DSD 文件头失败")?;
@@ -1480,7 +1486,16 @@ impl DirectDsdSource {
     }
 
     pub fn open_local_at(path: &Path, position_secs: f64) -> Result<(Self, f64)> {
-        let mut reader = DirectDsdReader::open_local(path)?;
+        let reader = DirectDsdReader::open_local(path)?;
+        Self::open_reader_at(reader, position_secs)
+    }
+
+    /// 从已经打开的可定位 Reader 创建 Native DSD source，供 memfd 等内存
+    /// 文件入口复用。Reader 必须是 DSF/DFF；SACD ISO 仍通过 open_local。
+    pub fn open_reader_at(
+        mut reader: DirectDsdReader,
+        position_secs: f64,
+    ) -> Result<(Self, f64)> {
         let duration_micros = (reader.duration_secs() * 1_000_000.0)
             .round()
             .clamp(0.0, u64::MAX as f64) as u64;
