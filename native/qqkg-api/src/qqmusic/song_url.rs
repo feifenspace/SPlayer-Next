@@ -212,13 +212,21 @@ impl QqmusicClient {
 
         // 1. 获取真实 media_mid 与服务端存在的各档位体积
         let (fetched_media_mid, sizes) = self.fetch_track_file(mid).await;
-        let media_mid = params
-            .get("mediaMid")
-            .or_else(|| params.get("media_mid"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&fetched_media_mid);
+        // CgiGetTrackInfo 返回的 media_mid 才是当前曲目在 vkey 文件名中的权威值。
+        // 前端传入的 mediaMid 可能来自旧搜索结果或缓存，优先使用它会导致
+        // Hi-Res 文件名匹配失败，随后被误判为“只有 Lossless 可用”。
+        // 只有上游没有返回真实 media_mid 时，才退回请求参数中的值。
+        let media_mid = if fetched_media_mid != mid {
+            fetched_media_mid.as_str()
+        } else {
+            params
+                .get("mediaMid")
+                .or_else(|| params.get("media_mid"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&fetched_media_mid)
+        };
 
         let has_size_info = !sizes.is_empty();
 

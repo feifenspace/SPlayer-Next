@@ -51,11 +51,33 @@ export interface QMPlaylistItem {
   trackCount?: number;
 }
 
+const QQ_IMAGE_HOST_RE = /(^|\.)gtimg\.cn$/i;
+
+const proxyQqImage = (url: string | undefined): string | undefined => {
+  if (!url) return undefined;
+  try {
+    const parsed = new URL(url);
+    if (
+      (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      QQ_IMAGE_HOST_RE.test(parsed.hostname)
+    ) {
+      return `/api/proxy/image?url=` + encodeURIComponent(url);
+    }
+  } catch {
+    // 保留无法解析的原始 URL，由图片组件自行处理。
+  }
+  return url;
+};
+
 export const qqAlbumCover = (mid: string, size = 300): string =>
-  `https://y.gtimg.cn/music/photo_new/T002R${size}x${size}M000${mid}.jpg`;
+  proxyQqImage(
+    `https://y.gtimg.cn/music/photo_new/T002R` + size + `x` + size + `M000` + mid + `.jpg`,
+  ) ?? "";
 
 export const qqArtistCover = (mid: string, size = 300): string =>
-  `https://y.gtimg.cn/music/photo_new/T001R${size}x${size}M000${mid}.jpg`;
+  proxyQqImage(
+    `https://y.gtimg.cn/music/photo_new/T001R` + size + `x` + size + `M000` + mid + `.jpg`,
+  ) ?? "";
 
 /**
  * 将 QM 付费标识转换为应用层等级
@@ -109,7 +131,8 @@ const qqTrackQuality = (song: QMSong): { quality: AudioQuality; fileSize: number
 };
 
 export const qqSongToTrack = (song: QMSong): Track => {
-  const cover = song.cover || (song.albumMid ? qqAlbumCover(song.albumMid) : undefined);
+  const cover =
+    proxyQqImage(song.cover) || (song.albumMid ? qqAlbumCover(song.albumMid) : undefined);
   const audio = qqTrackQuality(song);
   return {
     id: song.mid || song.id,
@@ -129,7 +152,8 @@ export const qqSongToTrack = (song: QMSong): Track => {
     fee: qqTrackFee(song),
     cover,
     coverOriginal:
-      song.coverOriginal || (song.albumMid ? qqAlbumCover(song.albumMid, 800) : undefined),
+      proxyQqImage(song.coverOriginal) ||
+      (song.albumMid ? qqAlbumCover(song.albumMid, 800) : undefined),
   };
 };
 
