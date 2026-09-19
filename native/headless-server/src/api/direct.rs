@@ -113,15 +113,23 @@ impl DirectInput {
     fn duplicate_anchor(&self) -> anyhow::Result<Self> {
         match self {
             #[cfg(target_os = "linux")]
-            Self::Memfd { file, path } => {
+            Self::Memfd { file, .. } => {
                 // try_clone() 共享 open-file description 的偏移；缓存源可能
                 // 停在写入后的 EOF，取出时必须显式回到文件起点。
                 let mut cloned = file.try_clone()?;
                 cloned.seek(SeekFrom::Start(0))?;
-                Ok(Self::Memfd {
-                    file: cloned,
-                    path: path.clone(),
-                })
+                // /proc/self/fd/N 绑定的是具体 fd。不能继续使用旧
+                // DirectInput 的 path，否则旧锚点释放后缓存命中会得到 ENOENT。
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::fd::AsRawFd;
+                    let path = format!("/proc/self/fd/{}", cloned.as_raw_fd());
+                    return Ok(Self::Memfd { file: cloned, path });
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    unreachable!("Memfd 仅在 Linux 上可用");
+                }
             },
             Self::Path(path) => Ok(Self::Path(path.clone())),
         }
