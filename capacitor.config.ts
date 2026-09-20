@@ -13,7 +13,7 @@ type AndroidCapacitorConfig = CapacitorConfig & {
 
 const config: AndroidCapacitorConfig = {
   appId: "top.imsyy.splayer_next",
-  appName: "SPlayer Next",
+  appName: "SPlayer-Next-Headless-Android",
   webDir: "dist/capacitor",
   backgroundColor: "#00000000",
   // 关闭 Capacitor 的事件冗余日志（playbackStateChanged / progressChanged 等 10Hz 推送会刷屏）

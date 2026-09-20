@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">SPlayer Next</string>
-    <string name="title_activity_main">SPlayer Next</string>
+    <string name="app_name">SPlayer-Next-Headless-Android</string>
+    <string name="title_activity_main">SPlayer-Next-Headless-Android</string>
 
     <!-- Android 12+ 隐私归因标签，AndroidManifest.xml 的 <attribution> 引用 -->
     <string name="attribution_playback">媒体播放与通知栏控制</string>

@@ -1,8 +1,8 @@
 <div align="center">
 
-<img alt="SPlayer for Android Next logo" width="120" height="120" src="public/icons/logo-next.png" />
+<img alt="SPlayer-Next-Headless-Android logo" width="120" height="120" src="public/icons/logo-next.png" />
 
-<h2>SPlayer for Android Next</h2>
+<h2>SPlayer-Next-Headless-Android</h2>
 
 <p>🎵 现代化的 Android 移动端音乐播放器，基于 Capacitor + Vue 3 构建</p>
 
@@ -38,7 +38,7 @@
 
 ## 项目简介
 
-**SPlayer for Android Next** 是专为 Android 移动平台打造的新一代现代化音乐播放器。
+**SPlayer-Next-Headless-Android** 是专为 Android 移动平台打造的新一代现代化音乐播放器。
 
 项目基于 **Capacitor + Vue 3 + TypeScript** 架构构建，通过深度定制的 Android 原生插件桥接操作系统底层能力：
 
@@ -130,7 +130,7 @@ pnpm android:format   # Kotlin 代码格式化 (ktlintFormat)
 
 ## 致谢
 
-特别感谢以下让 SPlayer for Android Next 成为可能的开源项目与技术：
+特别感谢以下让 SPlayer-Next-Headless-Android 成为可能的开源项目与技术：
 
 - [Capacitor](https://capacitorjs.com/) —— 跨平台移动混合开发框架
 - [Media3 / ExoPlayer](https://github.com/androidx/media) —— 强大的 Android 媒体播放引擎

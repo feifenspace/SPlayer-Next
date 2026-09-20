@@ -1,8 +1,8 @@
 <div align="center">
 
-<img alt="SPlayer for Android Next logo" width="120" height="120" src="public/icons/logo-next.png" />
+<img alt="SPlayer-Next-Headless-Android logo" width="120" height="120" src="public/icons/logo-next.png" />
 
-<h2>SPlayer for Android Next</h2>
+<h2>SPlayer-Next-Headless-Android</h2>
 
 <p>🎵 Modern Android mobile music player built with Capacitor + Vue 3</p>
 
@@ -38,7 +38,7 @@
 
 ## Overview
 
-**SPlayer for Android Next** is a next-generation modern music player tailored specifically for the Android mobile platform.
+**SPlayer-Next-Headless-Android** is a next-generation modern music player tailored specifically for the Android mobile platform.
 
 The project is built on **Capacitor + Vue 3 + TypeScript**, bridging low-level operating system capabilities through customized Android native plugins:
 

@@ -1,4 +1,4 @@
-# SPlayer-for-Android-Next 开发路线图（Roadmap）
+# SPlayer-Next-Headless-Android 开发路线图（Roadmap）
 
 > 本文档维护 Android 端的后续开发方案：安全加固、工程优化、桌面能力迁移与协作治理约定。
 > 状态随 PR / issue 更新；变更请通过 PR 修改本文件。

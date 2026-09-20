@@ -1,6 +1,6 @@
 {
-  "name": "splayer-for-android-next",
-  "productName": "SPlayer-for-Android-Next",
+  "name": "splayer-next-headless-android",
+  "productName": "SPlayer-Next-Headless-Android",
   "version": "1.2.0-alpha.1",
   "description": "Modern Android music player featuring rich lyrics display and extensive audio format support",
   "type": "module",

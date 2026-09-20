@@ -28,7 +28,7 @@ object ExternalApiRouter {
     return when (uri) {
       "/api/external/info" -> {
         val res = JSONObject()
-        res.put("name", "SPlayer Next")
+        res.put("name", "SPlayer-Next-Headless-Android")
         try {
           val pkgInfo = context.packageManager.getPackageInfo(context.packageName, 0)
           res.put("version", pkgInfo.versionName ?: "unknown")
