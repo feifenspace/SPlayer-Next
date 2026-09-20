@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use crate::audio_output::OutputFailureCallback;
 use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
-use crate::source::DecoderSource;
+use crate::source::{DecoderSource, IntegerDecoderSource};
 
 /// 全进程累计 XRUN 计数（B9.6）：供 B2.2 观测钩子周期采样，
 /// 汇入 §六.2 拷机判据（xrun_count=0）
@@ -36,6 +36,65 @@ pub fn xrun_total() -> u64 {
 const MAX_CONTIGUOUS_ERRORS: u32 = 50;
 /// 设备事件等待上限（毫秒）：决定 play/pause 指令的响应延迟上界
 const WAIT_CEILING_MS: u32 = 50;
+
+/// 等待已经提交给 ALSA DMA 的旧音频自然播放完，再释放 PCM。
+///
+/// 直接 drop 会截断 hw/appl queue 的尾部，跨曲目或跨采样率重建时容易
+/// 把截断边沿送到 DAC。这里不再写入新数据，只等待硬件消耗现有队列；
+/// 上限保证设备异常时停止不会卡死。
+fn drain_before_drop(pcm: &PCM, format: Format, hardware_paused: bool, rate: u32) {
+    if hardware_paused {
+        return;
+    }
+
+    // 模仿 Diretta 的 pre-mute：在旧 DMA 队列后追加一小段数字静音，
+    // 让 DAC 在关闭/重配前回到零电平，而不是停在最后一个真实样本上。
+    let mut remaining = (rate as usize / 200).max(1); // 5 ms
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while remaining > 0 && std::time::Instant::now() < deadline {
+        let avail = match pcm.avail_update() {
+            Ok(avail) => avail as usize,
+            Err(_) => break,
+        };
+        if avail == 0 {
+            let _ = pcm.wait(Some(WAIT_CEILING_MS));
+            continue;
+        }
+        let frames = avail.min(remaining).min(4096);
+        let written = if format == Format::s16() {
+            match pcm.io_i16().and_then(|io| io.mmap(frames, |buf: &mut [i16]| {
+                buf.fill(0);
+                frames
+            })) {
+                Ok(n) => n,
+                Err(_) => break,
+            }
+        } else if format == Format::s24() {
+            match pcm.io_i32_s24().and_then(|io| io.mmap(frames, |buf: &mut [i32]| {
+                    buf.fill(0);
+                    frames
+                })) {
+                Ok(n) => n,
+                Err(_) => break,
+            }
+        } else {
+            match pcm.io_i32().and_then(|io| io.mmap(frames, |buf: &mut [i32]| {
+                buf.fill(0);
+                frames
+            })) {
+                Ok(n) => n,
+                Err(_) => break,
+            }
+        };
+        remaining = remaining.saturating_sub(written);
+    }
+
+    if remaining > 0 {
+        warn!(remaining, rate, "ALSA MMAP 停止静音垫未完全写入，回退强制释放");
+    } else if let Err(error) = pcm.drain() {
+        warn!(%error, rate, "ALSA MMAP 正常 drain 失败，回退强制释放");
+    }
+}
 
 /// hw buffer 预填高水位（毫秒）。写循环每轮只把 hw 已填水位补到该上限，
 /// 而非"有空间就灌"：消费节奏贴回真实时，解码 Shared 队列得以保留网络
@@ -190,6 +249,53 @@ impl AlsaMmapStream {
         ))
     }
 
+    /// 打开整数 PCM 写入线程。只由后续位纯真路径调用；现有 f32 open 保持不变。
+    pub fn open_integer(
+        device: &str,
+        requested_sample_rate: Option<u32>,
+        source: IntegerDecoderSource,
+        volume: Arc<AtomicU32>,
+        stopped: Arc<AtomicBool>,
+        on_failure: OutputFailureCallback,
+    ) -> Result<(Self, u32, u16)> {
+        let (_, _, rate, channels, _) = open_pcm(device, requested_sample_rate)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let device_owned = device.to_string();
+        let worker_stop = Arc::clone(&stop);
+        let worker_paused = Arc::clone(&paused);
+        let worker = std::thread::Builder::new()
+            .name("alsa-mmap-output-i32".into())
+            .spawn(move || {
+                boost_current_audio_thread("alsa-mmap-output-i32");
+                bind_current_thread_to_performance_cores("alsa-mmap-output-i32");
+                if let Err(error) = write_loop_integer(
+                    &device_owned,
+                    requested_sample_rate,
+                    source,
+                    volume,
+                    stopped,
+                    worker_paused,
+                    worker_stop,
+                    on_failure,
+                ) {
+                    warn!(error = %error, "ALSA MMAP i32 写循环退出");
+                }
+            })
+            .context("启动 ALSA MMAP i32 写循环线程失败")?;
+        Ok((
+            Self {
+                stop,
+                paused,
+                worker: Some(worker),
+                sample_rate: rate,
+                channels,
+            },
+            rate,
+            channels,
+        ))
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -230,6 +336,9 @@ fn write_loop(
     on_failure: OutputFailureCallback,
 ) -> Result<()> {
     let (pcm, format, rate, _channels, can_pause) = open_pcm(device, requested_rate)?;
+    // ALSA hw 参数在本次流的生命周期内保持不变。提前缓存 buffer_frames，
+    // 避免实时写循环每轮再次进入 ALSA 控制层查询参数。
+    let (buffer_frames, _period_frames) = pcm.get_params()?;
     // v9e 诊断：一次性打印协商几何 + 启动阈值
     {
         let (buf, per) = pcm.get_params()?;
@@ -246,6 +355,9 @@ fn write_loop(
         );
     }
     let mut hardware_paused = false;
+    let mut pause_draining = false;
+    let mut pause_silence_remaining = 0usize;
+    let mut startup_silence_remaining = (rate as usize / 200).max(1); // 5 ms
     let mut contiguous_errors: u32 = 0;
     let mut xrun_count: u64 = 0;
     // v9e 诊断：状态轨迹（前 15s 或非 Running 时每秒一条）
@@ -258,14 +370,24 @@ fn write_loop(
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(HW_HIGH_WATERMARK_MS);
+    let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
 
     // 暂停/停止时送数字静音：f32 静音帧（写入时按格式转换）
     macro_rules! fill_frame {
         ($frame:expr) => {{
             let gain = f32::from_bits(volume.load(Ordering::Relaxed));
-            if stopped.load(Ordering::Acquire) || paused.load(Ordering::Acquire) {
+            if startup_silence_remaining > 0 {
                 $frame[0] = 0.0;
                 $frame[1] = 0.0;
+                startup_silence_remaining -= 1;
+            } else if stopped.load(Ordering::Acquire) || paused.load(Ordering::Acquire) {
+                $frame[0] = 0.0;
+                $frame[1] = 0.0;
+            } else if gain.to_bits() == 1.0_f32.to_bits() {
+                // 100% 音量是 ALSA MMAP 位纯真门槛；跳过无意义的 f32 乘法，
+                // 保持解码器输出到容器转换之间最短的样本路径。
+                $frame[0] = source.next().unwrap_or(0.0);
+                $frame[1] = source.next().unwrap_or(0.0);
             } else {
                 $frame[0] = source.next().map(|v| v * gain).unwrap_or(0.0);
                 $frame[1] = source.next().map(|v| v * gain).unwrap_or(0.0);
@@ -275,24 +397,43 @@ fn write_loop(
 
     loop {
         if stop.load(Ordering::Acquire) {
+            drain_before_drop(&pcm, format, hardware_paused, rate);
             let _ = pcm.drop();
-            info!(xrun_count, "ALSA MMAP 写循环停止");
+            info!(xrun_count, "ALSA MMAP 写循环停止（已排空旧 DMA 队列）");
             return Ok(());
         }
 
         let want_paused = paused.load(Ordering::Acquire);
-        if want_paused != hardware_paused {
-            if can_pause {
-                if pcm.pause(want_paused).is_ok() {
-                    hardware_paused = want_paused;
-                }
-            } else if want_paused {
-                let _ = pcm.drop();
-                hardware_paused = true;
-            } else {
-                pcm.prepare()?;
-                hardware_paused = false;
+        if want_paused && !hardware_paused && can_pause {
+            // 不在任意一个非零样本处直接冻结 ALSA。先让写循环补一小段
+            // 0 PCM，再等待旧 DMA 队列排空，最后才 pause 硬件。
+            if !pause_draining {
+                pause_draining = true;
+                pause_silence_remaining = (rate as usize / 200).max(1); // 5 ms
             }
+            if pause_silence_remaining == 0 {
+                let delay = pcm.status().map(|s| s.get_delay()).unwrap_or(0);
+                if delay <= 0 {
+                    if pcm.pause(true).is_ok() {
+                        hardware_paused = true;
+                        pause_draining = false;
+                    }
+                } else {
+                    let _ = pcm.wait(Some(WAIT_CEILING_MS));
+                    continue;
+                }
+            }
+        } else if !want_paused {
+            pause_draining = false;
+            pause_silence_remaining = 0;
+            if hardware_paused {
+                if pcm.pause(false).is_ok() {
+                    hardware_paused = false;
+                }
+            }
+        } else if want_paused && !can_pause {
+            let _ = pcm.drop();
+            hardware_paused = true;
         }
         if hardware_paused {
             // 设备时钟已冻结（原位 pause）：无数据可写，等指令即可
@@ -367,18 +508,16 @@ fn write_loop(
         // 高水位限速（v9e）：hw 已填水位 = buffer_frames - avail。每轮只补到
         // ~HW_HIGH_WATERMARK_MS 上限，多余供给滞留在 Shared 队列作网络缓冲垫。
         // pacing 只约束"何时写"，不碰样本路径——位纯真不受影响。
-        let buffer_frames = {
-            let (buf, _per) = pcm.get_params()?;
-            buf
-        };
-        let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
         let filled = buffer_frames.saturating_sub(avail as u64);
         let allowed = watermark_frames.saturating_sub(filled) as usize;
-        let frames = if watermark_ms == 0 {
+        let mut frames = if watermark_ms == 0 {
             avail.min(4096)
         } else {
             avail.min(4096).min(allowed)
         };
+        if pause_draining {
+            frames = frames.min(pause_silence_remaining);
+        }
         if frames == 0 {
             // 已填至高水位：hw 还在按真实时消耗，睡一小段再补。
             // 不能用 pcm.wait——它等的是 avail>=avail_min（周期级空闲），
@@ -431,6 +570,9 @@ fn write_loop(
                 contiguous_errors = 0;
                 diag_writes += 1;
                 diag_frames += n as u64;
+                if pause_draining {
+                    pause_silence_remaining = pause_silence_remaining.saturating_sub(n);
+                }
             }
             Err(err) => {
                 if pcm.state() == State::XRun {
@@ -469,8 +611,208 @@ fn write_loop(
     }
 }
 
-/// 整数源解码的 f32 归一化是除以 2^(n-1)，回写必须乘同系数：
-/// 乘 32767/8388607 会引入 0.003% 失真，破坏位纯真（§六.1 回录哈希不过）
+/// 整数 PCM 写入循环。单位增益时直接把 FFmpeg 的 S32 容器样本映射到
+/// ALSA 的 S32/S24/S16 容器；只有用户主动调节音量时才走 f32 增益分支。
+#[allow(clippy::too_many_arguments)]
+fn write_loop_integer(
+    device: &str,
+    requested_rate: Option<u32>,
+    mut source: IntegerDecoderSource,
+    volume: Arc<AtomicU32>,
+    stopped: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    on_failure: OutputFailureCallback,
+) -> Result<()> {
+    let (pcm, format, rate, _channels, can_pause) = open_pcm(device, requested_rate)?;
+    let (buffer_frames, _period_frames) = pcm.get_params()?;
+    let watermark_ms = std::env::var("SPLAYER_ALSAMMAP_WATERMARK_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(HW_HIGH_WATERMARK_MS);
+    let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
+    let mut hardware_paused = false;
+    let mut pause_draining = false;
+    let mut pause_silence_remaining = 0usize;
+    let mut startup_silence_remaining = (rate as usize / 200).max(1);
+    let mut contiguous_errors = 0_u32;
+    let mut xrun_count = 0_u64;
+
+    macro_rules! next_i32 {
+        () => {{
+            if startup_silence_remaining > 0 {
+                startup_silence_remaining -= 1;
+                0
+            } else if stopped.load(Ordering::Acquire) {
+                0
+            } else {
+            let sample = source.next().unwrap_or(0);
+            let gain = f32::from_bits(volume.load(Ordering::Relaxed));
+            if gain.to_bits() == 1.0_f32.to_bits() {
+                sample
+            } else {
+                (sample as f32 * gain).round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
+            }
+            }
+        }};
+    }
+
+    loop {
+        if stop.load(Ordering::Acquire) {
+            drain_before_drop(&pcm, format, hardware_paused, rate);
+            let _ = pcm.drop();
+            info!(xrun_count, "ALSA MMAP i32 写循环停止（已排空旧 DMA 队列）");
+            return Ok(());
+        }
+        let want_paused = paused.load(Ordering::Acquire);
+        if want_paused && !hardware_paused && can_pause {
+            if !pause_draining {
+                pause_draining = true;
+                pause_silence_remaining = (rate as usize / 200).max(1);
+            }
+            if pause_silence_remaining == 0 {
+                let delay = pcm.status().map(|s| s.get_delay()).unwrap_or(0);
+                if delay <= 0 {
+                    if pcm.pause(true).is_ok() {
+                        hardware_paused = true;
+                        pause_draining = false;
+                    }
+                } else {
+                    let _ = pcm.wait(Some(WAIT_CEILING_MS));
+                    continue;
+                }
+            }
+        } else if !want_paused {
+            pause_draining = false;
+            pause_silence_remaining = 0;
+            if hardware_paused {
+                if pcm.pause(false).is_ok() {
+                    hardware_paused = false;
+                }
+            }
+        } else if want_paused && !can_pause {
+            let _ = pcm.drop();
+            hardware_paused = true;
+        }
+        if hardware_paused {
+            std::thread::sleep(std::time::Duration::from_millis(WAIT_CEILING_MS as u64));
+            continue;
+        }
+        match pcm.state() {
+            State::Running | State::Prepared | State::Paused => {}
+            State::XRun => {
+                xrun_count += 1;
+                XRUN_TOTAL.fetch_add(1, Ordering::Release);
+                pcm.prepare()?;
+                continue;
+            }
+            State::Suspended => {
+                if pcm.resume().is_err() {
+                    pcm.prepare()?;
+                }
+                continue;
+            }
+            State::Open | State::Setup => {
+                pcm.prepare()?;
+                continue;
+            }
+            other => anyhow::bail!("ALSA 设备进入不可恢复状态: {other:?}"),
+        }
+        let avail = match pcm.avail_update() {
+            Ok(avail) => avail as usize,
+            Err(error) => {
+                if pcm.state() == State::XRun {
+                    xrun_count += 1;
+                    XRUN_TOTAL.fetch_add(1, Ordering::Release);
+                    pcm.prepare()?;
+                    continue;
+                }
+                contiguous_errors += 1;
+                if contiguous_errors >= MAX_CONTIGUOUS_ERRORS {
+                    on_failure();
+                    anyhow::bail!("ALSA i32 连续错误超限（last: {error}）");
+                }
+                continue;
+            }
+        };
+        if avail == 0 {
+            let _ = pcm.wait(Some(WAIT_CEILING_MS));
+            continue;
+        }
+        let filled = buffer_frames.saturating_sub(avail as u64);
+        let allowed = watermark_frames.saturating_sub(filled) as usize;
+        let mut frames = if watermark_ms == 0 {
+            avail.min(4096)
+        } else {
+            avail.min(4096).min(allowed)
+        };
+        if pause_draining {
+            frames = frames.min(pause_silence_remaining);
+        }
+        if frames == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(
+                (watermark_ms / 4).clamp(2, 20),
+            ));
+            continue;
+        }
+        let result = if format == Format::s16() {
+            pcm.io_i16()?.mmap(frames, |buf: &mut [i16]| {
+                for pair in buf.chunks_exact_mut(2) {
+                    pair[0] = (next_i32!() >> 16) as i16;
+                    pair[1] = (next_i32!() >> 16) as i16;
+                }
+                frames
+            })
+        } else if format == Format::s24() {
+            pcm.io_i32_s24()?.mmap(frames, |buf: &mut [i32]| {
+                for pair in buf.chunks_exact_mut(2) {
+                    pair[0] = next_i32!() >> 8;
+                    pair[1] = next_i32!() >> 8;
+                }
+                frames
+            })
+        } else {
+            pcm.io_i32()?.mmap(frames, |buf: &mut [i32]| {
+                for pair in buf.chunks_exact_mut(2) {
+                    pair[0] = next_i32!();
+                    pair[1] = next_i32!();
+                }
+                frames
+            })
+        };
+        match result {
+            Ok(_) => {
+                contiguous_errors = 0;
+                if pause_draining {
+                    pause_silence_remaining = pause_silence_remaining.saturating_sub(frames);
+                }
+            }
+            Err(error) => {
+                if pcm.state() == State::XRun {
+                    xrun_count += 1;
+                    let _ = pcm.prepare();
+                    continue;
+                }
+                contiguous_errors += 1;
+                if contiguous_errors >= MAX_CONTIGUOUS_ERRORS {
+                    on_failure();
+                    anyhow::bail!("ALSA i32 连续错误超限（last: {error}）");
+                }
+            }
+        }
+        if matches!(pcm.state(), State::Prepared) {
+            if let Err(error) = pcm.start() {
+                if pcm.state() == State::XRun {
+                    xrun_count += 1;
+                    let _ = pcm.prepare();
+                } else {
+                    warn!(error = %error, "ALSA MMAP i32 显式 start 失败");
+                }
+            }
+        }
+    }
+}
+
 /// 枚举 ALSA hw 直出设备（"hw:X,Y"），供 devices 端点合成 alsammap 条目。
 /// 枚举失败（权限/无声卡）返回空列表，best-effort 不构成错误
 pub fn list_hw_devices() -> Vec<(String, String)> {
@@ -682,6 +1024,8 @@ fn dsd_write_loop(
     let channels = usize::from(reader.format().channels);
     let (pcm, rate, wire_fmt) = open_dsd_pcm(device, dsd_bit_rate, channels as u32)?;
     let frame_bytes = channels * wire_fmt.bytes_per_ch();
+    // DSD MMAP 的 hw 几何在本次流中固定，避免实时循环反复查询 ALSA 控制层。
+    let (buffer_frames, _period_frames) = pcm.get_params()?;
     info!(?wire_fmt, channels, "ALSA DSD 协商完成");
     let mut contiguous_errors: u32 = 0;
     let mut xrun_count: u64 = 0;
@@ -704,6 +1048,7 @@ fn dsd_write_loop(
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(HW_HIGH_WATERMARK_MS);
+    let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
     info!(need_bitrev, "ALSA DSD 位序适配（目标线序 MSB-first）");
 
     loop {
@@ -756,11 +1101,6 @@ fn dsd_write_loop(
         }
 
         // 水位限速（同 PCM 版）：DSD 预填上限 200ms
-        let buffer_frames = {
-            let (buf, _per) = pcm.get_params()?;
-            buf
-        };
-        let watermark_frames = watermark_ms.saturating_mul(rate as u64) / 1000;
         let filled = buffer_frames.saturating_sub(avail as u64);
         let allowed = watermark_frames.saturating_sub(filled) as usize;
         let frames = if watermark_ms == 0 {

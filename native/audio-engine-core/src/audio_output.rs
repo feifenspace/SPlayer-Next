@@ -198,6 +198,30 @@ impl AudioOutput {
             }
         }
     }
+
+    /// 创建整数 PCM ALSA MMAP 流。该接口只接受 alsammap 后端，避免整数数据
+    /// 意外进入 CPAL/f32 路径。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn build_integer_stream(
+        &self,
+        source: crate::source::IntegerDecoderSource,
+        volume: Arc<AtomicU32>,
+        stopped: Arc<AtomicBool>,
+    ) -> Result<crate::playback::PlaybackStream> {
+        let device = match &self.backend {
+            OutputBackend::AlsaMmap { device, .. } => device,
+            _ => anyhow::bail!("整数 PCM 输出仅支持 ALSA MMAP 后端"),
+        };
+        let (stream, _, _) = crate::alsa_mmap_sink::AlsaMmapStream::open_integer(
+            device,
+            Some(self.sample_rate()),
+            source,
+            volume,
+            stopped,
+            Arc::clone(&self.on_failure),
+        )?;
+        Ok(crate::playback::PlaybackStream::Alsa(stream))
+    }
 }
 
 impl Drop for AudioOutput {
@@ -509,6 +533,10 @@ where
         #[cfg(target_os = "linux")]
         let _props_guard = pipewire_props::Guard::set_stream_props(config.sample_rate);
 
+        let mut startup_silence_samples = config
+            .sample_rate
+            .saturating_div(200)
+            .saturating_mul(config.channels as u32) as usize;
         device.build_output_stream(
             config,
             move |data: &mut [T], _| {
@@ -518,7 +546,12 @@ where
                     return;
                 }
                 for output in data {
-                    *output = T::from_sample(source.next().unwrap_or(0.0) * gain);
+                    if startup_silence_samples > 0 {
+                        *output = T::EQUILIBRIUM;
+                        startup_silence_samples -= 1;
+                    } else {
+                        *output = T::from_sample(source.next().unwrap_or(0.0) * gain);
+                    }
                 }
             },
             move |error| {

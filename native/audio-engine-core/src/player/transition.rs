@@ -10,7 +10,7 @@ use crate::equalizer::Equalizer;
 use crate::metadata::AudioMetadata;
 use crate::playback::PlaybackHandle;
 use crate::shared::Shared;
-use crate::source::DecoderSource;
+use crate::source::{DecoderSource, IntegerDecoderSource};
 use crate::tempo::StretchProcessor;
 use anyhow::Result;
 use ffmpeg_audio::HttpCancelHandle;
@@ -334,12 +334,26 @@ impl InnerPlayer {
         if let Some(out) = output {
             self.output = Some(out);
         }
-        let reader = DecoderSource::new(Arc::clone(&shared), Arc::clone(&self.fft));
         let was_paused = self.state == PlayerState::Paused;
         let volume = self.target_volume;
+        let fft = Arc::clone(&self.fft);
         let playback = {
             let output = self.ensure_output(None)?;
-            Arc::new(PlaybackHandle::attach(output, reader, volume, was_paused)?)
+            if shared.is_integer_output() {
+                Arc::new(PlaybackHandle::attach_integer(
+                    output,
+                    IntegerDecoderSource::new(Arc::clone(&shared)),
+                    volume,
+                    was_paused,
+                )?)
+            } else {
+                Arc::new(PlaybackHandle::attach(
+                    output,
+                    DecoderSource::new(Arc::clone(&shared), fft),
+                    volume,
+                    was_paused,
+                )?)
+            }
         };
 
         self.playback = Some(playback);
@@ -403,11 +417,25 @@ impl InnerPlayer {
         self.pending_load_handle = cancel;
         self.output = Some(output);
 
-        let reader = DecoderSource::new(Arc::clone(&shared), Arc::clone(&self.fft));
         let volume = self.target_volume;
+        let fft = Arc::clone(&self.fft);
         let playback = {
             let output = self.ensure_output(None)?;
-            Arc::new(PlaybackHandle::attach(output, reader, volume, !auto_play)?)
+            if shared.is_integer_output() {
+                Arc::new(PlaybackHandle::attach_integer(
+                    output,
+                    IntegerDecoderSource::new(Arc::clone(&shared)),
+                    volume,
+                    !auto_play,
+                )?)
+            } else {
+                Arc::new(PlaybackHandle::attach(
+                    output,
+                    DecoderSource::new(Arc::clone(&shared), fft),
+                    volume,
+                    !auto_play,
+                )?)
+            }
         };
 
         self.playback = Some(playback);

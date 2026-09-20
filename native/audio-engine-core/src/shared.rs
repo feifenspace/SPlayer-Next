@@ -15,9 +15,22 @@ pub struct AudioChunk {
     pub source_sample_count: u64,
 }
 
+/// 未经过 f32 转换的交错整数 PCM 数据块。
+/// 该队列只供后续 ALSA MMAP 整数输出链使用，当前 f32 路径不读取它。
+pub struct IntegerAudioChunk {
+    pub player_samples: Vec<i32>,
+    pub source_sample_count: u64,
+}
+
 /// 非阻塞弹出缓冲区的结果
 pub enum PopResult {
     Chunk(AudioChunk),
+    Pending,
+    Finished,
+}
+
+pub enum IntegerPopResult {
+    Chunk(IntegerAudioChunk),
     Pending,
     Finished,
 }
@@ -28,10 +41,14 @@ pub struct Shared {
     decoded_condvar: Condvar,
     output_buffer: Mutex<VecDeque<AudioChunk>>,
     output_condvar: Condvar,
+    integer_output_buffer: Mutex<VecDeque<IntegerAudioChunk>>,
+    integer_output_condvar: Condvar,
     player_buffer_pool: Mutex<Vec<Vec<f32>>>,
     fft_buffer_pool: Mutex<Vec<Vec<f32>>>,
+    integer_player_buffer_pool: Mutex<Vec<Vec<i32>>>,
     decode_eof: AtomicBool,
     output_eof: AtomicBool,
+    integer_output: AtomicBool,
     is_stopping: AtomicBool,
     /// 已被输出回调消费的交错采样数（包含所有声道）
     samples_consumed: AtomicU64,
@@ -60,6 +77,11 @@ pub const FRAME_BUFFER_CAPACITY: usize = 192;
 /// DSP 后缓冲只保留少量块，保证 EQ/tempo 参数更新能快速生效
 const OUTPUT_BUFFER_CAPACITY: usize = 4;
 
+/// 整数 PCM 路径绕过 DSP 队列，必须拥有独立的解码预缓冲。
+/// 如果沿用 OUTPUT_BUFFER_CAPACITY=4，ALSA 实时线程会在解码器切换帧的
+/// 瞬间看到 Pending，并插入 20ms 静音，形成规律性的断续杂音。
+const INTEGER_OUTPUT_BUFFER_CAPACITY: usize = FRAME_BUFFER_CAPACITY;
+
 /// 复用池上限覆盖解码队列、输出队列和两个线程的在手缓冲
 const BUFFER_POOL_CAPACITY: usize = FRAME_BUFFER_CAPACITY + OUTPUT_BUFFER_CAPACITY + 4;
 
@@ -74,10 +96,14 @@ impl Shared {
             decoded_condvar: Condvar::new(),
             output_buffer: Mutex::new(VecDeque::with_capacity(OUTPUT_BUFFER_CAPACITY)),
             output_condvar: Condvar::new(),
+            integer_output_buffer: Mutex::new(VecDeque::with_capacity(INTEGER_OUTPUT_BUFFER_CAPACITY)),
+            integer_output_condvar: Condvar::new(),
             player_buffer_pool: Mutex::new(Vec::with_capacity(BUFFER_POOL_CAPACITY)),
             fft_buffer_pool: Mutex::new(Vec::with_capacity(BUFFER_POOL_CAPACITY)),
+            integer_player_buffer_pool: Mutex::new(Vec::with_capacity(BUFFER_POOL_CAPACITY)),
             decode_eof: AtomicBool::new(false),
             output_eof: AtomicBool::new(false),
+            integer_output: AtomicBool::new(false),
             is_stopping: AtomicBool::new(false),
             samples_consumed: AtomicU64::new(0),
             sample_rate,
@@ -121,6 +147,14 @@ impl Shared {
         self.normalization_enabled.load(Ordering::Relaxed)
     }
 
+    pub fn set_integer_output(&self, enabled: bool) {
+        self.integer_output.store(enabled, Ordering::Release);
+    }
+
+    pub fn is_integer_output(&self) -> bool {
+        self.integer_output.load(Ordering::Acquire)
+    }
+
     /// 获取原始增益值（不考虑开关）
     pub fn normalization_gain(&self) -> f32 {
         f32::from_bits(self.normalization_gain.load(Ordering::Relaxed))
@@ -150,6 +184,22 @@ impl Shared {
     pub fn recycle_fft_buffer(&self, mut buffer: Vec<f32>) {
         buffer.clear();
         if let Some(mut pool) = self.fft_buffer_pool.try_lock() {
+            if pool.len() < BUFFER_POOL_CAPACITY {
+                pool.push(buffer);
+            }
+        }
+    }
+
+    pub fn take_integer_player_buffer(&self) -> Vec<i32> {
+        self.integer_player_buffer_pool
+            .lock()
+            .pop()
+            .unwrap_or_default()
+    }
+
+    pub fn recycle_integer_player_buffer(&self, mut buffer: Vec<i32>) {
+        buffer.clear();
+        if let Some(mut pool) = self.integer_player_buffer_pool.try_lock() {
             if pool.len() < BUFFER_POOL_CAPACITY {
                 pool.push(buffer);
             }
@@ -265,6 +315,31 @@ impl Shared {
         self.output_condvar.notify_one();
     }
 
+    /// 推入整数 PCM 输出块。该队列与现有 f32 队列完全隔离。
+    pub fn push_integer_output(&self, chunk: IntegerAudioChunk) {
+        let mut buffer = self.integer_output_buffer.lock();
+        while buffer.len() >= INTEGER_OUTPUT_BUFFER_CAPACITY
+            && !self.is_stopping.load(Ordering::Acquire)
+        {
+            self.integer_output_condvar.wait(&mut buffer);
+        }
+        if self.is_stopping.load(Ordering::Acquire) {
+            return;
+        }
+        buffer.push_back(chunk);
+        self.integer_output_condvar.notify_one();
+    }
+
+    pub fn wait_for_integer_space(&self) -> bool {
+        let mut buffer = self.integer_output_buffer.lock();
+        while buffer.len() >= INTEGER_OUTPUT_BUFFER_CAPACITY
+            && !self.is_stopping.load(Ordering::Acquire)
+        {
+            self.integer_output_condvar.wait(&mut buffer);
+        }
+        !self.is_stopping.load(Ordering::Acquire)
+    }
+
     /// 非阻塞弹出数据块，供实时输出线程避免在音频回调链路里等待解码线程
     pub fn try_pop(&self) -> PopResult {
         let Some(mut buffer) = self.output_buffer.try_lock() else {
@@ -283,6 +358,21 @@ impl Shared {
         }
     }
 
+    pub fn try_pop_integer(&self) -> IntegerPopResult {
+        let Some(mut buffer) = self.integer_output_buffer.try_lock() else {
+            return IntegerPopResult::Pending;
+        };
+        if let Some(chunk) = buffer.pop_front() {
+            self.integer_output_condvar.notify_one();
+            return IntegerPopResult::Chunk(chunk);
+        }
+        if self.output_eof.load(Ordering::Acquire) || self.is_stopping.load(Ordering::Acquire) {
+            IntegerPopResult::Finished
+        } else {
+            IntegerPopResult::Pending
+        }
+    }
+
     /// 标记解码完成
     pub fn mark_eof(&self) {
         self.decode_eof.store(true, Ordering::Release);
@@ -294,6 +384,7 @@ impl Shared {
         self.output_eof.store(true, Ordering::Release);
         self.decoded_condvar.notify_all();
         self.output_condvar.notify_all();
+        self.integer_output_condvar.notify_all();
     }
 
     /// 发出停止信号，唤醒双方
@@ -305,6 +396,7 @@ impl Shared {
         }
         self.decoded_condvar.notify_all();
         self.output_condvar.notify_all();
+        self.integer_output_condvar.notify_all();
     }
 
     /// 清空缓冲区并释放内存（stop 后调用，避免 AudioChunk 在 Arc 引用存活期间持续占用内存）
@@ -320,6 +412,13 @@ impl Shared {
         for chunk in decoded_chunks.into_iter().chain(output_chunks) {
             self.recycle_player_buffer(chunk.player_samples);
             self.recycle_fft_buffer(chunk.fft_samples);
+        }
+        let mut integer_output = self.integer_output_buffer.lock();
+        let integer_chunks = std::mem::take(&mut *integer_output);
+        integer_output.shrink_to_fit();
+        drop(integer_output);
+        for chunk in integer_chunks {
+            self.recycle_integer_player_buffer(chunk.player_samples);
         }
     }
 }

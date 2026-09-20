@@ -1459,12 +1459,37 @@ fn regular_load_worker(
         .lock()
         .set_output_format(output.sample_rate(), output.channels());
     tempo.lock().reset();
-    let (metadata, decode_handle, cancel) = audio_engine_core::decoder::start_prepared_decode(
-        prepared,
-        std::sync::Arc::clone(&shared),
-        equalizer,
-        tempo,
-    )?;
+    // The integer MMAP path is retained for sample-level validation, but is
+    // opt-in until its S32LE representation is verified on every USB DAC.
+    // The established f32 MMAP path remains the safe default.
+    let integer_pcm_enabled = std::env::var("SPLAYER_ALSAMMAP_INTEGER")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let integer_pcm = integer_pcm_enabled
+        && output.is_alsammap()
+        && !normalization_enabled
+        && !equalizer.lock().enabled()
+        && tempo.lock().is_bypass()
+        && (16..=32).contains(&prepared.bits_per_sample());
+    let (metadata, decode_handle, cancel) = if integer_pcm {
+        tracing::info!(
+            source = %source_for_decoder,
+            bits_per_sample = prepared.bits_per_sample(),
+            "ALSA MMAP 启用整数 PCM 解码路径"
+        );
+        audio_engine_core::decoder::start_prepared_decode_integer(
+            prepared,
+            std::sync::Arc::clone(&shared),
+        )?
+    } else {
+        audio_engine_core::decoder::start_prepared_decode(
+            prepared,
+            std::sync::Arc::clone(&shared),
+            equalizer,
+            tempo,
+        )?
+    };
     Ok((metadata, decode_handle, shared, output, cancel))
 }
 

@@ -17,7 +17,7 @@ use crate::error::{AudioErrorKind, AudioResultExt};
 use crate::loudness::LoudnessAnalyzer;
 use crate::metadata::{self, AudioMetadata};
 use crate::priority;
-use crate::shared::{AudioChunk, Shared};
+use crate::shared::{AudioChunk, IntegerAudioChunk, Shared};
 use crate::tempo::StretchProcessor;
 
 /// 无输出设备信息时初始化 DSP 使用的默认声道数
@@ -103,6 +103,26 @@ impl OutputLimiter {
     }
 }
 
+enum PlayerResampler {
+    Float(Resampler),
+    Integer(Resampler),
+}
+
+impl PlayerResampler {
+    fn flush(&mut self) -> Result<(), AudioError> {
+        match self {
+            Self::Float(resampler) | Self::Integer(resampler) => resampler.flush(),
+        }
+    }
+
+    fn float_mut(&mut self) -> &mut Resampler {
+        match self {
+            Self::Float(resampler) => resampler,
+            Self::Integer(_) => panic!("整数解码器误进入 f32 播放循环"),
+        }
+    }
+}
+
 /// 解码会话所需的资源（跨 seek 复用，避免重建 ffmpeg_audio 上下文）
 ///
 /// 此处必须进行 1-to-N 分发，因为需要两个可能存在采样率差异的音源
@@ -110,7 +130,7 @@ impl OutputLimiter {
 ///  - FFT 重采样器输出 48kHz 的 stereo f32
 pub struct DecoderData {
     reader: AudioReader,
-    player_resampler: Resampler,
+    player_resampler: PlayerResampler,
     fft_resampler: Resampler,
     /// 网络中断句柄仅由远端源持有，stop() 取消后可在 seek 前重置
     cancel_handle: Option<HttpCancelHandle>,
@@ -132,6 +152,11 @@ impl PreparedDecoder {
     /// 音源原始采样率，用于输出流采样率协商（设备支持时按精确采样率打开）
     pub fn original_sample_rate(&self) -> u32 {
         self.metadata.original_sample_rate
+    }
+
+    /// 源音频有效位深，供输出后端选择位纯真数据路径和记录诊断信息。
+    pub fn bits_per_sample(&self) -> u32 {
+        self.metadata.bits_per_sample
     }
 
     pub fn into_metadata(self) -> AudioMetadata {
@@ -183,7 +208,14 @@ impl DecoderData {
 
     /// 输出设备格式变化后重建播放重采样器；FFT 分支仍保持固定双声道分析格式
     pub fn reconfigure_player_output(&mut self, sample_rate: u32, channels: u16) -> Result<()> {
-        self.player_resampler = build_player_resampler(&self.reader, sample_rate, channels)?;
+        self.player_resampler = match self.player_resampler {
+            PlayerResampler::Float(_) => {
+                PlayerResampler::Float(build_player_resampler(&self.reader, sample_rate, channels)?)
+            }
+            PlayerResampler::Integer(_) => PlayerResampler::Integer(
+                build_integer_player_resampler(&self.reader, sample_rate, channels)?,
+            ),
+        };
         Ok(())
     }
 }
@@ -379,7 +411,7 @@ pub fn start_prepared_decode(
 
     let data = DecoderData {
         reader,
-        player_resampler,
+        player_resampler: PlayerResampler::Float(player_resampler),
         fft_resampler,
         cancel_handle: cancel_handle.clone(),
         cue_info,
@@ -411,6 +443,72 @@ pub fn start_prepared_decode(
         .context("启动解码线程失败")
         .with_audio_kind(AudioErrorKind::DecodeFailed)?;
 
+    Ok((metadata, handle, cancel_handle))
+}
+
+/// 启动不经过 DSP/f32 队列的整数 PCM 解码。调用方必须已经确认输出是
+/// ALSA MMAP 且归一化、EQ、tempo 均关闭。
+pub fn start_prepared_decode_integer(
+    prepared: PreparedDecoder,
+    shared: Arc<Shared>,
+) -> Result<(
+    AudioMetadata,
+    JoinHandle<DecoderData>,
+    Option<HttpCancelHandle>,
+)> {
+    let PreparedDecoder {
+        reader,
+        mut metadata,
+        replay_gain_db: _,
+        cancel_handle,
+        cue_info,
+    } = prepared;
+    let target_rate = shared.sample_rate();
+    shared.set_integer_output(true);
+    let player_resampler = build_integer_player_resampler(&reader, target_rate, shared.channels())?;
+    let fft_resampler = reader
+        .build_resampler(
+            ResampleOptions::new()
+                .sample_rate(FFT_TARGET_SAMPLE_RATE as i32)
+                .channels(i32::from(FFT_CHANNELS))
+                .format::<f32>(),
+        )
+        .with_context(|| "构建整数 PCM 路径 FFT 重采样器失败")?;
+    metadata.sample_rate = target_rate;
+    if let Some(handle) = &cancel_handle {
+        shared.bind_cancel_handle(handle.clone());
+    }
+    let data = DecoderData {
+        reader,
+        player_resampler: PlayerResampler::Integer(player_resampler),
+        fft_resampler,
+        cancel_handle: cancel_handle.clone(),
+        cue_info,
+    };
+    let handle = thread::Builder::new()
+        .name("audio-decoder-i32".to_string())
+        .spawn(move || {
+            priority::boost_current_audio_thread("audio-decoder-i32");
+            let mut data = data;
+            run_decode_safely(&shared, || {
+                let max_samples = data.cue_info.as_ref().and_then(|cue| {
+                    (cue.duration > 0.0).then(|| {
+                        (cue.duration
+                            * shared.sample_rate() as f64
+                            * shared.channels() as f64)
+                            .round() as u64
+                    })
+                });
+                let resampler = match &mut data.player_resampler {
+                    PlayerResampler::Integer(resampler) => resampler,
+                    PlayerResampler::Float(_) => panic!("整数解码器使用了 f32 重采样器"),
+                };
+                run_integer_decoding_loop(&mut data.reader, resampler, &shared, max_samples);
+            });
+            data
+        })
+        .context("启动整数 PCM 解码线程失败")
+        .with_audio_kind(AudioErrorKind::DecodeFailed)?;
     Ok((metadata, handle, cancel_handle))
 }
 
@@ -458,6 +556,7 @@ fn process_audio_chunk(
     limiter: &mut OutputLimiter,
     tempo_scratch: &mut Vec<f32>,
     channels: u16,
+    apply_limiter: bool,
 ) -> AudioChunk {
     if chunk.player_samples.is_empty() {
         return chunk;
@@ -467,13 +566,17 @@ fn process_audio_chunk(
         .lock()
         .process_interleaved(&mut chunk.player_samples);
     if tempo.lock().is_bypass() {
-        limiter.process(&mut chunk.player_samples, channels);
+        if apply_limiter {
+            limiter.process(&mut chunk.player_samples, channels);
+        }
         return chunk;
     }
 
     tempo_scratch.clear();
     tempo.lock().process(&chunk.player_samples, tempo_scratch);
-    limiter.process(tempo_scratch, channels);
+    if apply_limiter {
+        limiter.process(tempo_scratch, channels);
+    }
     std::mem::swap(&mut chunk.player_samples, tempo_scratch);
     chunk
 }
@@ -482,6 +585,9 @@ fn run_dsp_loop(shared: &Shared, equalizer: &Mutex<Equalizer>, tempo: &Mutex<Str
     let mut limiter = OutputLimiter::new();
     let mut tempo_scratch = shared.take_player_buffer();
     while let Some(chunk) = shared.pop_decoded() {
+        let apply_limiter = shared.is_normalization_enabled()
+            || equalizer.lock().enabled()
+            || !tempo.lock().is_bypass();
         let chunk = process_audio_chunk(
             chunk,
             equalizer,
@@ -489,6 +595,7 @@ fn run_dsp_loop(shared: &Shared, equalizer: &Mutex<Equalizer>, tempo: &Mutex<Str
             &mut limiter,
             &mut tempo_scratch,
             shared.channels(),
+            apply_limiter,
         );
         shared.push_output(chunk);
         if shared.is_stopping() {
@@ -567,6 +674,20 @@ fn build_player_resampler(
         .with_context(|| "构建播放重采样器失败")
 }
 
+fn build_integer_player_resampler(
+    reader: &AudioReader,
+    target_rate: u32,
+    target_channels: u16,
+) -> Result<Resampler> {
+    let player_opts = ResampleOptions::new()
+        .sample_rate(target_rate as i32)
+        .channels(i32::from(target_channels))
+        .format::<i32>();
+    reader
+        .build_resampler(player_opts)
+        .with_context(|| "构建整数 PCM 播放重采样器失败")
+}
+
 fn build_resamplers(
     reader: &AudioReader,
     target_rate: u32,
@@ -587,6 +708,16 @@ fn build_resamplers(
 
 /// 核心解码循环：每帧解码一次，使用复用缓冲分发到播放与 FFT 重采样器
 fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
+    if let PlayerResampler::Integer(resampler) = &mut data.player_resampler {
+        let max_samples = data.cue_info.as_ref().and_then(|cue| {
+            (cue.duration > 0.0).then(|| {
+                (cue.duration * shared.sample_rate() as f64 * shared.channels() as f64).round()
+                    as u64
+            })
+        });
+        run_integer_decoding_loop(&mut data.reader, resampler, shared, max_samples);
+        return;
+    }
     // 响度归一化：有 ReplayGain 标签时用固定增益，否则用实时分析
     let has_replay_gain = (shared.normalization_gain() - 1.0).abs() > f32::EPSILON;
     let mut loudness = LoudnessAnalyzer::new(shared.sample_rate(), shared.channels());
@@ -627,13 +758,13 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
         match data.reader.receive_frame() {
             Ok(Some(frame)) => {
                 // 1-to-N: 同一帧顺序喂两个重采样器
-                if data.player_resampler.process::<f32>(Some(&frame)).is_err() {
+                if data.player_resampler.float_mut().process::<f32>(Some(&frame)).is_err() {
                     debug!("player resampler 处理失败，结束解码");
                     shared.mark_decode_failed();
                     return;
                 }
                 let mut player_samples = shared.take_player_buffer();
-                player_samples.extend_from_slice(data.player_resampler.output_as::<f32>());
+                player_samples.extend_from_slice(data.player_resampler.float_mut().output_as::<f32>());
 
                 if data.fft_resampler.process::<f32>(Some(&frame)).is_err() {
                     debug!("fft resampler 处理失败，结束解码");
@@ -690,10 +821,10 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
             }
             Ok(None) | Err(AudioError::Eof) => {
                 // EOF flush：把两个重采样器内部残留挤出来，否则最后几十毫秒丢
-                let _ = data.player_resampler.process::<f32>(None);
+                let _ = data.player_resampler.float_mut().process::<f32>(None);
                 let _ = data.fft_resampler.process::<f32>(None);
                 let mut player_samples = shared.take_player_buffer();
-                player_samples.extend_from_slice(data.player_resampler.output_as::<f32>());
+                player_samples.extend_from_slice(data.player_resampler.float_mut().output_as::<f32>());
                 let mut fft_samples = shared.take_fft_buffer();
                 fft_samples.extend_from_slice(data.fft_resampler.output_as::<f32>());
                 if !player_samples.is_empty() || !fft_samples.is_empty() {
@@ -728,6 +859,89 @@ fn run_decoding_loop(data: &mut DecoderData, shared: &Shared) {
                 // 阈值保障：mark_decode_failed 后若 position 接近末尾仍发 Ended
                 shared.mark_decode_failed();
                 debug!(error = %e, had_success, io_failure, "解码线程异常结束");
+                return;
+            }
+        }
+    }
+}
+
+/// 整数 PCM 解码循环的独立入口。
+/// 该入口只向 i32 队列供数，供 ALSA MMAP 位纯真路径接入；现有 f32/DSP
+/// 解码循环保持独立，避免整数路径尚未完成时改变默认播放行为。
+pub(crate) fn run_integer_decoding_loop(
+    reader: &mut AudioReader,
+    resampler: &mut Resampler,
+    shared: &Shared,
+    max_player_samples: Option<u64>,
+) {
+    let mut total_player_samples = 0_u64;
+    loop {
+        if !shared.wait_for_integer_space() {
+            return;
+        }
+        if max_player_samples.is_some_and(|max| total_player_samples >= max) {
+            shared.mark_eof();
+            shared.mark_output_eof();
+            return;
+        }
+        match reader.receive_frame() {
+            Ok(Some(frame)) => {
+                if resampler.process::<i32>(Some(&frame)).is_err() {
+                    shared.mark_decode_failed();
+                    return;
+                }
+                let mut samples = shared.take_integer_player_buffer();
+                samples.extend_from_slice(resampler.output_as::<i32>());
+                if !samples.is_empty() {
+                    let reached_limit = if let Some(max) = max_player_samples {
+                        let remaining = max.saturating_sub(total_player_samples) as usize;
+                        if samples.len() >= remaining {
+                            samples.truncate(remaining);
+                            total_player_samples = max;
+                            true
+                        } else {
+                            total_player_samples += samples.len() as u64;
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    shared.push_integer_output(IntegerAudioChunk {
+                        source_sample_count: samples.len() as u64,
+                        player_samples: samples,
+                    });
+                    if reached_limit {
+                        shared.mark_eof();
+                        shared.mark_output_eof();
+                        return;
+                    }
+                } else {
+                    shared.recycle_integer_player_buffer(samples);
+                }
+            }
+            Ok(None) | Err(AudioError::Eof) => {
+                let _ = resampler.process::<i32>(None);
+                let mut samples = shared.take_integer_player_buffer();
+                samples.extend_from_slice(resampler.output_as::<i32>());
+                if !samples.is_empty() {
+                    shared.push_integer_output(IntegerAudioChunk {
+                        source_sample_count: samples.len() as u64,
+                        player_samples: samples,
+                    });
+                } else {
+                    shared.recycle_integer_player_buffer(samples);
+                }
+                shared.mark_eof();
+                shared.mark_output_eof();
+                return;
+            }
+            Err(error) => {
+                if !shared.is_stopping() {
+                    debug!(error = %error, "整数 PCM 解码失败");
+                    shared.mark_decode_failed();
+                }
+                shared.mark_eof();
+                shared.mark_output_eof();
                 return;
             }
         }
@@ -818,6 +1032,7 @@ mod tests {
             &mut limiter,
             &mut scratch,
             2,
+            true,
         );
 
         assert!(processed
@@ -846,10 +1061,36 @@ mod tests {
             &mut limiter,
             &mut scratch,
             2,
+            true,
         );
 
         assert_eq!(processed.source_sample_count, 4096);
         assert_eq!(processed.player_samples.len(), 2048);
+    }
+
+    #[test]
+    fn bitperfect_dsp_bypass_preserves_samples_without_limiter() {
+        let equalizer = Mutex::new(Equalizer::new(48_000, 2));
+        let tempo = Mutex::new(StretchProcessor::new(2, 48_000));
+        let mut limiter = OutputLimiter::new();
+        let mut scratch = Vec::new();
+        let input = vec![1.25, -1.25, 0.75, -0.75];
+
+        let processed = process_audio_chunk(
+            AudioChunk {
+                player_samples: input.clone(),
+                fft_samples: Vec::new(),
+                source_sample_count: input.len() as u64,
+            },
+            &equalizer,
+            &tempo,
+            &mut limiter,
+            &mut scratch,
+            2,
+            false,
+        );
+
+        assert_eq!(processed.player_samples, input);
     }
 
     #[test]
@@ -884,5 +1125,25 @@ mod tests {
         assert!(!fft_samples.is_empty());
         assert_eq!(player_samples.len() % 6, 0);
         assert_eq!(fft_samples.len() % usize::from(FFT_CHANNELS), 0);
+    }
+
+    #[test]
+    fn integer_resampler_emits_samples_into_integer_queue() {
+        let mut reader = AudioReader::new(Cursor::new(mono_wav())).unwrap();
+        let mut resampler = build_integer_player_resampler(&reader, 48_000, 2).unwrap();
+        let shared = Shared::new(48_000, 2);
+
+        run_integer_decoding_loop(&mut reader, &mut resampler, &shared, None);
+
+        let mut count = 0;
+        loop {
+            match shared.try_pop_integer() {
+                crate::shared::IntegerPopResult::Chunk(chunk) => count += chunk.player_samples.len(),
+                crate::shared::IntegerPopResult::Pending => continue,
+                crate::shared::IntegerPopResult::Finished => break,
+            }
+        }
+        assert!(count > 0);
+        assert!(!shared.is_decode_failed());
     }
 }

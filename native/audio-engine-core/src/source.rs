@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::fft::FftAnalyzer;
-use crate::shared::{PopResult, Shared};
+use crate::shared::{IntegerPopResult, PopResult, Shared};
 const UNDERRUN_SILENCE_MS: u32 = 20;
 
 /// 平台无关的解码样本读取器。
@@ -100,10 +100,87 @@ impl Drop for DecoderSampleReader {
 /// 解码样本读取器别名，作为播放输出链路的输入类型
 pub type DecoderSource = DecoderSampleReader;
 
+/// 整数 PCM 输出读取器。只读取 Shared 的独立 i32 队列，不经过 f32/DSP 路径。
+pub struct IntegerDecoderSource {
+    shared: Arc<Shared>,
+    local_buffer: Vec<i32>,
+    local_index: usize,
+    underrun_silence_remaining: usize,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl IntegerDecoderSource {
+    pub fn new(shared: Arc<Shared>) -> Self {
+        let sample_rate = shared.sample_rate();
+        let channels = shared.channels();
+        Self {
+            shared,
+            local_buffer: Vec::new(),
+            local_index: 0,
+            underrun_silence_remaining: 0,
+            sample_rate,
+            channels,
+        }
+    }
+}
+
+impl Iterator for IntegerDecoderSource {
+    type Item = i32;
+
+    fn next(&mut self) -> Option<i32> {
+        if let Some(sample) = self.local_buffer.get(self.local_index).copied() {
+            self.local_index += 1;
+            return Some(sample);
+        }
+        if !self.local_buffer.is_empty() {
+            self.shared
+                .recycle_integer_player_buffer(std::mem::take(&mut self.local_buffer));
+            self.local_index = 0;
+        }
+        if self.underrun_silence_remaining > 0 {
+            self.underrun_silence_remaining -= 1;
+            return Some(0);
+        }
+        match self.shared.try_pop_integer() {
+            IntegerPopResult::Chunk(chunk) if !chunk.player_samples.is_empty() => {
+                self.shared.advance_consumed(chunk.source_sample_count);
+                self.local_buffer = chunk.player_samples;
+                self.local_index = 1;
+                self.local_buffer.first().copied()
+            }
+            IntegerPopResult::Chunk(chunk) => {
+                self.shared.advance_consumed(chunk.source_sample_count);
+                self.shared.recycle_integer_player_buffer(chunk.player_samples);
+                self.next()
+            }
+            IntegerPopResult::Pending => {
+                let silence_samples = (u64::from(self.sample_rate)
+                    * u64::from(self.channels)
+                    * u64::from(UNDERRUN_SILENCE_MS)
+                    / 1000) as usize;
+                self.underrun_silence_remaining = silence_samples.saturating_sub(1);
+                Some(0)
+            }
+            IntegerPopResult::Finished => {
+                self.shared.mark_all_consumed();
+                None
+            }
+        }
+    }
+}
+
+impl Drop for IntegerDecoderSource {
+    fn drop(&mut self) {
+        self.shared
+            .recycle_integer_player_buffer(std::mem::take(&mut self.local_buffer));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::AudioChunk;
+    use crate::shared::{AudioChunk, IntegerAudioChunk};
 
     #[test]
     fn returns_preprocessed_samples_without_copying() {
@@ -166,5 +243,19 @@ mod tests {
         }
         assert_eq!(source.next(), Some(0.25));
         assert_eq!(source.next(), Some(-0.25));
+    }
+
+    #[test]
+    fn integer_reader_keeps_samples_without_float_conversion() {
+        let shared = Shared::new(48_000, 2);
+        shared.push_integer_output(IntegerAudioChunk {
+            player_samples: vec![i32::MIN, -1, 0, i32::MAX],
+            source_sample_count: 4,
+        });
+        let mut source = IntegerDecoderSource::new(shared);
+        assert_eq!(source.next(), Some(i32::MIN));
+        assert_eq!(source.next(), Some(-1));
+        assert_eq!(source.next(), Some(0));
+        assert_eq!(source.next(), Some(i32::MAX));
     }
 }

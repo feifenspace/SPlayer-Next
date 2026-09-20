@@ -4,10 +4,10 @@
 //!
 //! 基于 Axum 0.8 的路由定义，提供播放控制、状态查询、扫描和 WebSocket 端点。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{extract::State, Json};
@@ -53,7 +53,9 @@ pub(crate) fn clean_old_stream_cache(cache_dir: &std::path::Path) {
                 }
                 if let Ok(meta) = entry.metadata() {
                     let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    files.push((path, mtime));
+                    if !is_cache_path_active(&path) {
+                        files.push((path, mtime));
+                    }
                 }
             }
         }
@@ -98,6 +100,51 @@ pub(crate) enum DirectInput {
         path: String,
     },
     Path(String),
+    /// 磁盘缓存路径及其活动租约。清理线程不能删除仍可能被后续
+    /// handoff/reconnect 打开的文件。
+    ProtectedPath {
+        path: String,
+        lease: Arc<ActivePathLease>,
+    },
+}
+
+static ACTIVE_CACHE_PATHS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn active_cache_paths() -> &'static Mutex<HashSet<String>> {
+    ACTIVE_CACHE_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn protect_cache_path(path: String) -> anyhow::Result<Arc<ActivePathLease>> {
+    active_cache_paths()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("活动缓存路径锁已中毒"))?
+        .insert(path.clone());
+    Ok(Arc::new(ActivePathLease { path }))
+}
+
+pub(crate) struct ActivePathLease {
+    path: String,
+}
+
+impl Drop for ActivePathLease {
+    fn drop(&mut self) {
+        if let Ok(mut paths) = active_cache_paths().lock() {
+            paths.remove(&self.path);
+        }
+    }
+}
+
+fn is_cache_path_active(path: &Path) -> bool {
+    active_cache_paths()
+        .lock()
+        .map(|paths| paths.contains(path.to_string_lossy().as_ref()))
+        .unwrap_or(true)
+}
+
+fn protected_cache_input(path: PathBuf) -> anyhow::Result<DirectInput> {
+    let path = path.to_string_lossy().to_string();
+    let lease = protect_cache_path(path.clone())?;
+    Ok(DirectInput::ProtectedPath { path, lease })
 }
 
 impl DirectInput {
@@ -106,6 +153,7 @@ impl DirectInput {
             #[cfg(target_os = "linux")]
             Self::Memfd { path, .. } => path,
             Self::Path(path) => path,
+            Self::ProtectedPath { path, .. } => path,
         }
     }
 
@@ -132,6 +180,10 @@ impl DirectInput {
                 }
             },
             Self::Path(path) => Ok(Self::Path(path.clone())),
+            Self::ProtectedPath { path, lease } => Ok(Self::ProtectedPath {
+                path: path.clone(),
+                lease: Arc::clone(lease),
+            }),
         }
     }
 }
@@ -419,7 +471,7 @@ pub(crate) fn materialize_direct_input(
                 tracing::debug!(path = %cached_path, "在线磁盘缓存已转入 memfd 纯内存播放");
                 return Ok(input);
             }
-            return Ok(DirectInput::Path(cached_path));
+            return protected_cache_input(target_file);
         }
     }
 
@@ -499,7 +551,7 @@ pub(crate) fn materialize_direct_input(
             tracing::debug!(path = %cached_path, "在线磁盘缓存已转入 memfd 纯内存播放");
             return Ok(input);
         }
-        return Ok(DirectInput::Path(cached_path));
+        return protected_cache_input(target_file);
     }
 
     // 磁盘缓存未命中：优先下载到 memfd 纯内存缓存（零磁盘 IO）。仅 memfd
@@ -548,7 +600,7 @@ pub(crate) fn materialize_direct_input(
 
     fs::rename(&part_file, &target_file)?;
     tracing::info!(url = %url, path = %target_file.to_string_lossy(), written, "在线音源已下载至磁盘缓存");
-    Ok(DirectInput::Path(target_file.to_string_lossy().to_string()))
+    protected_cache_input(target_file)
 }
 
 /// Direct 载入成功后的统一响应体
@@ -821,7 +873,7 @@ pub(crate) async fn direct_commit_boundary_handler(
 mod tests {
     use std::io::Cursor;
 
-    use super::copy_with_abort;
+    use super::{clean_old_stream_cache, copy_with_abort, protected_cache_input};
 
     #[test]
     fn preload_rejects_truncated_content_with_known_length() {
@@ -844,5 +896,31 @@ mod tests {
         assert_eq!(written, 8);
         assert!(!exceeded);
         assert_eq!(output, b"complete");
+    }
+
+    #[test]
+    fn active_disk_cache_path_is_not_deleted_by_cleanup() {
+        let dir = tempfile::tempdir().expect("temporary cache directory");
+        let active = dir.path().join("active.flac");
+        std::fs::write(&active, b"active").expect("active cache file");
+        std::fs::write(dir.path().join("old.flac"), b"old").expect("old cache file");
+        std::fs::write(dir.path().join("new.flac"), b"new").expect("new cache file");
+
+        let input = protected_cache_input(active.clone()).expect("protect active cache path");
+        clean_old_stream_cache(dir.path());
+        assert!(active.exists(), "active playback cache must remain available");
+
+        drop(input);
+        clean_old_stream_cache(dir.path());
+        assert!(
+            !active.exists()
+                || dir
+                    .path()
+                    .read_dir()
+                    .expect("cache directory")
+                    .count()
+                    <= 2,
+            "inactive cache cleanup should be allowed after the lease is released"
+        );
     }
 }
