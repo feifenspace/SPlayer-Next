@@ -74,6 +74,7 @@ declare module 'vue' {
     FontConfig: typeof import('./src/components/settings/custom/FontConfig.vue')['default']
     FullPlayer: typeof import('./src/components/player/FullPlayer/index.vue')['default']
     FullPlayerMobile: typeof import('./src/components/player/FullPlayer/FullPlayerMobile.vue')['default']
+    HeadlessServerConfig: typeof import('./src/components/settings/custom/HeadlessServerConfig.vue')['default']
     HotkeyConfig: typeof import('./src/components/settings/custom/HotkeyConfig.vue')['default']
     IconLucideArrowLeft: typeof import('~icons/lucide/arrow-left')['default']
     IconLucideArrowRight: typeof import('~icons/lucide/arrow-right')['default']
