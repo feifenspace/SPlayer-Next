@@ -9,7 +9,9 @@ import type {
   PlaybackQueueItem,
 } from "@shared/types/player";
 
-const STORAGE_KEY = "splayer.headless.remote.server";
+const SERVERS_KEY = "splayer.headless.remote.servers";
+const ACTIVE_SERVER_KEY = "splayer.headless.remote.active";
+const LEGACY_SERVER_KEY = "splayer.headless.remote.server";
 const DEFAULT_TIMEOUT_MS = 8000;
 
 export interface HeadlessServerProfile {
@@ -39,21 +41,37 @@ type Listener = (event: PlayerEvent) => void;
 
 const normalizeBaseUrl = (value: string): string => value.trim().replace(/\/+$/, "");
 
-const readProfile = (): HeadlessServerProfile | null => {
+const readProfiles = (): HeadlessServerProfile[] => {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return null;
-    const value = JSON.parse(raw) as Partial<HeadlessServerProfile>;
-    if (!value.baseUrl) return null;
-    return {
+    const stored = localStorage.getItem(SERVERS_KEY);
+    if (stored) {
+      const values = JSON.parse(stored) as Array<Partial<HeadlessServerProfile>>;
+      return values
+        .filter((value) => value.baseUrl)
+        .map((value) => ({
+          id: value.id || normalizeBaseUrl(value.baseUrl as string),
+          name: value.name || value.baseUrl as string,
+          baseUrl: normalizeBaseUrl(value.baseUrl as string),
+          token: value.token || undefined,
+        }));
+    }
+    const legacy = localStorage.getItem(LEGACY_SERVER_KEY);
+    if (!legacy) return [];
+    const value = JSON.parse(legacy) as Partial<HeadlessServerProfile>;
+    if (!value.baseUrl) return [];
+    return [{
       id: value.id || normalizeBaseUrl(value.baseUrl),
       name: value.name || value.baseUrl,
       baseUrl: normalizeBaseUrl(value.baseUrl),
       token: value.token || undefined,
-    };
+    }];
   } catch {
-    return null;
+    return [];
   }
+};
+
+const persistProfiles = (profiles: HeadlessServerProfile[]): void => {
+  localStorage.setItem(SERVERS_KEY, JSON.stringify(profiles));
 };
 
 const toPlayerState = (value: unknown): PlayerStatus["state"] => {
@@ -99,7 +117,11 @@ const toLoadResult = (track: Track | undefined): LoadResult => ({
 });
 
 class HeadlessRemoteClient {
-  private profile: HeadlessServerProfile | null = readProfile();
+  private profiles: HeadlessServerProfile[] = readProfiles();
+  private activeId: string | null =
+    localStorage.getItem(ACTIVE_SERVER_KEY) || this.profiles[0]?.id || null;
+  private profile: HeadlessServerProfile | null =
+    this.profiles.find((item) => item.id === this.activeId) ?? this.profiles[0] ?? null;
   private socket: WebSocket | null = null;
   private socketGeneration = 0;
   private listeners = new Set<Listener>();
@@ -119,13 +141,43 @@ class HeadlessRemoteClient {
       baseUrl: normalizeBaseUrl(profile.baseUrl),
       token: profile.token || undefined,
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+    const index = this.profiles.findIndex((item) => item.id === next.id);
+    if (index >= 0) this.profiles[index] = next;
+    else this.profiles.push(next);
+    persistProfiles(this.profiles);
+    this.activeId = next.id;
+    localStorage.setItem(ACTIVE_SERVER_KEY, next.id);
     this.profile = next;
     this.disconnect();
   }
 
   getProfile(): HeadlessServerProfile | null {
     return this.profile;
+  }
+
+  getProfiles(): HeadlessServerProfile[] {
+    return [...this.profiles];
+  }
+
+  select(id: string): void {
+    const next = this.profiles.find((item) => item.id === id);
+    if (!next) throw new Error("Headless server not found");
+    this.disconnect();
+    this.activeId = next.id;
+    this.profile = next;
+    localStorage.setItem(ACTIVE_SERVER_KEY, next.id);
+  }
+
+  remove(id: string): void {
+    this.profiles = this.profiles.filter((item) => item.id !== id);
+    persistProfiles(this.profiles);
+    if (this.activeId === id) {
+      this.disconnect();
+      this.profile = this.profiles[0] ?? null;
+      this.activeId = this.profile?.id ?? null;
+      if (this.activeId) localStorage.setItem(ACTIVE_SERVER_KEY, this.activeId);
+      else localStorage.removeItem(ACTIVE_SERVER_KEY);
+    }
   }
 
   isConfigured(): boolean {
@@ -265,6 +317,31 @@ class HeadlessRemoteClient {
     return this.request<HeadlessQueueSnapshot>("/api/v1/player/queue");
   }
 
+  async updateQueue(
+    items: PlaybackQueueItem[],
+    index: number,
+    repeat: string,
+    shuffle: boolean,
+  ): Promise<void> {
+    await this.request("/api/v1/player/queue", {
+      method: "PUT",
+      body: JSON.stringify({
+        items: items.map(({ track }) => ({
+          source: track.path ?? "",
+          duration_ms: track.duration,
+          title: track.title,
+          artist: track.artists?.map((item) => item.name).join(", "),
+          album: track.album?.name,
+          cover: track.cover,
+          track,
+        })),
+        index,
+        repeat,
+        shuffle,
+      }),
+    });
+  }
+
   async nowPlaying(): Promise<HeadlessNowPlaying> {
     return this.request<HeadlessNowPlaying>("/api/v1/player/now-playing");
   }
@@ -346,3 +423,9 @@ export const disconnectHeadlessServer = (): void => headlessRemote.disconnect();
 export const getHeadlessQueue = (): Promise<HeadlessQueueSnapshot> => headlessRemote.queue();
 export const getHeadlessNowPlaying = (): Promise<HeadlessNowPlaying> => headlessRemote.nowPlaying();
 export const getHeadlessDevices = (): Promise<AudioDevice[]> => headlessRemote.devices();
+
+export const getHeadlessServers = (): HeadlessServerProfile[] => headlessRemote.getProfiles();
+export const selectHeadlessServer = (id: string): void => headlessRemote.select(id);
+export const removeHeadlessServer = (id: string): void => headlessRemote.remove(id);
+
+export const updateHeadlessQueue = (items: PlaybackQueueItem[], index: number, repeat: string, shuffle: boolean): Promise<void> => headlessRemote.updateQueue(items, index, repeat, shuffle);

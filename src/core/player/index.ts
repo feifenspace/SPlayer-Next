@@ -40,6 +40,7 @@ import bridge, {
   isHeadlessRemote,
 } from "@/services/bridge";
 import { isLanSyncReceiver } from "@/composables/useLanSyncRole";
+import { updateHeadlessQueue } from "@/services/headlessRemote";
 import {
   dispatchLanRemoteCommand,
   isApplyingRemoteState,
@@ -1187,6 +1188,7 @@ export const moveInQueue = (fromIndex: number, toIndex: number): void => {
 
 let unsubscribe: (() => void) | null = null;
 let initialized = false;
+let headlessQueueSyncStop: (() => void) | null = null;
 
 /** 初始化播放器 */
 export const initPlayer = async (): Promise<void> => {
@@ -1206,6 +1208,23 @@ export const initPlayer = async (): Promise<void> => {
         );
         queue.setQueue(tracks);
         status.playIndex = Number(remoteQueue.index ?? remoteQueue.pos ?? 0);
+        if (headlessQueueSyncStop) headlessQueueSyncStop();
+        let timer: number | undefined;
+        headlessQueueSyncStop = watch(
+          [() => queue.queueEntries.value, () => status.playIndex, () => status.repeatMode, () => status.shuffleMode],
+          () => {
+            if (timer !== undefined) window.clearTimeout(timer);
+            timer = window.setTimeout(() => {
+              void updateHeadlessQueue(
+                queue.queueEntries.value,
+                status.playIndex,
+                status.repeatMode,
+                status.shuffleMode === "on",
+              ).catch((error) => console.warn("[player] remote queue sync failed", error));
+            }, 180);
+          },
+          { deep: true },
+        );
       } else {
         console.warn("[player] no Headless server configured");
       }
@@ -1327,6 +1346,10 @@ export const restoreLastTrack = async (): Promise<void> => {
 
 /** 清理事件订阅 */
 export const disposePlayer = (): void => {
+  if (headlessQueueSyncStop) {
+    headlessQueueSyncStop();
+    headlessQueueSyncStop = null;
+  }
   disposeNextTrackPreload();
   if (unsubscribe) {
     unsubscribe();
