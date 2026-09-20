@@ -6,7 +6,7 @@ import * as playback from "@/services/playback";
 import * as autoClose from "@/services/autoClose";
 import * as abLoop from "@/services/abLoop";
 import * as cacheScheduler from "@/services/cacheScheduler";
-import { isAndroidNative } from "@/services/bridge";
+import { isAndroidNative, isHeadlessRemote } from "@/services/bridge";
 import * as playStats from "./stats";
 import {
   hasReachedSeekTarget,
@@ -42,7 +42,7 @@ const finishCurrentTrack = async (): Promise<void> => {
     // 定时关闭"等本曲结束"模式
     if (stopByTimer) return;
     // Android：自动续播由原生闭环（ended 到达即原生已放弃推进），不再触发切歌
-    if (isAndroidNative) return;
+    if (isAndroidNative || isHeadlessRemote) return;
     // 单曲循环：seek 回开头继续播放
     if (repeatOne) {
       await seek(0);
@@ -135,7 +135,7 @@ export const handleEvent = async (event: PlayerEvent): Promise<void> => {
         if (stopByTimer) break;
 
         // Android：自动续播由原生闭环（ended 到达即原生已放弃推进），不再触发切歌
-        if (isAndroidNative) break;
+        if (isAndroidNative || isHeadlessRemote) break;
 
         // 单曲循环：seek 回开头继续播放
         if (repeatOne) {

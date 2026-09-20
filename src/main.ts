@@ -24,6 +24,7 @@ import {
   setEmbeddedApiReadyPromise,
   isAndroid,
   isAndroidNative,
+  isHeadlessRemote,
 } from "./services/bridge";
 import bridge from "./services/bridge";
 import {
@@ -40,14 +41,14 @@ app.directive("ripple", vRipple);
 app.use(pinia);
 app.use(router);
 app.use(i18n);
-const embeddedApiReady = isAndroidNative ? waitForEmbeddedApiReady() : Promise.resolve(true);
+const embeddedApiReady = isAndroidNative && !isHeadlessRemote ? waitForEmbeddedApiReady() : Promise.resolve(true);
 // 把 ready promise 注入 bridge：apiFetch 在未就绪时会 await 它，避免组件 onMounted 早调 API 直接抛错
 if (isAndroidNative) setEmbeddedApiReadyPromise(embeddedApiReady);
 
 if (isAndroid) {
-  setApiPort(EMBEDDED_API_PORT);
+  if (!isHeadlessRemote) setApiPort(EMBEDDED_API_PORT);
   (window as unknown as Record<string, unknown>).api = bridge;
-  if (!isAndroidNative) setAndroidEmbeddedApiAvailable(true);
+  if (!isAndroidNative || isHeadlessRemote) setAndroidEmbeddedApiAvailable(true);
 }
 
 // 初始化主题
@@ -61,7 +62,7 @@ useThemeStore().init();
 export let embeddedApiCookieReady: Promise<void> = Promise.resolve();
 
 // Android 端设置 Node.js 嵌入式 API 端口；浏览器预览由 Vite dev 启动同端口 API。
-if (isAndroid) {
+if (isAndroid && !isHeadlessRemote) {
   // 立刻 hydrate user store：pinia-plugin-persistedstate 在首次访问时同步从 localStorage 读取
   const user = useUserStore();
   embeddedApiCookieReady = embeddedApiReady
@@ -124,6 +125,7 @@ const removeSplash = (): void => {
  */
 const bootstrapPlayback = async (): Promise<void> => {
   await initPlayer();
+  if (isHeadlessRemote) return;
 
   const pendingAudioFiles = await window.api.system.consumePendingAudioFiles();
   const pendingOrpheusUrl = await window.api.system.consumePendingProtocolUrl();

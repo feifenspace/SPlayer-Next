@@ -143,10 +143,11 @@ import { defaultSystemConfig } from "@shared/defaults/settings";
 import { defaultHotkeyConfig } from "@shared/defaults/hotkeys";
 import { useSettingsStore } from "@/stores/settings";
 import { toggleEruda, reportNetworkEntry } from "@/composables/useEruda";
-import { isAndroid, isAndroidNative, isAndroidPreview } from "@/utils/platform";
+import { isAndroid, isAndroidNative, isAndroidPreview, isHeadlessRemote } from "@/utils/platform";
 
 // 平台检测常量已抽到叶子模块 @/utils/platform 以打破循环依赖；re-export 保持既有导入路径
-export { isAndroid, isAndroidNative, isAndroidPreview };
+export { isAndroid, isAndroidNative, isAndroidPreview, isHeadlessRemote };
+import { headlessRemote } from "@/services/headlessRemote";
 
 /**
  * 将 file:// / content:// URI 转为 Capacitor WebView 可加载的 URL。
@@ -1800,6 +1801,7 @@ const bridge = {
   player: {
     load: async (source: string, options?: LoadOptions): Promise<IpcResponse<LoadResult>> => {
       if (isAndroidPreview) return loadPreviewAudio(source, options);
+      if (isHeadlessRemote) return headlessRemote.load(source, options);
       if (!isAndroid) return electronApi().player.load(source, options);
       const result = await getPlaybackPlugin().load({
         url: source,
@@ -1814,7 +1816,9 @@ const bridge = {
     play: (): Promise<IpcResponse> =>
       isAndroidPreview
         ? playPreviewAudio()
-        : isAndroid
+        : isHeadlessRemote
+          ? headlessRemote.play()
+          : isAndroid
           ? getPlaybackPlugin()
               .play()
               .then((res) =>
@@ -1824,7 +1828,9 @@ const bridge = {
     pause: (): Promise<IpcResponse> =>
       isAndroidPreview
         ? Promise.resolve(pausePreviewAudio())
-        : isAndroid
+        : isHeadlessRemote
+          ? headlessRemote.pause()
+          : isAndroid
           ? getPlaybackPlugin()
               .pause()
               .then((res) =>
@@ -1839,7 +1845,9 @@ const bridge = {
     stop: (): Promise<IpcResponse> =>
       isAndroidPreview
         ? Promise.resolve(stopPreviewAudio())
-        : isAndroid
+        : isHeadlessRemote
+          ? headlessRemote.stop()
+          : isAndroid
           ? getPlaybackPlugin()
               .stop()
               .then((res) =>
@@ -1849,7 +1857,9 @@ const bridge = {
     seek: (positionMs: number): Promise<IpcResponse> =>
       isAndroidPreview
         ? Promise.resolve(seekPreviewAudio(positionMs))
-        : isAndroid
+        : isHeadlessRemote
+          ? headlessRemote.seek(positionMs)
+          : isAndroid
           ? getPlaybackPlugin()
               .seek({ positionMs })
               .then((res) =>
@@ -1859,7 +1869,9 @@ const bridge = {
     setVolume: (volume: number): Promise<IpcResponse> =>
       isAndroidPreview
         ? Promise.resolve(setPreviewVolume(volume))
-        : isAndroid
+        : isHeadlessRemote
+          ? headlessRemote.setVolume(volume)
+          : isAndroid
           ? getPlaybackPlugin()
               .setVolume({ volume })
               .then((res) =>
@@ -1869,7 +1881,9 @@ const bridge = {
     getVolume: (): Promise<IpcResponse<number>> =>
       isAndroidPreview
         ? Promise.resolve(ok(previewVolume))
-        : isAndroid
+        : isHeadlessRemote
+          ? headlessRemote.status().then((res) => ({ success: true, data: res.data?.volume ?? 1 }))
+          : isAndroid
           ? getPlaybackPlugin()
               .getStatus()
               .then((s) => ({
@@ -1888,7 +1902,9 @@ const bridge = {
     getStatus: (): Promise<IpcResponse<PlayerStatus>> =>
       isAndroidPreview
         ? Promise.resolve(ok(getPreviewStatus()))
-        : isAndroid
+        : isHeadlessRemote
+          ? headlessRemote.status()
+          : isAndroid
           ? getPlaybackPlugin()
               .getStatus()
               .then((res) => {
@@ -1979,8 +1995,10 @@ const bridge = {
         ? (androidWarn("player", "reinit"), Promise.resolve({ success: true }))
         : electronApi().player.reinit(),
     getOutputDevices: (): Promise<IpcResponse<AudioDevice[]>> =>
-      isAndroid
-        ? (androidWarn("player", "getOutputDevices"), Promise.resolve({ success: true, data: [] }))
+      isHeadlessRemote
+        ? headlessRemote.devices().then((data) => ({ success: true, data }))
+        : isAndroid
+          ? (androidWarn("player", "getOutputDevices"), Promise.resolve({ success: true, data: [] }))
         : electronApi().player.getOutputDevices(),
     getDefaultDeviceName: (): Promise<IpcResponse<string | null>> =>
       isAndroid
@@ -1988,8 +2006,10 @@ const bridge = {
           Promise.resolve({ success: true, data: null }))
         : electronApi().player.getDefaultDeviceName(),
     setOutputDevice: (deviceId: string | null, pauseBeforeSwitch = false): Promise<IpcResponse> =>
-      isAndroid
-        ? (androidWarn("player", "setOutputDevice"), Promise.resolve({ success: true }))
+      isHeadlessRemote
+        ? headlessRemote.setOutputDevice(deviceId)
+        : isAndroid
+          ? (androidWarn("player", "setOutputDevice"), Promise.resolve({ success: true }))
         : electronApi().player.setOutputDevice(deviceId, pauseBeforeSwitch),
     setPauseOnDeviceSwitch: (enabled: boolean): Promise<IpcResponse> =>
       isAndroid
@@ -2038,6 +2058,7 @@ const bridge = {
         previewPlayerListeners.add(callback);
         return () => previewPlayerListeners.delete(callback);
       }
+      if (isHeadlessRemote) return headlessRemote.onEvent(callback);
       if (!isAndroid) return electronApi().player.onEvent(callback);
       const plugin = getPlaybackPlugin();
       const listeners: Array<Promise<{ remove: () => void }>> = [];

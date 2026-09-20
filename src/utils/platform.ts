@@ -13,3 +13,5 @@ export const isAndroid =
 export const isAndroidNative = isAndroid && Capacitor.isNativePlatform();
 /** 浏览器预览 Android UI（如从设备打开主机 IP 页面）；此时无法运行嵌入式服务，不能充当广播主机。 */
 export const isAndroidPreview = isAndroid && !isAndroidNative;
+
+export const isHeadlessRemote = isAndroid;

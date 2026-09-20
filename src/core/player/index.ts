@@ -37,6 +37,7 @@ import bridge, {
   ensureNotificationPermission,
   isAndroid,
   isAndroidNative,
+  isHeadlessRemote,
 } from "@/services/bridge";
 import { isLanSyncReceiver } from "@/composables/useLanSyncRole";
 import {
@@ -346,7 +347,21 @@ const loadTrack = async (track: Track | null, context?: PlaybackContext): Promis
   media.setPlaybackContext(context);
   lyricLoader.beginLoad();
   resetForLoad(track.duration ?? 0);
-  // Android：播放权威在原生。推全量队列上下文后由原生解析并开播，JS 不做音源解析
+  // Headless remote playback is authoritative on the server.
+  if (isHeadlessRemote) {
+    status.currentSource = track.path ?? null;
+    try {
+      await bridge.player.load(
+        track.path ?? track.mediaId ?? track.id,
+        { autoPlay: true, meta: track, context },
+      );
+    } catch (error) {
+      console.warn("[player] headless remote load failed", error);
+      if (myToken === trackToken) status.trackLoading = false;
+    }
+    return;
+  }
+  // Android native playback is authoritative on the device.
   if (isAndroidNative) {
     const isOnline = track.source !== "local";
     if (isOnline) {
@@ -1178,15 +1193,31 @@ export const initPlayer = async (): Promise<void> => {
   if (initialized) return;
   initialized = true;
   console.log("[player] init");
-  // 先从主进程同步后端配置，确保 system 设置可用
   const settings = useSettingsStore();
-  await settings.syncSystem();
-  // 流媒体。?store 必须在恢复队列前就绪，否则队列里?streaming track 拿不?cfg
-  await useStreamingStore().init();
-  // 插件 store 同理：在线歌曲 URL 兜底走插件，列表必须在 loadTrack 前就绪
-  void usePluginsStore().load();
-  await queue.restoreQueue();
   const status = useStatusStore();
+  if (isHeadlessRemote) {
+    try {
+      const remote = await import("@/services/headlessRemote");
+      if (remote.isHeadlessServerConfigured()) {
+        await remote.connectHeadlessServer();
+        const remoteQueue = await remote.getHeadlessQueue();
+        const tracks = (remoteQueue.items ?? []).map((item) =>
+          "track" in item ? item.track : (item as unknown as Track),
+        );
+        queue.setQueue(tracks);
+        status.playIndex = Number(remoteQueue.index ?? remoteQueue.pos ?? 0);
+      } else {
+        console.warn("[player] no Headless server configured");
+      }
+    } catch (error) {
+      console.warn("[player] Headless connection unavailable", error);
+    }
+  } else {
+    await settings.syncSystem();
+    await useStreamingStore().init();
+    void usePluginsStore().load();
+    await queue.restoreQueue();
+  }
   // 兼容移除“不循环”前持久化的旧状态
   if ((status.repeatMode as string) === "off") status.repeatMode = "list";
   // 恢复上次的音量和播放模式到主进程

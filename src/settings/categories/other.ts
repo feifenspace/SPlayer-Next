@@ -1,5 +1,6 @@
 import type { SettingCategory } from "@/types/settings-schema";
 import PlatformAccount from "@/components/settings/custom/PlatformAccount.vue";
+import HeadlessServerConfig from "@/components/settings/custom/HeadlessServerConfig.vue";
 import IconLucideSettings from "~icons/lucide/settings";
 
 const otherCategory: SettingCategory = {
@@ -58,6 +59,19 @@ const otherCategory: SettingCategory = {
             contentKey: "settings.confirm.kugouLoginVersionContent",
             type: "warning",
           },
+        },
+      ],
+    },
+    {
+      id: "headlessRemote",
+      platform: "android",
+      items: [
+        {
+          key: "headlessRemoteServer",
+          type: "custom",
+          component: HeadlessServerConfig,
+          fullWidth: true,
+          searchable: false,
         },
       ],
     },
