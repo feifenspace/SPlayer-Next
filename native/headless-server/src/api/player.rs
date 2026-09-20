@@ -44,6 +44,58 @@ pub struct SeekRequest {
     pub(crate) position_secs: f64,
 }
 
+/// 由遥控器提交完整曲目快照；在线曲目由服务端账号解析为直链后再进入统一加载状态机。
+#[derive(Debug, Deserialize)]
+pub struct LoadTrackRequest {
+    pub track: serde_json::Value,
+    pub auto_play: Option<bool>,
+}
+
+pub(crate) async fn load_track_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<LoadTrackRequest>,
+) -> Result<Json<PlayerResponse>, ApiError> {
+    let track = payload.track;
+    let path = track.get("path").and_then(Value::as_str).unwrap_or("").to_owned();
+    let source = if !path.is_empty() {
+        path
+    } else {
+        let item = crate::state::QueueItem {
+            source: String::new(),
+            duration_ms: track.get("duration").and_then(Value::as_u64),
+            title: track.get("title").and_then(Value::as_str).map(str::to_owned),
+            artist: track.get("artists").and_then(Value::as_array).map(|artists| {
+                artists.iter().filter_map(|artist| artist.get("name").and_then(Value::as_str)).collect::<Vec<_>>().join(", ")
+            }),
+            album: track.get("album").and_then(|album| album.get("name")).and_then(Value::as_str).map(str::to_owned),
+            cover: track.get("cover").and_then(Value::as_str).map(str::to_owned),
+            track: Some(track.clone()),
+        };
+        super::queue_source_resolver::resolve(&state, &item)
+            .await
+            .map_err(|error| ApiError::bad_request(error))?
+    };
+    let meta = LoadMeta {
+        id: track.get("id").and_then(Value::as_str).map(str::to_owned),
+        title: track.get("title").and_then(Value::as_str).map(str::to_owned),
+        artist: track.get("artists").and_then(Value::as_array).map(|artists| {
+            artists.iter().filter_map(|artist| artist.get("name").and_then(Value::as_str)).collect::<Vec<_>>().join(", ")
+        }),
+        album: track.get("album").and_then(|album| album.get("name")).and_then(Value::as_str).map(str::to_owned),
+        duration: track.get("duration").and_then(Value::as_u64),
+        track: track.get("track").and_then(Value::as_u64).and_then(|value| u16::try_from(value).ok()),
+        cue_path: track.get("cuePath").and_then(Value::as_str).map(str::to_owned),
+        cue_audio_path: track.get("cueAudioPath").and_then(Value::as_str).map(str::to_owned),
+        cue_start_ms: track.get("cueStartMs").and_then(Value::as_u64),
+        cue_end_ms: track.get("cueEndMs").and_then(Value::as_u64),
+    };
+    load_handler(
+        State(state),
+        Query(LoadQuery {}),
+        Json(LoadRequest { source, auto_play: payload.auto_play, meta: Some(meta) }),
+    ).await
+}
+
 /// 加载请求体
 #[derive(Debug, Deserialize)]
 pub struct LoadRequest {

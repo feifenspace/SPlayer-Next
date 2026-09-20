@@ -104,6 +104,7 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::get(player::devices_handler),
         )
         .route("/api/v1/player/load", axum::routing::post(load_handler))
+        .route("/api/v1/player/load-track", axum::routing::post(load_track_handler))
         .route("/api/v1/player/seek", axum::routing::post(seek_handler))
         // 服务端权威“正在播放”快照（重开页面/无浏览器恢复曲目显示）
         .route(
