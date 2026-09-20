@@ -181,10 +181,7 @@ impl QueueSnapshot {
     pub fn align_by_identity(&mut self, source: Option<&str>, track_id: Option<&str>) -> bool {
         if let Some(track_id) = track_id.filter(|id| !id.is_empty()) {
             if let Some(pos) = self.order.iter().position(|&idx| {
-                self.items
-                    .get(idx)
-                    .and_then(Self::item_track_id)
-                    .as_deref() == Some(track_id)
+                self.items.get(idx).and_then(Self::item_track_id).as_deref() == Some(track_id)
             }) {
                 self.pos = pos;
                 return true;
@@ -305,6 +302,9 @@ pub struct AppState {
     pub load_download_cancel: Arc<Mutex<Option<audio_engine_core::HttpCancelHandle>>>,
     /// v10：ALSA 原生 DSD 直出流（alsammap + DSD 源时挂载；load/stop 轮换）
     pub alsa_dsd_stream: Arc<Mutex<Option<Arc<crate::api::AlsaDsdHandle>>>>,
+    /// 原生 DSD 加载串行闸门：保证旧 ALSA DSD 流完全释放后再打开下一条流。
+    /// DSD 设备是独占资源，不能允许并发 load 在 worker 尚未挂载句柄时同时 open。
+    pub alsa_dsd_load_lock: Arc<tokio::sync::Mutex<()>>,
     /// 事件回调维护的最新状态快照（避免回调中加锁 player 导致死锁）
     snapshot: Arc<RwLock<Option<PlayerSnapshot>>>,
 }
@@ -378,7 +378,9 @@ impl AppState {
                             name = %first.output_name,
                             "局域网 Diretta 自动发现，设为默认输出"
                         );
-                        player_for_auto_scan.lock().set_output_device(Some(first.id.clone()));
+                        player_for_auto_scan
+                            .lock()
+                            .set_output_device(Some(first.id.clone()));
                     } else {
                         info!("局域网未发现 Diretta 目标，保持未选择输出（等待手动选择）");
                     }
@@ -395,16 +397,20 @@ impl AppState {
         let fft_subscriber_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pending_next = Arc::new(Mutex::new(None));
         let restored_queue = crate::db::get_server_state(&db.lock(), "playback_queue")
-            .ok().flatten()
+            .ok()
+            .flatten()
             .and_then(|value| serde_json::from_str::<Option<QueueSnapshot>>(&value).ok())
             .flatten()
-            .filter(|queue| queue.order.len() == queue.items.len()
-                && queue.order.iter().all(|&index| index < queue.items.len())
-                && (queue.items.is_empty() || queue.pos < queue.order.len()));
+            .filter(|queue| {
+                queue.order.len() == queue.items.len()
+                    && queue.order.iter().all(|&index| index < queue.items.len())
+                    && (queue.items.is_empty() || queue.pos < queue.order.len())
+            });
         let queue: Arc<Mutex<Option<QueueSnapshot>>> = Arc::new(Mutex::new(restored_queue));
         let direct_boundary_event: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let server_play_session: Arc<Mutex<Option<ServerPlaySession>>> = Arc::new(Mutex::new(None));
-        let server_play_completed: Arc<Mutex<Vec<ServerPlaySession>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_play_completed: Arc<Mutex<Vec<ServerPlaySession>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let server_play_finalize_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let load_download_cancel: Arc<Mutex<Option<audio_engine_core::HttpCancelHandle>>> =
             Arc::new(Mutex::new(None));
@@ -460,8 +466,7 @@ impl AppState {
                                 }
                                 _ => {
                                     if let Some(since) = session.playing_since.take() {
-                                        session.listened_ms +=
-                                            unix_millis().saturating_sub(since);
+                                        session.listened_ms += unix_millis().saturating_sub(since);
                                     }
                                 }
                             }
@@ -689,6 +694,7 @@ impl AppState {
             server_play_finalize_requested,
             load_download_cancel,
             alsa_dsd_stream: Arc::new(Mutex::new(None)),
+            alsa_dsd_load_lock: Arc::new(tokio::sync::Mutex::new(())),
             snapshot,
         })
     }
@@ -697,6 +703,40 @@ impl AppState {
     /// HTTP/WS 快照读取（A4）：优先读事件回调维护的缓存，热路径全程不碰
     /// player 锁；仅冷启动（尚无任何事件）短锁补齐一次
     pub fn snapshot(&self) -> PlayerSnapshot {
+        // Native DSD 直出绕过 audio-engine-core::Player 的普通 playback
+        // 状态机；这里把独立 DSD handle 映射回同一份快照，保证 HTTP/WS
+        // 与前端看到的播放状态、位置和曲目保持一致。
+        if let Some(handle) = self.alsa_dsd_stream.lock().clone() {
+            let mut snap = self.snapshot.read().clone().unwrap_or(PlayerSnapshot {
+                position: 0.0,
+                duration: 0.0,
+                volume: 1.0,
+                speed: 1.0,
+                state: PlayerState::Idle,
+                is_finished: false,
+                current_source: None,
+            });
+            let position_ms = handle.position.load(std::sync::atomic::Ordering::Acquire);
+            snap.position = (position_ms as f64 / 1000.0).min(handle.duration.max(0.0));
+            snap.duration = handle.duration;
+            snap.state = if handle.playing.load(std::sync::atomic::Ordering::Acquire) {
+                PlayerState::Playing
+            } else {
+                PlayerState::Paused
+            };
+            snap.is_finished = false;
+            if let Some(source) = self
+                .now_playing
+                .lock()
+                .as_ref()
+                .and_then(|value| value.get("source"))
+                .and_then(|value| value.as_str())
+            {
+                snap.current_source = Some(source.to_owned());
+            }
+            *self.snapshot.write() = Some(snap.clone());
+            return snap;
+        }
         if let Some(cached) = self.snapshot.read().clone() {
             return cached;
         }

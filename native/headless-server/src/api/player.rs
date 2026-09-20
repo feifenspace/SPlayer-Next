@@ -92,7 +92,7 @@ pub(crate) async fn load_track_handler(
     load_handler(
         State(state),
         Query(LoadQuery {}),
-        Json(LoadRequest { source, auto_play: payload.auto_play, meta: Some(meta) }),
+        Json(LoadRequest { source, auto_play: payload.auto_play, meta: Some(meta), start_position_secs: None }),
     ).await
 }
 
@@ -105,6 +105,9 @@ pub struct LoadRequest {
     pub auto_play: Option<bool>,
     /// 伴随元数据（用于前端传递 CUE 分轨信息）
     pub meta: Option<LoadMeta>,
+    /// 原生 DSD 重开时的起始位置；普通 load 保持为 None/0
+    #[serde(default)]
+    pub start_position_secs: Option<f64>,
 }
 
 /// 前端传递的音轨元数据
@@ -573,6 +576,10 @@ pub(crate) async fn load_handler(
     Json(payload): Json<LoadRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
     let auto_play = payload.auto_play.unwrap_or(true);
+    let start_position_secs = payload
+        .start_position_secs
+        .unwrap_or(0.0)
+        .max(0.0);
     let source = payload.source;
 
     // 手动/遥控加载即接管播放：作废可能残留的曲终自动接力标志（上一曲 Ended
@@ -604,6 +611,28 @@ pub(crate) async fn load_handler(
 
     let handle = audio_engine_core::HttpCancelHandle::new();
     let source_for_decoder = resolve_cue_source(&state, &source, payload.meta.as_ref())?;
+    // 原生 DSD 使用独占 ALSA hw 设备。必须在释放旧句柄之前取得专用闸门，
+    // 否则两个并发 load 可能都看见旧句柄为空，并同时进入 open_dsd_pcm。
+    // 闸门只覆盖 ALSA 原生 DSD load，不影响 PCM、Diretta 或普通控制请求。
+    let alsa_dsd_load_guard = if is_native_dsd_source(&source_for_decoder) {
+        let is_local_alsa = state
+            .player
+            .lock()
+            .selected_device()
+            .is_some_and(|device| device.starts_with("alsa:") || device.starts_with("alsammap:"));
+        if is_local_alsa {
+            Some(state.alsa_dsd_load_lock.lock().await)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Native DSD 流不归 InnerPlayer 状态机管理。所有新 load（手动切歌、自动接力、
+    // 直接打开）都必须先释放旧 DSD 线程，否则新旧流会同时占用同一 hw 设备。
+    // 这一步只释放输出线程，不删除数据库、队列或音频文件。
+    let old_alsa_dsd = state.alsa_dsd_stream.lock().take();
+    drop(old_alsa_dsd);
     // v12-3 点播命中预载缓存：必须在 reserve 作废 stage 之前查询命中；
     // 命中则注册直通代数并保留引擎 staged（reserve 跳过 cancel），
     // handoff 排空窗口内直接接力预载候选，跳过并行开源
@@ -629,10 +658,31 @@ pub(crate) async fn load_handler(
     let alsa_dsd = reservation
         .device_name
         .as_deref()
-        .is_some_and(|d| d.starts_with("alsammap:"))
+        .is_some_and(|d| d.starts_with("alsammap:") || d.starts_with("alsa:"))
         && is_native_dsd_source(&source_for_decoder);
     if alsa_dsd {
-        return run_alsa_dsd_load(state, source, auto_play, source_for_decoder, reservation).await;
+        if let Some(guard) = alsa_dsd_load_guard {
+            let result = run_alsa_dsd_load(
+                state.clone(),
+                source,
+                auto_play,
+                source_for_decoder,
+                start_position_secs,
+                reservation,
+            )
+            .await;
+            drop(guard);
+            return result;
+        }
+        return run_alsa_dsd_load(
+            state.clone(),
+            source,
+            auto_play,
+            source_for_decoder,
+            start_position_secs,
+            reservation,
+        )
+        .await;
     }
     if reservation.direct_selector.is_some() {
         return run_direct_load(
@@ -1514,10 +1564,8 @@ fn regular_load_worker(
     // The integer MMAP path is retained for sample-level validation, but is
     // opt-in until its S32LE representation is verified on every USB DAC.
     // The established f32 MMAP path remains the safe default.
-    let integer_pcm_enabled = std::env::var("SPLAYER_ALSAMMAP_INTEGER")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let integer_pcm_enabled =
+        std::env::var("SPLAYER_ALSAMMAP_INTEGER").ok().as_deref() == Some("1");
     let integer_pcm = integer_pcm_enabled
         && output.is_alsammap()
         && !normalization_enabled
@@ -1554,6 +1602,7 @@ async fn run_alsa_dsd_load(
     source: String,
     auto_play: bool,
     source_for_decoder: String,
+    start_position_secs: f64,
     reservation: LoadReservation,
 ) -> Result<Json<PlayerResponse>, ApiError> {
     use audio_engine_core::direct_dsd::DirectDsdReader;
@@ -1577,14 +1626,21 @@ async fn run_alsa_dsd_load(
         let cancel = audio_engine_core::HttpCancelHandle::new();
         let meta = audio_engine_core::decoder::probe_metadata(&source_owned, None, cancel)
             .unwrap_or_default();
-        let reader = DirectDsdReader::open_local(std::path::Path::new(&source_owned))
+        let mut reader = DirectDsdReader::open_local(std::path::Path::new(&source_owned))
             .with_context(|| format!("打开 DSD 音源失败: {source_owned}"))?;
-        anyhow::Ok((meta, reader))
+        let actual_position = if start_position_secs > 0.0 {
+            reader
+                .seek_seconds(start_position_secs)
+                .with_context(|| format!("DSD seek 失败: {start_position_secs:.3}s"))?
+        } else {
+            0.0
+        };
+        anyhow::Ok((meta, reader, actual_position))
     })
     .await
     .map_err(|e| ApiError::internal(format!("ALSA DSD load task join error: {e}")))?;
 
-    let (metadata, reader) = match result {
+    let (metadata, reader, actual_position) = match result {
         Ok(res) => res,
         Err(err) => {
             let mut player = state.player.lock();
@@ -1601,13 +1657,9 @@ async fn run_alsa_dsd_load(
     });
 
     // 输出配置：alsammap 后端（probe 协商）+ DSD 流
-    let output = audio_engine_core::audio_output::AudioOutput::new(
-        Some(&selector),
-        None, // DSD 不走 PCM 采样率协商
-        0,
-        Arc::new(|| {}),
-    )
-    .map_err(|e| ApiError::internal(format!("打开 alsammap 输出配置失败: {e}")))?;
+    let output =
+        audio_engine_core::audio_output::AudioOutput::new_dsd(Some(&selector), 0, Arc::new(|| {}))
+            .map_err(|e| ApiError::internal(format!("打开 alsammap 输出配置失败: {e}")))?;
     let stream = output
         .build_dsd_stream(reader, on_eof)
         .map_err(|e| ApiError::internal(format!("打开 ALSA DSD 流失败: {e}")))?;
@@ -1622,7 +1674,9 @@ async fn run_alsa_dsd_load(
     let duration = metadata.duration_secs;
     let handle = Arc::new(AlsaDsdHandle {
         stream,
-        position: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        position: Arc::new(std::sync::atomic::AtomicU64::new(
+            (actual_position * 1000.0).round().max(0.0) as u64,
+        )),
         duration,
         playing: Arc::new(std::sync::atomic::AtomicBool::new(auto_play)),
     });
@@ -1889,11 +1943,44 @@ pub(crate) async fn seek_handler(
     Json(payload): Json<SeekRequest>,
 ) -> Result<Json<PlayerResponse>, ApiError> {
     let position = payload.position_secs.max(0.0);
-    // v10：ALSA DSD 位纯真流不可重定位，明确拒绝而非走状态机空转
-    if state.alsa_dsd_stream.lock().is_some() {
-        return Err(ApiError::bad_request(
-            "ALSA DSD 直出暂不支持 seek；请重新加载曲目或使用切歌控制",
-        ));
+    // 原生 DSD 不在实时写线程中直接改 reader。安全做法是停止当前 DMA，
+    // 重新打开同一源并在 DirectDsdReader 上按 DSD_SIZ_32 对齐 seek，
+    // 再用同一 ALSA/ALSA MMAP 原生格式恢复播放。
+    let dsd_was_playing = state
+        .alsa_dsd_stream
+        .lock()
+        .as_ref()
+        .map(|handle| handle.playing.load(std::sync::atomic::Ordering::Acquire));
+    if let Some(was_playing) = dsd_was_playing {
+        let source = state
+            .now_playing
+            .lock()
+            .as_ref()
+            .and_then(|value| value.get("source"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if let Some(source) = source {
+            let request = LoadRequest {
+                source,
+                auto_play: Some(true),
+                meta: None,
+                start_position_secs: Some(position),
+            };
+            let _ = load_handler(
+                State(state.clone()),
+                Query(LoadQuery {}),
+                Json(request),
+            )
+            .await?;
+            if !was_playing {
+                let _ = pause_handler(State(state.clone())).await;
+            }
+            return Ok(Json(PlayerResponse::ok(json!({
+                "status": "seeked",
+                "position": position,
+            }))));
+        }
+        return Err(ApiError::bad_request("当前原生 DSD 没有可定位的音源"));
     }
 
     let direct_take = {
@@ -2022,6 +2109,7 @@ pub(crate) async fn seek_handler(
                     source,
                     auto_play: Some(was_playing),
                     meta: None,
+                    start_position_secs: None,
                 };
                 let load_query = LoadQuery {};
                 load_handler(State(state), Query(load_query), Json(load_req)).await

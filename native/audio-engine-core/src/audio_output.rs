@@ -35,6 +35,11 @@ enum OutputBackend {
         sample_rate: u32,
         channels: u16,
     },
+    #[cfg(target_os = "linux")]
+    NativeDsd {
+        device: String,
+        access: crate::alsa_mmap_sink::DsdAccess,
+    },
 }
 
 pub struct AudioOutput {
@@ -119,12 +124,53 @@ impl AudioOutput {
         })
     }
 
+    /// 创建 native DSD 输出配置，不探测或打开普通 PCM 流。
+    /// native DSD 始终打开对应的 `hw:` 设备，避免 ALSA plug 层参与格式转换。
+    #[cfg(target_os = "linux")]
+    pub fn new_dsd(
+        device_id: Option<&str>,
+        generation: u64,
+        on_failure: OutputFailureCallback,
+    ) -> Result<Self> {
+        let selector = device_id.ok_or_else(|| anyhow!("native DSD 必须选择 ALSA 设备"))?;
+        let (device, access) = if let Some(device) = selector.strip_prefix("alsammap:") {
+            (
+                device.to_owned(),
+                crate::alsa_mmap_sink::DsdAccess::MmapInterleaved,
+            )
+        } else if let Some(device) = selector.strip_prefix("alsa:") {
+            // 前端的普通 ALSA 设备列表可能保存为 `alsa:plughw:...`。
+            // DSD 路径不能使用 plughw，否则 ALSA 可能把 DSD 当作 PCM 转换。
+            // 这里只在 native DSD 路径把同一张卡规范为 hw；PCM 路径仍保留
+            // 原来的 plughw 行为。
+            let device = device
+                .strip_prefix("plughw:")
+                .map(|rest| format!("hw:{rest}"))
+                .unwrap_or_else(|| device.to_owned());
+            (device, crate::alsa_mmap_sink::DsdAccess::RwInterleaved)
+        } else {
+            anyhow::bail!("native DSD 仅支持 alsa: 或 alsammap: 设备")
+        };
+        anyhow::ensure!(
+            device.starts_with("hw:"),
+            "native DSD 要求 hw: 直通设备，拒绝默认设备以避免 PCM 转换: {device}"
+        );
+        info!(device = %device, ?access, "创建 native DSD 输出配置");
+        Ok(Self {
+            backend: OutputBackend::NativeDsd { device, access },
+            generation,
+            on_failure,
+        })
+    }
+
     /// 实际输出流采样率（播放重采样目标）
     pub fn sample_rate(&self) -> u32 {
         match &self.backend {
             OutputBackend::Cpal { config, .. } => config.sample_rate(),
             #[cfg(target_os = "linux")]
             OutputBackend::AlsaMmap { sample_rate, .. } => *sample_rate,
+            #[cfg(target_os = "linux")]
+            OutputBackend::NativeDsd { .. } => 0,
         }
     }
 
@@ -134,6 +180,8 @@ impl AudioOutput {
             OutputBackend::Cpal { config, .. } => config.channels(),
             #[cfg(target_os = "linux")]
             OutputBackend::AlsaMmap { channels, .. } => *channels,
+            #[cfg(target_os = "linux")]
+            OutputBackend::NativeDsd { .. } => 2,
         }
     }
 
@@ -148,11 +196,16 @@ impl AudioOutput {
         on_eof: Box<dyn FnOnce() + Send>,
     ) -> Result<crate::playback::PlaybackStream> {
         let device = match &self.backend {
-            OutputBackend::AlsaMmap { device, .. } => device.clone(),
+            OutputBackend::NativeDsd { device, .. } => device.clone(),
             _ => anyhow::bail!("build_dsd_stream 仅支持 alsammap 后端"),
+        };
+        let access = match &self.backend {
+            OutputBackend::NativeDsd { access, .. } => *access,
+            _ => unreachable!(),
         };
         let stream = crate::alsa_mmap_sink::AlsaDsdStream::open(
             &device,
+            access,
             reader,
             on_eof,
             Arc::clone(&self.on_failure),
@@ -195,6 +248,10 @@ impl AudioOutput {
                     Arc::clone(&self.on_failure),
                 )?;
                 Ok(crate::playback::PlaybackStream::Alsa(stream))
+            }
+            #[cfg(target_os = "linux")]
+            OutputBackend::NativeDsd { .. } => {
+                anyhow::bail!("native DSD 输出不能接收 PCM 解码流")
             }
         }
     }
@@ -536,7 +593,8 @@ where
         let mut startup_silence_samples = config
             .sample_rate
             .saturating_div(200)
-            .saturating_mul(config.channels as u32) as usize;
+            .saturating_mul(config.channels as u32)
+            as usize;
         device.build_output_stream(
             config,
             move |data: &mut [T], _| {

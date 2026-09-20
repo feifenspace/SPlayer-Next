@@ -24,12 +24,32 @@ pub(crate) const DIRETTA_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
 
 const DIRETTA_CAPS_CACHE_TTL: Duration = Duration::from_secs(600);
 
-fn diretta_caps_cache() -> &'static Mutex<HashMap<String, (Instant, audio_engine_core::diretta::DirettaTargetCapabilities)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, audio_engine_core::diretta::DirettaTargetCapabilities)>>> = OnceLock::new();
+fn diretta_caps_cache() -> &'static Mutex<
+    HashMap<
+        String,
+        (
+            Instant,
+            audio_engine_core::diretta::DirettaTargetCapabilities,
+        ),
+    >,
+> {
+    static CACHE: OnceLock<
+        Mutex<
+            HashMap<
+                String,
+                (
+                    Instant,
+                    audio_engine_core::diretta::DirettaTargetCapabilities,
+                ),
+            >,
+        >,
+    > = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_target_caps(target: &str) -> Option<audio_engine_core::diretta::DirettaTargetCapabilities> {
+fn cached_target_caps(
+    target: &str,
+) -> Option<audio_engine_core::diretta::DirettaTargetCapabilities> {
     let mut cache = diretta_caps_cache().lock().ok()?;
     let (stored_at, caps) = cache.get(target)?;
     if stored_at.elapsed() > DIRETTA_CAPS_CACHE_TTL {
@@ -130,8 +150,12 @@ pub(crate) async fn diretta_select_handler(
     // 此前一律补前缀，本地声卡被当成 Diretta 目标，PCM/DSD 全部无法播放
     let (dev_name, is_local_device) = match raw_target {
         None => (None, false),
-        // alsammap: 本地直出选择器（B9），非 Diretta 目标，原样保留
-        Some(trimmed) if trimmed.starts_with("alsammap:") => (Some(trimmed.to_string()), true),
+        // 本地 ALSA 选择器（普通 ALSA 与 MMAP），非 Diretta 目标，原样保留。
+        // `alsa:plughw:*` 也必须在这里识别；否则会被下面的默认分支错误
+        // 包装成 `diretta:alsa:plughw:*`，导致 DSD/PCM load 无法进入 ALSA 路径。
+        Some(trimmed) if trimmed.starts_with("alsa:") || trimmed.starts_with("alsammap:") => {
+            (Some(trimmed.to_string()), true)
+        }
         Some(trimmed) if trimmed.starts_with("diretta:") || trimmed.starts_with("diretta@") => {
             (Some(trimmed.to_string()), false)
         }

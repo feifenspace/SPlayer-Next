@@ -11,13 +11,14 @@
 //! f32 拉取（16/24-bit 源在 gain=1 时 f32 往返无损），原生源格式直通解码
 //! 归入后续迭代。
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use alsa::pcm::{Access, Format, State};
 use alsa::{Direction, ValueOr, PCM};
 use anyhow::{anyhow, ensure, Context, Result};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::audio_output::OutputFailureCallback;
 use crate::priority::{bind_current_thread_to_performance_cores, boost_current_audio_thread};
@@ -32,10 +33,71 @@ pub fn xrun_total() -> u64 {
     XRUN_TOTAL.load(Ordering::Acquire)
 }
 
+/// 原生 DSD 停止前的静音收尾，覆盖普通 ALSA 和 ALSA MMAP。
+///
+/// DSD 不能像 PCM 那样把最后一个样本淡出；直接 drop 会把 DMA 中的
+/// DSD 位流截断在任意位置，部分 DAC 会把这个边界表现为点击声。切换
+/// 曲目或 seek 时先丢弃旧 DMA 队列，再按访问方式送约 20ms 的 0x69
+/// （高翻转密度的 DSD 静音模式），最后 drain，让 DAC 在重新协商前看到
+/// 稳定的静音位流。
+fn mute_dsd_before_drop(pcm: &PCM, access: DsdAccess, frame_bytes: usize, rate: u32) {
+    if pcm.drop().is_err() || pcm.prepare().is_err() {
+        let _ = pcm.drop();
+        return;
+    }
+
+    let mut remaining = (rate as usize / 50).max(1); // 20 ms DSD 静音
+    let silence = vec![0x69_u8; 4096 * frame_bytes];
+    while remaining > 0 {
+        let frames = remaining.min(4096);
+        let bytes = frames * frame_bytes;
+        let written = match access {
+            DsdAccess::MmapInterleaved => pcm
+                .io_bytes()
+                .mmap(frames, |buf: &mut [u8]| {
+                    let copy = bytes.min(buf.len());
+                    buf[..copy].copy_from_slice(&silence[..copy]);
+                    copy / frame_bytes
+                })
+                .unwrap_or(0),
+            DsdAccess::RwInterleaved => pcm
+                .io_bytes()
+                .write_all(&silence[..bytes])
+                .map(|_| frames)
+                .unwrap_or(0),
+        };
+        if written > 0 {
+            remaining = remaining.saturating_sub(written);
+        } else {
+            break;
+        }
+    }
+
+    if remaining == 0 {
+        let _ = pcm.start();
+        let _ = pcm.drain();
+    } else {
+        let _ = pcm.drop();
+    }
+}
+
 /// 连续致命错误阈值：超过后判定输出链路故障并上报（触发 OutputStalled 重建链路）
 const MAX_CONTIGUOUS_ERRORS: u32 = 50;
 /// 设备事件等待上限（毫秒）：决定 play/pause 指令的响应延迟上界
 const WAIT_CEILING_MS: u32 = 50;
+/// Native DSD 切歌时，旧 ALSA worker 可能正处于 close/stop 的短窗口。
+/// 设备打开失败只允许短时重试，避免把瞬时释放竞态误报成硬件不支持。
+const DSD_OPEN_RETRIES: usize = 20;
+const DSD_OPEN_RETRY_MS: u64 = 50;
+
+/// Native DSD 的 ALSA 访问方式。
+/// 普通 ALSA 使用 RWInterleaved，ALSA MMAP 使用 MMapInterleaved；两者
+/// 都直接写 DSD 原始线格式，不经过 PCM 解码或重采样。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DsdAccess {
+    RwInterleaved,
+    MmapInterleaved,
+}
 
 /// 等待已经提交给 ALSA DMA 的旧音频自然播放完，再释放 PCM。
 ///
@@ -62,26 +124,32 @@ fn drain_before_drop(pcm: &PCM, format: Format, hardware_paused: bool, rate: u32
         }
         let frames = avail.min(remaining).min(4096);
         let written = if format == Format::s16() {
-            match pcm.io_i16().and_then(|io| io.mmap(frames, |buf: &mut [i16]| {
-                buf.fill(0);
-                frames
-            })) {
+            match pcm.io_i16().and_then(|io| {
+                io.mmap(frames, |buf: &mut [i16]| {
+                    buf.fill(0);
+                    frames
+                })
+            }) {
                 Ok(n) => n,
                 Err(_) => break,
             }
         } else if format == Format::s24() {
-            match pcm.io_i32_s24().and_then(|io| io.mmap(frames, |buf: &mut [i32]| {
+            match pcm.io_i32_s24().and_then(|io| {
+                io.mmap(frames, |buf: &mut [i32]| {
                     buf.fill(0);
                     frames
-                })) {
+                })
+            }) {
                 Ok(n) => n,
                 Err(_) => break,
             }
         } else {
-            match pcm.io_i32().and_then(|io| io.mmap(frames, |buf: &mut [i32]| {
-                buf.fill(0);
-                frames
-            })) {
+            match pcm.io_i32().and_then(|io| {
+                io.mmap(frames, |buf: &mut [i32]| {
+                    buf.fill(0);
+                    frames
+                })
+            }) {
                 Ok(n) => n,
                 Err(_) => break,
             }
@@ -90,7 +158,10 @@ fn drain_before_drop(pcm: &PCM, format: Format, hardware_paused: bool, rate: u32
     }
 
     if remaining > 0 {
-        warn!(remaining, rate, "ALSA MMAP 停止静音垫未完全写入，回退强制释放");
+        warn!(
+            remaining,
+            rate, "ALSA MMAP 停止静音垫未完全写入，回退强制释放"
+        );
     } else if let Err(error) = pcm.drain() {
         warn!(%error, rate, "ALSA MMAP 正常 drain 失败，回退强制释放");
     }
@@ -349,10 +420,7 @@ fn write_loop(
                 SwParams::get_start_threshold(&sw)
             })
             .unwrap_or(-1);
-        info!(
-            buf, per, start_th, rate,
-            "ALSA MMAP 写循环几何"
-        );
+        info!(buf, per, start_th, rate, "ALSA MMAP 写循环几何");
     }
     let mut hardware_paused = false;
     let mut pause_draining = false;
@@ -595,7 +663,10 @@ fn write_loop(
         if matches!(pcm.state(), State::Prepared) {
             match pcm.start() {
                 Ok(()) => {
-                    info!(filled = buffer_frames.saturating_sub(avail as u64), "ALSA MMAP 显式 start：hw 自动启动未触发，已手动拉起");
+                    info!(
+                        filled = buffer_frames.saturating_sub(avail as u64),
+                        "ALSA MMAP 显式 start：hw 自动启动未触发，已手动拉起"
+                    );
                 }
                 Err(err) => {
                     if pcm.state() == State::XRun {
@@ -646,13 +717,15 @@ fn write_loop_integer(
             } else if stopped.load(Ordering::Acquire) {
                 0
             } else {
-            let sample = source.next().unwrap_or(0);
-            let gain = f32::from_bits(volume.load(Ordering::Relaxed));
-            if gain.to_bits() == 1.0_f32.to_bits() {
-                sample
-            } else {
-                (sample as f32 * gain).round().clamp(i32::MIN as f32, i32::MAX as f32) as i32
-            }
+                let sample = source.next().unwrap_or(0);
+                let gain = f32::from_bits(volume.load(Ordering::Relaxed));
+                if gain.to_bits() == 1.0_f32.to_bits() {
+                    sample
+                } else {
+                    (sample as f32 * gain)
+                        .round()
+                        .clamp(i32::MIN as f32, i32::MAX as f32) as i32
+                }
             }
         }};
     }
@@ -889,6 +962,7 @@ fn open_dsd_pcm(
     device: &str,
     dsd_bit_rate: u32,
     channels: u32,
+    access: DsdAccess,
 ) -> Result<(alsa::pcm::PCM, u32, DsdWireFmt)> {
     let pcm = alsa::pcm::PCM::new(device, Direction::Playback, false)
         .with_context(|| format!("打开 DSD 设备 {device} 失败"))?;
@@ -899,7 +973,10 @@ fn open_dsd_pcm(
     ] {
         let alsa_rate = dsd_bit_rate / divisor;
         let mut h = alsa::pcm::HwParams::any(&pcm)?;
-        h.set_access(Access::MMapInterleaved)?;
+        h.set_access(match access {
+            DsdAccess::RwInterleaved => Access::RWInterleaved,
+            DsdAccess::MmapInterleaved => Access::MMapInterleaved,
+        })?;
         h.set_channels(channels).map_err(|_| {
             anyhow!("DSD 设备 {device} 不支持 {channels} 声道（该设备 DSD altset 可能仅立体声，多声道 DSD 请用 Diretta 输出）")
         })?;
@@ -944,6 +1021,7 @@ impl AlsaDsdStream {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         device: &str,
+        access: DsdAccess,
         mut reader: crate::direct_dsd::DirectDsdReader,
         on_eof: Box<dyn FnOnce() + Send>,
         on_failure: OutputFailureCallback,
@@ -952,7 +1030,27 @@ impl AlsaDsdStream {
         let bit_rate = fmt.bit_rate;
         let channels = u32::from(fmt.channels);
         // 早期探测：设备 DSD 格式/声道数/速率任一不满足都在此报清晰错误
-        let (pcm_probe, probe_rate, _wire) = open_dsd_pcm(device, bit_rate, channels)?;
+        let mut probe = None;
+        let mut last_error = None;
+        for attempt in 0..=DSD_OPEN_RETRIES {
+            match open_dsd_pcm(device, bit_rate, channels, access) {
+                Ok(result) => {
+                    probe = Some(result);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < DSD_OPEN_RETRIES {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            DSD_OPEN_RETRY_MS,
+                        ));
+                    }
+                }
+            }
+        }
+        let (pcm_probe, probe_rate, _wire) = probe.ok_or_else(|| {
+            last_error.unwrap_or_else(|| anyhow!("打开 DSD 设备 {device} 失败"))
+        })?;
         drop(pcm_probe);
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -965,23 +1063,27 @@ impl AlsaDsdStream {
             .spawn(move || {
                 boost_current_audio_thread("alsa-dsd-output");
                 bind_current_thread_to_performance_cores("alsa-dsd-output");
-                if let Err(error) =
-                    dsd_write_loop(
-                        &device_owned,
-                        bit_rate,
-                        &mut reader,
-                        worker_stop,
-                        worker_paused,
-                        on_eof,
-                        on_failure,
-                    )
-                {
+                if let Err(error) = dsd_write_loop(
+                    &device_owned,
+                    access,
+                    bit_rate,
+                    &mut reader,
+                    worker_stop,
+                    worker_paused,
+                    on_eof,
+                    on_failure,
+                ) {
                     warn!(error = %error, "ALSA DSD 写循环退出");
                 }
             })
             .context("启动 ALSA DSD 写循环线程失败")?;
 
-        Ok(Self { stop, paused, worker: Some(worker), sample_rate: probe_rate })
+        Ok(Self {
+            stop,
+            paused,
+            worker: Some(worker),
+            sample_rate: probe_rate,
+        })
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -1014,6 +1116,7 @@ impl Drop for AlsaDsdStream {
 #[allow(clippy::too_many_arguments)]
 fn dsd_write_loop(
     device: &str,
+    access: DsdAccess,
     dsd_bit_rate: u32,
     reader: &mut crate::direct_dsd::DirectDsdReader,
     stop: Arc<AtomicBool>,
@@ -1022,7 +1125,7 @@ fn dsd_write_loop(
     on_failure: OutputFailureCallback,
 ) -> Result<()> {
     let channels = usize::from(reader.format().channels);
-    let (pcm, rate, wire_fmt) = open_dsd_pcm(device, dsd_bit_rate, channels as u32)?;
+    let (pcm, rate, wire_fmt) = open_dsd_pcm(device, dsd_bit_rate, channels as u32, access)?;
     let frame_bytes = channels * wire_fmt.bytes_per_ch();
     // DSD MMAP 的 hw 几何在本次流中固定，避免实时循环反复查询 ALSA 控制层。
     let (buffer_frames, _period_frames) = pcm.get_params()?;
@@ -1053,8 +1156,8 @@ fn dsd_write_loop(
 
     loop {
         if stop.load(Ordering::Acquire) {
-            let _ = pcm.drop();
-            info!(xrun_count, "ALSA DSD 写循环停止");
+            mute_dsd_before_drop(&pcm, access, frame_bytes, rate);
+            info!(xrun_count, ?access, "ALSA DSD 写循环停止");
             return Ok(());
         }
         match pcm.state() {
@@ -1152,20 +1255,38 @@ fn dsd_write_loop(
 
         let wire = std::cmp::min(frames, (staging.len() - staging_pos) / frame_bytes);
         // alsa-rs 的 io_checked 以「协商格式 == 类型默认格式」严格等值校验，DSD
-        // 三档格式均无 IoFormat 映射，io_i32/io_i16/io_u8 一律 unsupported("io_xx")。
-        // 官方逃生口 io_bytes()（文档：unusual format 用）：免检、字节粒度 mmap，
-        // IO::mmap 按 frames_to_bytes 换算，对 U32/U16/U8 三档统一适用
-        let result = pcm.io_bytes().mmap(frames, |buf: &mut [u8]| {
-            let src = &staging[staging_pos..];
-            let copy = std::cmp::min(buf.len(), src.len() / frame_bytes * frame_bytes);
-            buf[..copy].copy_from_slice(&src[..copy]);
-            copy / frame_bytes
-        });
-        staging_pos += (staging.len() - staging_pos).min(wire * frame_bytes);
+        // 三档格式均无 IoFormat 映射，统一使用 io_bytes()。
+        // 普通 ALSA 走 write，ALSA MMAP 走 mmap；两条路径写入同一份原始 DSD 字节。
+        let result = match access {
+            DsdAccess::RwInterleaved => {
+                let bytes = wire * frame_bytes;
+                let src = &staging[staging_pos..staging_pos + bytes];
+                pcm.io_bytes()
+                    .write_all(src)
+                    .map(|_| wire)
+                    .map_err(|error| anyhow!("ALSA native DSD write failed: {error}"))
+            }
+            DsdAccess::MmapInterleaved => pcm
+                .io_bytes()
+                .mmap(wire, |buf: &mut [u8]| {
+                    let src = &staging[staging_pos..];
+                    let copy = std::cmp::min(buf.len(), src.len() / frame_bytes * frame_bytes);
+                    buf[..copy].copy_from_slice(&src[..copy]);
+                    copy / frame_bytes
+                })
+                .map_err(|error| anyhow!("ALSA native DSD mmap failed: {error}")),
+        };
         match result {
-            Ok(n) => {
+            Ok(written) => {
+                // snd_pcm_mmap_begin may expose fewer contiguous frames than requested
+                // when the ring buffer wraps. Advance by the committed frame count, not
+                // by `wire`, otherwise the uncommitted DSD bytes are silently discarded
+                // and produce periodic clicks unique to the MMAP path.
+                if access == DsdAccess::MmapInterleaved && written < wire {
+                    debug!(requested = wire, written, "ALSA DSD MMAP 短提交");
+                }
+                staging_pos += written * frame_bytes;
                 contiguous_errors = 0;
-                let _ = n;
             }
             Err(err) => {
                 if pcm.state() == State::XRun {

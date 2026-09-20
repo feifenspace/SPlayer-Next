@@ -328,6 +328,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                             // 时长提示进 meta：stream 模式的 duration 仅来自
                             // 前端 meta，接力加载丢弃它会导致时长归零
                             meta: duration_hint_meta(next.duration_hint),
+                            start_position_secs: None,
                         }),
                     )
                     .await;
@@ -492,6 +493,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                     source: source.clone(),
                     auto_play: Some(true),
                     meta: None,
+                    start_position_secs: None,
                 }),
             )
             .await;
@@ -549,6 +551,7 @@ pub fn spawn_output_recovery_watchdog(state: AppState) {
                                 source: next.source.clone(),
                                 auto_play: Some(true),
                                 meta: duration_hint_meta(next.duration_hint),
+                                start_position_secs: None,
                             }),
                         )
                         .await,
